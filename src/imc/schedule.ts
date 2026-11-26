@@ -16,6 +16,7 @@ import {
   type InsulationTakeoffResult,
   type ManualJLoadResult,
   calculateAshrae622Ventilation,
+  calculateDuctHydraulics,
   calculateIeccInsulationTakeoff,
   calculateManualJLoad,
   sizeHvacEquipment,
@@ -30,6 +31,7 @@ import {
   type HvacSystemType,
   METERS_TO_FEET,
   type OccupancyType,
+  SQM_TO_SQFT,
   round2,
 } from './tables'
 
@@ -230,9 +232,45 @@ export function buildHvacSchedule(
   if (cached) return cached
 
   const all = Object.values(nodes)
-  const rooms = extractRoomPolygons(nodes, null)
+  const rawRooms = extractRoomPolygons(nodes, null)
   const walls = extractWallSegments(nodes, null)
   const levelH = resolveLevelHeightM(nodes, null)
+
+  // Walls-only fallback: synthesize a conditioned footprint room from wall bounds when no room polygons exist
+  let rooms = rawRooms
+  if (rooms.length === 0 && walls.length > 0) {
+    let minX = Infinity
+    let maxX = -Infinity
+    let minZ = Infinity
+    let maxZ = -Infinity
+    for (const w of walls) {
+      minX = Math.min(minX, w.start[0], w.end[0])
+      maxX = Math.max(maxX, w.start[0], w.end[0])
+      minZ = Math.min(minZ, w.start[1], w.end[1])
+      maxZ = Math.max(maxZ, w.start[1], w.end[1])
+    }
+    if (Number.isFinite(minX)) {
+      const areaSqm = Math.max(0, (maxX - minX) * (maxZ - minZ))
+      if (areaSqm > 1) {
+        rooms = [
+          {
+            id: 'room_walls_fallback',
+            name: 'Main Conditioned Zone',
+            category: 'living',
+            polygon: [
+              [minX, minZ],
+              [maxX, minZ],
+              [maxX, maxZ],
+              [minX, maxZ],
+            ],
+            centroid: [(minX + maxX) / 2, (minZ + maxZ) / 2],
+            areaSqm: round2(areaSqm),
+            areaSqft: round2(areaSqm * SQM_TO_SQFT),
+          },
+        ]
+      }
+    }
+  }
 
   const manualJ = calculateManualJLoad({
     rooms: rooms.map((r) => ({
@@ -263,8 +301,23 @@ export function buildHvacSchedule(
     hasKitchen,
   })
 
-  // Estimate true exterior envelope footprint per level (avoid summing interior partition walls or double-counting attic across stories)
-  const levelIds = [...new Set(all.filter((n) => n.type === 'level').map((n) => n.id))]
+  // Estimate true exterior envelope footprint per level sorted by elevation ascending
+  // (avoid summing interior partition walls, double-counting attic across stories, or counting unconditioned spaces)
+  const levelNodes = all
+    .filter((n) => n.type === 'level')
+    .map((n, idx) => ({
+      id: n.id,
+      order:
+        typeof n.elevation === 'number'
+          ? n.elevation
+          : typeof n.level === 'number'
+            ? n.level
+            : typeof n.index === 'number'
+              ? n.index
+              : idx,
+    }))
+    .sort((a, b) => a.order - b.order)
+  const levelIds = [...new Set(levelNodes.map((l) => l.id))]
   const activeLevelIds = levelIds.length > 0 ? levelIds : [null]
   let exteriorPerimeterLf = 0
   let topLevelFootprintSqft = 0
@@ -285,7 +338,9 @@ export function buildHvacSchedule(
       minZ = Math.min(minZ, w.start[1], w.end[1])
       maxZ = Math.max(maxZ, w.start[1], w.end[1])
     }
-    for (const r of lvlRooms) {
+    const conditionedLvlRooms = lvlRooms.filter((r) => !/garage|exterior|attic/.test(r.category))
+    const footprintRooms = conditionedLvlRooms.length > 0 ? conditionedLvlRooms : lvlRooms
+    for (const r of footprintRooms) {
       for (const [x, z] of r.polygon) {
         minX = Math.min(minX, x)
         maxX = Math.max(maxX, x)
@@ -296,8 +351,12 @@ export function buildHvacSchedule(
     if (Number.isFinite(minX)) {
       const perimM = 2 * ((maxX - minX) + (maxZ - minZ))
       exteriorPerimeterLf += perimM * METERS_TO_FEET
-      const lvlSqft = lvlRooms.reduce((s, r) => s + r.areaSqft, 0)
-      topLevelFootprintSqft = lvlSqft > 0 ? lvlSqft : round2((maxX - minX) * (maxZ - minZ) * 10.763910417)
+      const lvlSqft = conditionedLvlRooms.reduce((s, r) => s + r.areaSqft, 0)
+      if (lvlSqft > 0) {
+        topLevelFootprintSqft = lvlSqft
+      } else if (lvlRooms.length === 0) {
+        topLevelFootprintSqft = round2((maxX - minX) * (maxZ - minZ) * SQM_TO_SQFT)
+      }
     }
   }
   const perimeterLf = round2(exteriorPerimeterLf)
@@ -342,13 +401,38 @@ export function buildHvacSchedule(
       const system = (n.system as HvacDuctSystem) || 'supply-branch'
       const material = (n.material as DuctMaterial) || 'galvanized-sheet'
       const shape = (n.shape as DuctShape) || 'round'
+      const widthIn = typeof n.width === 'number' ? n.width : 14
+      const heightIn = typeof n.height === 'number' ? n.height : 8
+      const diameterIn = typeof n.diameter === 'number' ? n.diameter : 6
       const sizeLabel =
         shape === 'rectangular'
-          ? `${Number(n.width ?? 14)}"x${Number(n.height ?? 8)}"`
-          : `${Number(n.diameter ?? 6)}" dia`
+          ? `${widthIn}"x${heightIn}"`
+          : `${diameterIn}" dia`
       const path = Array.isArray(n.path) ? (n.path as ReadonlyArray<readonly [number, number, number]>) : []
       const lengthFt = polylineLengthM(path) * METERS_TO_FEET
-      const vel = typeof n.velocityFpm === 'number' ? n.velocityFpm : 0
+      const cfm = typeof n.airflowCfm === 'number' ? n.airflowCfm : 0
+      const isAirDuct =
+        system === 'supply-trunk' ||
+        system === 'supply-branch' ||
+        system === 'return-trunk' ||
+        system === 'return-branch' ||
+        system === 'exhaust-duct' ||
+        system === 'fresh-air-erv'
+      const vel =
+        cfm > 0 && isAirDuct
+          ? calculateDuctHydraulics({
+              cfm,
+              shape,
+              diameterIn,
+              widthIn,
+              heightIn,
+              material,
+              system,
+              isTrunk: system === 'supply-trunk' || system === 'return-trunk',
+              isReturn: system === 'return-trunk' || system === 'return-branch',
+              occupancy,
+            }).velocityFpm
+          : 0
       const key = `${system}|${material}|${shape}|${sizeLabel}`
       const existing = ductMap.get(key)
       if (existing) {

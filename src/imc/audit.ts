@@ -10,9 +10,13 @@ import {
 } from './framing-interop'
 import {
   type HvacObstacle,
+  type RoomPolygon2D,
+  classifyHvacRoomName,
   detectHvacClashes,
   extractHvacObstacles,
+  extractRoomPolygons,
   measureCondensateSlope,
+  pointInPolygon2D,
   polylineLengthM,
   resolveLevelHeightM,
 } from './routing'
@@ -97,6 +101,7 @@ export function auditSceneHvac(
   const zoneSpec = CLIMATE_ZONES[climateZone] ?? CLIMATE_ZONES['4A']
 
   const obstaclesByLevel = new Map<string, HvacObstacle[]>()
+  const roomsByLevel = new Map<string, RoomPolygon2D[]>()
   const levelHeightCache = new Map<string, number>()
 
   const getObstaclesForLevel = (lvlId: string | null): HvacObstacle[] => {
@@ -105,6 +110,15 @@ export function auditSceneHvac(
     if (!list) {
       list = extractHvacObstacles(nodes, lvlId)
       obstaclesByLevel.set(key, list)
+    }
+    return list
+  }
+  const getRoomsForLevel = (lvlId: string | null): RoomPolygon2D[] => {
+    const key = lvlId ?? '__all__'
+    let list = roomsByLevel.get(key)
+    if (!list) {
+      list = extractRoomPolygons(nodes, lvlId)
+      roomsByLevel.set(key, list)
     }
     return list
   }
@@ -119,11 +133,22 @@ export function auditSceneHvac(
   }
 
   // 1. Equipment checks (IMC 307.2 condensate drain & secondary pan, NEC 440.14 disconnect, gas furnace fuel-gas)
+  const levelCoolingCoils = new Map<string, string[]>()
   for (const eq of equipment) {
     const kind = (eq.equipmentKind as HvacEquipmentKind) || 'air-handler'
     const spec = HVAC_EQUIPMENT_SPECS[kind]
+    const eqLevelKey = resolveNodeLevelId(nodes, eq) ?? '__root__'
+    if (
+      kind === 'gas-furnace-96' ||
+      ((kind === 'air-handler' || kind === 'gas-furnace-80') &&
+        (typeof eq.coolingTons === 'number' ? eq.coolingTons > 0 : true))
+    ) {
+      const list = levelCoolingCoils.get(eqLevelKey) ?? []
+      list.push(eq.id)
+      levelCoolingCoils.set(eqLevelKey, list)
+    }
     if (spec?.needsCondensate) {
-      if (eq.hasSecondaryDrainPan === false) {
+      if (!spec.isOutdoor && eq.hasSecondaryDrainPan === false) {
         push({
           severity: 'error',
           codeRef: 'IMC 307.2.3',
@@ -133,7 +158,7 @@ export function auditSceneHvac(
           nodeIds: [eq.id],
         })
       }
-      if (eq.hasFloatSwitch === false) {
+      if (!spec.isOutdoor && eq.hasFloatSwitch === false) {
         push({
           severity: 'warning',
           codeRef: 'IMC 307.2.3(3)',
@@ -154,7 +179,6 @@ export function auditSceneHvac(
         nodeIds: [eq.id],
       })
     }
-    const eqLevelKey = resolveNodeLevelId(nodes, eq) ?? '__root__'
     if (spec?.usesFuelGas && typeof eq.gasBtuh === 'number' && eq.gasBtuh > 0 && !gasPipeLevels.has(eqLevelKey)) {
       push({
         severity: 'info',
@@ -203,12 +227,19 @@ export function auditSceneHvac(
 
     // Same-level Priority #1 Structural, Priority #2 Plumbing & NEC 110.26(E) clashes
     if (path.length >= 2) {
-      const halfSpanM =
+      const clashMargin =
         shape === 'round'
           ? Math.max(0.02, (diameterIn * INCHES_TO_METERS) / 2)
-          : Math.max(0.05, (Math.max(widthIn, heightIn) * INCHES_TO_METERS) / 2)
-      const clashes = detectHvacClashes(path, getObstaclesForLevel(runLevelId), halfSpanM)
+          : {
+              horizontal: Math.max(0.05, (widthIn * INCHES_TO_METERS) / 2),
+              vertical: Math.max(0.04, (heightIn * INCHES_TO_METERS) / 2),
+            }
+      const clashes = detectHvacClashes(path, getObstaclesForLevel(runLevelId), clashMargin)
+      const seenBaseObs = new Set<string>()
       for (const obs of clashes) {
+        const baseObsId = obs.nodeId ?? obs.id.replace(/:seg.*$/, '')
+        if (seenBaseObs.has(baseObsId)) continue
+        seenBaseObs.add(baseObsId)
         if (obs.category === 'electrical-dedicated-space') {
           push({
             severity: 'error',
@@ -216,7 +247,7 @@ export function auditSceneHvac(
             title: 'HVAC duct invades electrical panel dedicated overhead space',
             detail: `${run.name ?? run.id} passes through ${obs.label}.`,
             suggestedFix: 'Offset ductwork horizontally clear of the electrical panel footprint.',
-            nodeIds: [run.id, obs.id],
+            nodeIds: [run.id, baseObsId],
           })
         } else if (obs.category === 'structural') {
           push({
@@ -225,7 +256,7 @@ export function auditSceneHvac(
             title: 'HVAC duct collides with structural member',
             detail: `${run.name ?? run.id} intersects ${obs.label}.`,
             suggestedFix: 'Route duct around structural beam/column or drop into a drywall soffit.',
-            nodeIds: [run.id, obs.id],
+            nodeIds: [run.id, baseObsId],
           })
         } else {
           push({
@@ -234,7 +265,7 @@ export function auditSceneHvac(
             title: 'HVAC duct clashes with higher-priority Plumbing',
             detail: `${run.name ?? run.id} intersects ${obs.label}. Gravity plumbing holds Priority #2 right-of-way.`,
             suggestedFix: 'Offset HVAC duct around the plumbing pipe or equipment without moving gravity DWV drains.',
-            nodeIds: [run.id, obs.id],
+            nodeIds: [run.id, baseObsId],
           })
         }
       }
@@ -317,10 +348,49 @@ export function auditSceneHvac(
       }
     }
 
-    // IECC R403.3.1 Unconditioned Attic Supply Duct Insulation (must be >= R-8)
+    // IECC R403.3.1 Unconditioned Attic Supply & Return Duct Insulation (must be >= R-8)
+    // Segment-level check: a duct is in the unconditioned attic if any horizontal segment
+    // or >= 30% of total path length runs at midpoint y >= levelH + 0.05.
     const levelH = getLevelH(runLevelId)
-    const avgY = path.length > 0 ? path.reduce((s, p) => s + p[1], 0) / path.length : 0
-    const isAtticDuct = avgY >= levelH + 0.05
+    const atticThresholdY = levelH + 0.05
+    let totalPathLenM = 0
+    let atticLenM = 0
+    let hasHorizontalAtticSeg = false
+    let maxAtticMidY = 0
+    if (path.length >= 2) {
+      for (let i = 1; i < path.length; i++) {
+        const a = path[i - 1]!
+        const b = path[i]!
+        const dx = b[0] - a[0]
+        const dy = b[1] - a[1]
+        const dz = b[2] - a[2]
+        const segLen = Math.hypot(dx, dy, dz)
+        if (segLen < 1e-4) continue
+        const horizLen = Math.hypot(dx, dz)
+        const minY = Math.min(a[1], b[1])
+        const maxY = Math.max(a[1], b[1])
+        totalPathLenM += segLen
+        const frac =
+          minY >= atticThresholdY
+            ? 1
+            : maxY <= atticThresholdY
+              ? 0
+              : (maxY - atticThresholdY) / Math.abs(dy)
+        if (frac > 0) {
+          atticLenM += segLen * frac
+          const subMidY = (Math.max(minY, atticThresholdY) + maxY) / 2
+          if (subMidY > maxAtticMidY) maxAtticMidY = subMidY
+          if (horizLen * frac >= 0.1 && horizLen >= Math.abs(dy)) {
+            hasHorizontalAtticSeg = true
+          }
+        }
+      }
+    } else if (path.length === 1 && path[0]![1] >= atticThresholdY) {
+      hasHorizontalAtticSeg = true
+      maxAtticMidY = path[0]![1]
+    }
+    const isAtticDuct =
+      hasHorizontalAtticSeg || (totalPathLenM > 0 && atticLenM / totalPathLenM >= 0.3)
     if (
       isAtticDuct &&
       (system === 'supply-trunk' || system === 'supply-branch' || system === 'return-trunk' || system === 'return-branch')
@@ -331,7 +401,7 @@ export function auditSceneHvac(
           severity: 'error',
           codeRef: 'IECC R403.3.1',
           title: `Attic duct insulation (R-${insR}) below IECC R-${zoneSpec.ieccAtticDuctR} minimum`,
-          detail: `${run.name ?? run.id} runs in unconditioned attic space (avg ${(avgY * METERS_TO_FEET).toFixed(1)} ft) with R-${insR} insulation.`,
+          detail: `${run.name ?? run.id} runs in unconditioned attic space (${(maxAtticMidY * METERS_TO_FEET).toFixed(1)} ft) with R-${insR} insulation.`,
           suggestedFix: `Upgrade attic duct wrap or flex duct to >= R-${zoneSpec.ieccAtticDuctR} per IECC R403.3.1.`,
           nodeIds: [run.id],
         })
@@ -351,6 +421,21 @@ export function auditSceneHvac(
     }
   }
 
+  // Per-level indoor cooling coil condensate drain check (IMC 307.2.1)
+  for (const [lvlKey, coilIds] of levelCoolingCoils.entries()) {
+    const st = levelDuctState.get(lvlKey)
+    if (!st?.hasCondensate) {
+      push({
+        severity: 'warning',
+        codeRef: 'IMC 307.2.1',
+        title: `Indoor cooling coil missing condensate drain line${lvlKey !== '__root__' && levelCoolingCoils.size > 1 ? ` (level ${lvlKey})` : ''}`,
+        detail: `Indoor cooling coil equipment (${coilIds.join(', ')}) has no 3/4" PVC condensate-drain run on this level.`,
+        suggestedFix: 'Route a gravity-sloped (>= 1/8"/ft) 3/4" PVC condensate drain from the evaporator coil to an approved discharge.',
+        nodeIds: coilIds,
+      })
+    }
+  }
+
   // Per-level return air path invariant (IMC 601)
   for (const [lvlKey, st] of levelDuctState.entries()) {
     const lvlHasReturnGrille = terminals.some(
@@ -364,6 +449,36 @@ export function auditSceneHvac(
         detail: 'Supply ducts exist without a return air trunk or return grille on this level.',
         suggestedFix: 'Add a central return grille and sized return trunk back to the air handler return plenum.',
         nodeIds: st.sampleSupplyIds,
+      })
+    }
+  }
+
+  // Prohibited return-air intake zones (IMC 601.5 / IRC M1602.2)
+  const prohibitedReturnCategories = new Set(['bathroom', 'garage', 'kitchen', 'utility', 'closet', 'exterior', 'attic'])
+  for (const t of terminals) {
+    if (t.terminalKind !== 'return-grille') continue
+    const tLvlId = resolveNodeLevelId(nodes, t)
+    const lvlRooms = getRoomsForLevel(tLvlId)
+    const lvlH = getLevelH(tLvlId)
+    const pos = Array.isArray(t.position) && t.position.length >= 3 ? t.position : null
+    const termY = pos ? Number(pos[1]) : 0
+    const matchingRooms = pos
+      ? lvlRooms
+          .filter((r) => !(r.category === 'attic' && termY < lvlH))
+          .filter((r) => pointInPolygon2D(Number(pos[0]), Number(pos[2]), r.polygon))
+          .sort((a, b) => a.areaSqm - b.areaSqm)
+      : []
+    const containingRoom = matchingRooms[0]
+    const roomLabel = containingRoom?.name ?? (typeof t.roomName === 'string' ? t.roomName : '')
+    const roomCat = containingRoom?.category ?? (roomLabel ? classifyHvacRoomName(roomLabel) : 'other')
+    if (prohibitedReturnCategories.has(roomCat)) {
+      push({
+        severity: 'error',
+        codeRef: 'IMC 601.5 / IRC M1602.2',
+        title: `Return air grille placed in prohibited ${roomCat} zone`,
+        detail: `${t.name ?? t.id} draws return air from ${roomLabel || roomCat}; IMC 601.5 and IRC M1602.2 prohibit return air from bathrooms, kitchens, garages, closets, utility rooms, attics, or exterior spaces.`,
+        suggestedFix: 'Relocate the return air grille into a conditioned hallway, living room, or other habitable space.',
+        nodeIds: [t.id],
       })
     }
   }

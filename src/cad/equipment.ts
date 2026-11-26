@@ -48,6 +48,7 @@ export function buildHvacEquipmentCad(params: {
     const w = 0.54 * scale
     const h = 1.38
     const d = equipmentKind === 'air-handler' ? 0.56 : 0.72
+    const baseY = hasSecondaryDrainPan ? 0.05 : 0
     if (hasSecondaryDrainPan) {
       const pan = new Mesh(new BoxGeometry(w + 0.12, 0.05, d + 0.12), pool.galvanizedSheet)
       pan.position.y = 0.025
@@ -57,22 +58,22 @@ export function buildHvacEquipmentCad(params: {
       new BoxGeometry(w, h, d),
       equipmentKind === 'air-handler' ? pool.cabinetSlate : pool.cabinetLight,
     )
-    cabinet.position.y = 0.05 + h / 2
+    cabinet.position.y = baseY + h / 2
     g.add(cabinet)
     // Evaporator A-coil section badge at top
     const coilCap = new Mesh(new BoxGeometry(w + 0.01, 0.36, d + 0.01), pool.galvanizedSheet)
-    coilCap.position.y = 0.05 + h - 0.18
+    coilCap.position.y = baseY + h - 0.18
     g.add(coilCap)
     // Condensate 3/4" PVC stub
     const cond = new Mesh(new CylinderGeometry(0.014, 0.014, 0.14, 10), pool.condensateWhite)
     cond.rotation.z = Math.PI / 2
-    cond.position.set(w / 2 + 0.06, 0.95, 0.08)
+    cond.position.set(w / 2 + 0.06, baseY + 0.9, 0.08)
     g.add(cond)
     // Flue pipe for gas furnaces
     if (equipmentKind === 'gas-furnace-96' || equipmentKind === 'gas-furnace-80') {
       const flueMat = equipmentKind === 'gas-furnace-96' ? pool.condensateWhite : pool.galvanizedSheet
       const flue = new Mesh(new CylinderGeometry(0.04, 0.04, 0.45, 12), flueMat)
-      flue.position.set(-w * 0.22, 0.05 + h + 0.22, -d * 0.2)
+      flue.position.set(-w * 0.22, baseY + h + 0.22, -d * 0.2)
       g.add(flue)
     }
     return g

@@ -41,10 +41,12 @@ export function buildHvacFittingCad(kind: HvacFittingCadKind): Group {
     }
     case 'rect-transition-reducer': {
       const wide = new Mesh(new BoxGeometry(0.46, 0.2, 0.18), pool.galvanizedSheet)
-      wide.position.z = -0.14
+      wide.position.z = -0.13
+      const mid = new Mesh(new BoxGeometry(0.39, 0.2, 0.08), pool.galvanizedSheet)
+      mid.position.z = -0.03
       const narrow = new Mesh(new BoxGeometry(0.32, 0.2, 0.24), pool.galvanizedSheet)
-      narrow.position.z = 0.08
-      g.add(wide, narrow)
+      narrow.position.z = 0.09
+      g.add(wide, mid, narrow)
       break
     }
     case 'round-wye-branch': {
@@ -95,7 +97,7 @@ export function buildHvacFittingCad(kind: HvacFittingCadKind): Group {
       const pipe = new Mesh(new CylinderGeometry(0.075, 0.075, 0.24, 14), pool.galvanizedSheet)
       pipe.position.y = 0.12
       const cap = new Mesh(new CylinderGeometry(0.13, 0.13, 0.04, 16), pool.cabinetSlate)
-      cap.position.y = 0.26
+      cap.position.y = 0.25
       g.add(flange, pipe, cap)
       break
     }
@@ -116,14 +118,24 @@ export function buildHvacFittingCad(kind: HvacFittingCadKind): Group {
       const suction = new Mesh(new CylinderGeometry(0.026, 0.026, 0.55, 12), pool.copperInsulated)
       const liquid = new Mesh(new CylinderGeometry(0.01, 0.01, 0.55, 10), pool.copperBare)
       liquid.position.x = 0.045
-      g.add(suction, liquid)
+      const clampGeo = new BoxGeometry(0.09, 0.025, 0.056)
+      const clampLow = new Mesh(clampGeo, pool.cabinetSlate)
+      clampLow.position.set(0.015, -0.16, 0)
+      const clampHigh = new Mesh(clampGeo, pool.cabinetSlate)
+      clampHigh.position.set(0.015, 0.16, 0)
+      g.add(suction, liquid, clampLow, clampHigh)
       break
     }
     case 'condensate-p-trap-ss2': {
       const trap = new Mesh(new CylinderGeometry(0.016, 0.016, 0.22, 10), pool.condensateWhite)
+      const teeBranch = new Mesh(new CylinderGeometry(0.016, 0.016, 0.075, 10), pool.condensateWhite)
+      teeBranch.rotation.z = Math.PI / 2
+      teeBranch.position.set(0.03, 0.04, 0)
+      const switchRiser = new Mesh(new CylinderGeometry(0.016, 0.016, 0.04, 10), pool.condensateWhite)
+      switchRiser.position.set(0.06, 0.05, 0)
       const switchCap = new Mesh(new CylinderGeometry(0.024, 0.024, 0.07, 12), pool.dangerRed)
-      switchCap.position.set(0.06, 0.05, 0)
-      g.add(trap, switchCap)
+      switchCap.position.set(0.06, 0.085, 0)
+      g.add(trap, teeBranch, switchRiser, switchCap)
       break
     }
     case 'merv13-filter-rack': {
@@ -154,7 +166,9 @@ export function buildDuctRunCad(params: {
   heightIn: number
   diameterIn: number
   clearances?: ReadonlyArray<{
+    memberKind?: 'stud' | 'top-plate' | 'sole-plate' | 'joist-bay' | 'dropped-soffit'
     position: Vec3
+    ductDirection?: Vec3
     wallNormal: readonly [number, number]
     openingWidthIn: number
     openingHeightIn: number
@@ -222,21 +236,50 @@ export function buildDuctRunCad(params: {
     }
   }
 
-  // Framing penetration / firestop collars oriented to wallNormal (reusing shared unit box geometry)
+  // Hollow 4-bar framing penetration / firestop collars that wrap around ducts (never slice across as baffles)
   if (clearances.length > 0) {
     const unitCollarGeo = new BoxGeometry(1, 1, 1)
+    const barThick = 0.025
+    const barDepth = 0.035
     for (const clr of clearances) {
       const frameW = Math.max(0.08, clr.openingWidthIn * INCHES_TO_METERS)
       const frameH = Math.max(0.08, clr.openingHeightIn * INCHES_TO_METERS)
-      const collar = new Mesh(
-        unitCollarGeo,
-        clr.codeCompliant ? pool.galvanizedSheet : pool.dangerRed,
-      )
-      collar.scale.set(frameW, frameH, 0.03)
-      collar.position.set(clr.position[0], clr.position[1], clr.position[2])
+      const collarMat = clr.codeCompliant ? pool.galvanizedSheet : pool.dangerRed
+      const collarGroup = new Group()
+      collarGroup.name = `hvac-collar-${clr.memberKind ?? 'stud'}`
+      collarGroup.position.set(clr.position[0], clr.position[1], clr.position[2])
+
+      const topBar = new Mesh(unitCollarGeo, collarMat)
+      topBar.scale.set(frameW + 2 * barThick, barThick, barDepth)
+      topBar.position.set(0, frameH / 2 + barThick / 2, 0)
+
+      const botBar = new Mesh(unitCollarGeo, collarMat)
+      botBar.scale.set(frameW + 2 * barThick, barThick, barDepth)
+      botBar.position.set(0, -frameH / 2 - barThick / 2, 0)
+
+      const leftBar = new Mesh(unitCollarGeo, collarMat)
+      leftBar.scale.set(barThick, frameH, barDepth)
+      leftBar.position.set(-frameW / 2 - barThick / 2, 0, 0)
+
+      const rightBar = new Mesh(unitCollarGeo, collarMat)
+      rightBar.scale.set(barThick, frameH, barDepth)
+      rightBar.position.set(frameW / 2 + barThick / 2, 0, 0)
+
+      collarGroup.add(topBar, botBar, leftBar, rightBar)
+
       const [nx, nz] = clr.wallNormal
-      collar.rotation.y = Math.atan2(nx, nz)
-      g.add(collar)
+      if (clr.memberKind === 'top-plate' || clr.memberKind === 'sole-plate') {
+        // Vertical duct piercing horizontal top/sole plate -> collar lies flat in XZ around duct perimeter
+        collarGroup.rotation.order = 'YXZ'
+        collarGroup.rotation.y = Math.atan2(nx, nz)
+        collarGroup.rotation.x = Math.PI / 2
+      } else if (clr.memberKind === 'dropped-soffit' && clr.ductDirection) {
+        // Horizontal under-joist chase -> collar plane perpendicular to duct travel direction
+        collarGroup.rotation.y = Math.atan2(clr.ductDirection[0], clr.ductDirection[2])
+      } else {
+        collarGroup.rotation.y = Math.atan2(nx, nz)
+      }
+      g.add(collarGroup)
     }
   }
 

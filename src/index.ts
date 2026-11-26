@@ -34,37 +34,37 @@ export const hvacInspectorExtensions: InspectorExtension[] = [
   },
 ]
 
-export const hvacEquipmentDefinition = {
+export const hvacEquipmentDefinition: AnyNodeDefinition = {
   ...hvacEquipmentRenderDefinition,
   snapProfile: 'item' as const,
   parametrics: hvacEquipmentParametrics,
-}
+} as unknown as AnyNodeDefinition
 
-export const hvacPlenumDefinition = {
+export const hvacPlenumDefinition: AnyNodeDefinition = {
   ...hvacPlenumRenderDefinition,
   snapProfile: 'item' as const,
   parametrics: hvacPlenumParametrics,
-}
+} as unknown as AnyNodeDefinition
 
-export const hvacTerminalDefinition = {
+export const hvacTerminalDefinition: AnyNodeDefinition = {
   ...hvacTerminalRenderDefinition,
   snapProfile: 'item' as const,
   parametrics: hvacTerminalParametrics,
-}
+} as unknown as AnyNodeDefinition
 
-export const hvacDuctRunDefinition = {
+export const hvacDuctRunDefinition: AnyNodeDefinition = {
   ...hvacDuctRunRenderDefinition,
   snapProfile: 'structural' as const,
   parametrics: hvacDuctRunParametrics,
-}
+} as unknown as AnyNodeDefinition
 
 export const hvacPlugin: Plugin = {
   ...hvacRenderPlugin,
   nodes: [
-    hvacEquipmentDefinition as unknown as AnyNodeDefinition,
-    hvacPlenumDefinition as unknown as AnyNodeDefinition,
-    hvacTerminalDefinition as unknown as AnyNodeDefinition,
-    hvacDuctRunDefinition as unknown as AnyNodeDefinition,
+    hvacEquipmentDefinition,
+    hvacPlenumDefinition,
+    hvacTerminalDefinition,
+    hvacDuctRunDefinition,
   ],
   inspectorExtensions: hvacInspectorExtensions,
 }
@@ -103,6 +103,9 @@ export const hvacScheduleView: EditorHostView = {
 export const hvacChatExtension: PluginChatExtension = {
   pluginId: HVAC_PLUGIN_ID,
   cards: {
+    hvac_place_equipment: () => import('./ui/chat-card'),
+    hvac_place_plenum: () => import('./ui/chat-card'),
+    hvac_place_terminal: () => import('./ui/chat-card'),
     hvac_audit_imc: () => import('./ui/chat-card'),
     hvac_generate_schedule: () => import('./ui/chat-card'),
     hvac_route_duct: () => import('./ui/chat-card'),

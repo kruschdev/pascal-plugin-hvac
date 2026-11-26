@@ -70,9 +70,9 @@ export const hvacDuctRunParametrics: ParametricDescriptor<HvacDuctRunNode> = {
         { key: 'system', kind: 'enum', options: [...HvacDuctSystemEnum.options] },
         { key: 'shape', kind: 'enum', options: [...DuctShapeEnum.options], display: 'segmented' },
         { key: 'material', kind: 'enum', options: [...DuctMaterialEnum.options] },
-        { key: 'width', kind: 'number', unit: 'in', min: 1, max: 60, step: 2 },
-        { key: 'height', kind: 'number', unit: 'in', min: 1, max: 48, step: 2 },
-        { key: 'diameter', kind: 'number', unit: 'in', min: 1, max: 36, step: 1 },
+        { key: 'width', kind: 'number', unit: 'in', min: 2, max: 60, step: 2 },
+        { key: 'height', kind: 'number', unit: 'in', min: 2, max: 48, step: 2 },
+        { key: 'diameter', kind: 'number', unit: 'in', min: 0.5, max: 36, step: 0.25 },
       ],
     },
     {

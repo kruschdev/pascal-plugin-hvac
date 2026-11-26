@@ -85,6 +85,23 @@ export default function HvacChatCard({ toolName, output, state, actions }: ChatT
         </div>
       )}
 
+      {/* Summary for hvac_place_equipment, hvac_place_plenum, hvac_place_terminal */}
+      {routedNodeId && lengthFt === null && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11 }}>
+          <span>
+            <strong>Placed:</strong> {typeof data?.name === 'string' ? data.name : routedNodeId}
+            {typeof data?.designCfm === 'number' && data.designCfm > 0 ? ` · ${data.designCfm} CFM` : ''}
+          </span>
+          <button
+            type="button"
+            onClick={() => actions.select([routedNodeId])}
+            style={{ background: 'transparent', border: 'none', color: '#38bdf8', cursor: 'pointer', fontSize: 11 }}
+          >
+            Select
+          </button>
+        </div>
+      )}
+
       {/* Summary for hvac_route_duct */}
       {lengthFt !== null && (
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11 }}>

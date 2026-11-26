@@ -35,6 +35,9 @@ describe('Pascal Plugin API v1 Contract, Zod Round-Trip & E-016 Agent Operations
     expect(hvacScheduleView.pluginId).toBe('krusch:hvac')
     expect(hvacChatExtension.pluginId).toBe('krusch:hvac')
     expect(Object.keys(hvacChatExtension.cards ?? {})).toEqual([
+      'hvac_place_equipment',
+      'hvac_place_plenum',
+      'hvac_place_terminal',
       'hvac_audit_imc',
       'hvac_generate_schedule',
       'hvac_route_duct',

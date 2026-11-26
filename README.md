@@ -18,7 +18,7 @@ I built `@kruschdev/pascal-plugin-hvac` to complete the 4-trade MEP stack inside
   - **ASHRAE 62.2** continuous fresh-air ERV ventilation and local bath/kitchen exhaust sizing.
   - **IECC** building envelope insulation takeoffs (wall batts, blown-in attic cellulose, rim-joist closed-cell spray foam, and air-sealing caulk/foam).
 - **4-Trade MEP Coordination (Priority #3)**:
-  - **Priority #1 Structural & Bones Framing**: Detects `structural:assembly`, `structural:beam`, `structural:column`, and `bones:framing` obstacles, evaluates wall penetration openings, double top-plate straps, and dropped-soffit chases per IRC R502.8 / R602.6 / R302.11.
+  - **Priority #1 Structural & Bones Framing**: Reads `structural:assembly` and `bones:framing` framing metadata (stud spacing, joist depth, floor system, load-bearing wall overrides) to evaluate wall penetration openings, double top-plate straps, and dropped-soffit chases per IRC R502.8 / R602.6 / R302.11, and detours ductwork around `structural:beam` and `structural:column` collision obstacles.
   - **Priority #2 Plumbing**: Detours ductwork around gravity DWV drains, stacks, manifolds, and plumbing equipment without forcing gravity drains to move. Gas furnaces publish `gasBtuh` so `@kruschdev/pascal-plugin-plumbing` automatically includes furnace demand in its IFGC fuel-gas main sizing.
   - **Priority #4 Electrical**: Every powered `hvac:equipment` node publishes a standardized `electricalDemand` payload (NEC Art. 440 / 424 voltage, poles, breaker amps, VA, dedicated circuit flag) consumed automatically by `@kruschdev/pascal-plugin-electrical`. Duct routing also respects `NEC 110.26(E)` dedicated panel footprints down to the floor (`minY = 0`).
 - **42-Part Clean-Room MIT 3D CAD Library (`./cad`)**:

@@ -32,10 +32,13 @@ export type Aabb3 = {
 
 export type HvacObstacle = {
   id: string
+  nodeId?: string
   category: 'structural' | 'plumbing' | 'electrical-dedicated-space'
   label: string
   box: Aabb3
 }
+
+export type DuctClashMargin = number | { horizontal: number; vertical: number }
 
 export type WallSegment2D = {
   id: string
@@ -64,6 +67,7 @@ export type RoomPolygon2D = {
     | 'office'
     | 'garage'
     | 'exterior'
+    | 'attic'
     | 'other'
   polygon: ReadonlyArray<readonly [number, number]>
   centroid: readonly [number, number]
@@ -147,17 +151,34 @@ export function extractWallSegments(
 
 export function classifyHvacRoomName(name: string): RoomPolygon2D['category'] {
   const s = name.toLowerCase()
-  if (/bed|master|primary|nursery|guest/.test(s)) return 'bedroom'
   if (/bath|powder|restroom|wc|toilet/.test(s)) return 'bathroom'
-  if (/kitchen|pantry/.test(s)) return 'kitchen'
-  if (/hall|corridor|foyer|entry/.test(s)) return 'hallway'
+  if (/attic/.test(s)) return 'attic'
+  if (/garage|carport/.test(s)) return 'garage'
+  if (/exterior|outdoor|patio|deck|porch|balcony|yard/.test(s)) return 'exterior'
   if (/utility|mech|furnace|closet|storage/.test(s)) return 'utility'
   if (/laundry|mudroom/.test(s)) return 'laundry'
+  if (/kitchen|pantry/.test(s)) return 'kitchen'
+  if (/hall|corridor|foyer|entry/.test(s)) return 'hallway'
   if (/office|study|den/.test(s)) return 'office'
-  if (/garage|carport/.test(s)) return 'garage'
-  if (/porch|patio|deck|balcony|yard|exterior/.test(s)) return 'exterior'
+  if (/bed|master|primary|nursery|guest/.test(s)) return 'bedroom'
   if (/living|great|family|dining|open|suite|conference/.test(s)) return 'living'
   return 'other'
+}
+
+export function pointInPolygon2D(
+  px: number,
+  pz: number,
+  polygon: ReadonlyArray<readonly [number, number]>,
+): boolean {
+  if (polygon.length < 3) return false
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, zi] = polygon[i]!
+    const [xj, zj] = polygon[j]!
+    const intersects = zi > pz !== zj > pz && px < ((xj - xi) * (pz - zi)) / (zj - zi + 1e-12) + xi
+    if (intersects) inside = !inside
+  }
+  return inside
 }
 
 export function polygonAreaAndCentroid(
@@ -210,10 +231,13 @@ export function extractRoomPolygons(
     const poly = rawPoly.map((p) => [Number(p[0]), Number(p[1])] as const)
     const { areaSqm, centroid } = polygonAreaAndCentroid(poly)
     const label = typeof n.name === 'string' && n.name.trim() ? n.name.trim() : n.id
+    const rawCat = typeof n.category === 'string' ? n.category.trim() : ''
+    const fromCat = rawCat ? classifyHvacRoomName(rawCat) : 'other'
+    const category = fromCat !== 'other' ? fromCat : classifyHvacRoomName(label)
     rooms.push({
       id: n.id,
       name: label,
-      category: classifyHvacRoomName(label),
+      category,
       polygon: poly,
       centroid,
       areaSqm: round2(areaSqm),
@@ -300,6 +324,7 @@ export function extractHvacObstacles(
       const z1 = sz + (ez - sz) * t1
       obstacles.push({
         id: steps === 1 ? id : `${id}:seg${s}`,
+        nodeId: id,
         category: 'structural',
         label,
         box: {
@@ -328,6 +353,7 @@ export function extractHvacObstacles(
       const h = typeof n.heightM === 'number' ? n.heightM : levelH
       obstacles.push({
         id: n.id,
+        nodeId: n.id,
         category: 'structural',
         label: `Structural column (${n.name ?? n.id})`,
         box: { minX: pos[0] - w / 2, maxX: pos[0] + w / 2, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - d / 2, maxZ: pos[2] + d / 2 },
@@ -347,6 +373,7 @@ export function extractHvacObstacles(
       const h = typeof n.height === 'number' ? n.height : levelH
       obstacles.push({
         id: n.id,
+        nodeId: n.id,
         category: 'structural',
         label: `Column (${n.name ?? n.id})`,
         box: { minX: pos[0] - w / 2, maxX: pos[0] + w / 2, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - d / 2, maxZ: pos[2] + d / 2 },
@@ -379,6 +406,7 @@ export function extractHvacObstacles(
           const p1: Vec3 = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1, a[2] + (b[2] - a[2]) * t1]
           obstacles.push({
             id: steps === 1 ? `${n.id}:seg${i - 1}` : `${n.id}:seg${i - 1}_${s}`,
+            nodeId: n.id,
             category: 'plumbing',
             label: `Plumbing ${String(n.nominalSize ?? '2"')} ${String(n.system ?? 'pipe')} (${n.id})`,
             box: {
@@ -397,6 +425,7 @@ export function extractHvacObstacles(
       const h = n.type === 'plumbing:manifold' ? 0.7 : 1.55
       obstacles.push({
         id: n.id,
+        nodeId: n.id,
         category: 'plumbing',
         label: `Plumbing ${n.type === 'plumbing:manifold' ? 'manifold' : 'equipment'} (${n.name ?? n.id})`,
         box: {
@@ -412,7 +441,12 @@ export function extractHvacObstacles(
       // NEC 110.26(E)(1)(a): Dedicated electrical space from floor (minY = 0) to 6 ft above panel
       const w = typeof n.width === 'number' ? n.width : 0.42
       const d = typeof n.depth === 'number' ? n.depth : 0.16
-      const rot = typeof n.rotation === 'number' ? n.rotation : 0
+      const rot =
+        typeof n.rotation === 'number'
+          ? n.rotation
+          : Array.isArray(n.rotation) && typeof n.rotation[1] === 'number'
+            ? n.rotation[1]
+            : 0
       const cosR = Math.abs(Math.cos(rot))
       const sinR = Math.abs(Math.sin(rot))
       const halfX = (w * cosR + d * sinR) / 2 + 0.03
@@ -420,6 +454,7 @@ export function extractHvacObstacles(
       const panelTopY = pos[1] + (typeof n.height === 'number' ? n.height / 2 : 0.46)
       obstacles.push({
         id: n.id,
+        nodeId: n.id,
         category: 'electrical-dedicated-space',
         label: `NEC 110.26(E) Dedicated Space (${n.name ?? n.id})`,
         box: {
@@ -437,9 +472,15 @@ export function extractHvacObstacles(
   return obstacles
 }
 
-export function segmentIntersectsAabb(a: Vec3, b: Vec3, box: Aabb3, margin = 0.03): boolean {
-  const mins = [box.minX - margin, box.minY - margin, box.minZ - margin] as const
-  const maxs = [box.maxX + margin, box.maxY + margin, box.maxZ + margin] as const
+export function segmentIntersectsAabb(
+  a: Vec3,
+  b: Vec3,
+  box: Aabb3,
+  margin: number | readonly [number, number, number] = 0.03,
+): boolean {
+  const [mx, my, mz] = typeof margin === 'number' ? [margin, margin, margin] : margin
+  const mins = [box.minX - mx, box.minY - my, box.minZ - mz] as const
+  const maxs = [box.maxX + mx, box.maxY + my, box.maxZ + mz] as const
   const dirs = [b[0] - a[0], b[1] - a[1], b[2] - a[2]] as const
   const starts = [a[0], a[1], a[2]] as const
 
@@ -465,8 +506,12 @@ export function segmentIntersectsAabb(a: Vec3, b: Vec3, box: Aabb3, margin = 0.0
 export function detectHvacClashes(
   path: ReadonlyArray<Vec3>,
   obstacles: ReadonlyArray<HvacObstacle>,
-  ductHalfSpanM = 0.08,
+  ductHalfSpanM: DuctClashMargin = 0.08,
 ): HvacObstacle[] {
+  const margin3: readonly [number, number, number] =
+    typeof ductHalfSpanM === 'number'
+      ? [ductHalfSpanM + 0.02, ductHalfSpanM + 0.02, ductHalfSpanM + 0.02]
+      : [ductHalfSpanM.horizontal + 0.02, ductHalfSpanM.vertical + 0.02, ductHalfSpanM.horizontal + 0.02]
   const hits: HvacObstacle[] = []
   const seen = new Set<string>()
   for (let i = 1; i < path.length; i++) {
@@ -474,7 +519,7 @@ export function detectHvacClashes(
     const b = path[i]!
     for (const obs of obstacles) {
       if (seen.has(obs.id)) continue
-      if (segmentIntersectsAabb(a, b, obs.box, ductHalfSpanM + 0.02)) {
+      if (segmentIntersectsAabb(a, b, obs.box, margin3)) {
         seen.add(obs.id)
         hits.push(obs)
       }
@@ -503,7 +548,8 @@ export function routeHvacDuctRun(params: {
   from: Vec3
   to: Vec3
   plenumY: number
-  ductHalfSpanM?: number
+  maxPlenumY?: number
+  ductHalfSpanM?: DuctClashMargin
   allowDiagonalBranch?: boolean
   obstacles?: ReadonlyArray<HvacObstacle>
 }): {
@@ -516,13 +562,15 @@ export function routeHvacDuctRun(params: {
     from,
     to,
     plenumY,
+    maxPlenumY,
     ductHalfSpanM = 0.08,
     allowDiagonalBranch = false,
     obstacles = [],
   } = params
 
   const buildCand = (mode: 'x' | 'z' | 'diag' | 'ux' | 'uz', offsetM = 0, yOffset = 0): Vec3[] => {
-    const y = plenumY + yOffset
+    const rawY = plenumY + yOffset
+    const y = maxPlenumY !== undefined ? Math.min(rawY, maxPlenumY) : rawY
     const sP: Vec3 = [from[0], y, from[2]]
     const eP: Vec3 = [to[0], y, to[2]]
     if (mode === 'ux') {
@@ -553,6 +601,7 @@ export function routeHvacDuctRun(params: {
       buildCand('z', 0, 0),
       buildCand('x', 0, 0),
       // Elevation hops first so attic trunks & branches step cleanly over Priority #2 DWV vents
+      // (conditioned-soffit runs clamp to maxPlenumY and also try downward soffit clearances)
       buildCand('diag', 0, 0.35),
       buildCand('x', 0, 0.35),
       buildCand('z', 0, 0.35),
@@ -563,6 +612,8 @@ export function routeHvacDuctRun(params: {
       buildCand('z', 0, 0.28),
       buildCand('x', 0, -0.18),
       buildCand('z', 0, -0.18),
+      buildCand('x', 0, -0.32),
+      buildCand('z', 0, -0.32),
       buildCand('ux', 0.65, 0),
       buildCand('ux', -0.65, 0),
       buildCand('uz', 0.65, 0),
@@ -575,6 +626,10 @@ export function routeHvacDuctRun(params: {
       buildCand('ux', -0.65, 0.35),
       buildCand('uz', 0.65, 0.35),
       buildCand('uz', -0.65, 0.35),
+      buildCand('ux', 0.85, -0.25),
+      buildCand('ux', -0.85, -0.25),
+      buildCand('uz', 0.85, -0.25),
+      buildCand('uz', -0.85, -0.25),
       buildCand('ux', 1.1, 0),
       buildCand('ux', -1.1, 0),
       buildCand('uz', 1.1, 0),
@@ -583,6 +638,20 @@ export function routeHvacDuctRun(params: {
       buildCand('ux', -1.6, 0.35),
       buildCand('uz', 1.6, 0.35),
       buildCand('uz', -1.6, 0.35),
+      buildCand('ux', 2.2, -0.25),
+      buildCand('ux', -2.2, -0.25),
+      buildCand('uz', 2.2, -0.25),
+      buildCand('uz', -2.2, -0.25),
+      buildCand('x', 0, -0.44),
+      buildCand('z', 0, -0.44),
+      buildCand('ux', 1.2, -0.44),
+      buildCand('ux', -1.2, -0.44),
+      buildCand('uz', 1.2, -0.44),
+      buildCand('uz', -1.2, -0.44),
+      buildCand('ux', 2.2, -0.44),
+      buildCand('ux', -2.2, -0.44),
+      buildCand('uz', 2.2, -0.44),
+      buildCand('uz', -2.2, -0.44),
       buildCand('diag', 0.85, 0),
       buildCand('diag', -0.85, 0),
       buildCand('diag', 0.85, 0.35),

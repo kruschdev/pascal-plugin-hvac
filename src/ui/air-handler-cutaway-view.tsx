@@ -4,7 +4,7 @@
  * the cutaway model Group when primitive props change, with ResizeObserver and full GPU disposal on unmount.
  */
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   AmbientLight,
   type BufferGeometry,
@@ -57,9 +57,12 @@ export default function AirHandlerCutawayView({
   const rendererRef = useRef<WebGLRenderer | null>(null)
   const modelRef = useRef<Group | null>(null)
   const rotYRef = useRef(-0.22)
+  const [webglError, setWebglError] = useState<string | null>(null)
 
-  // Primitive supply branch count avoids recreating the cutaway model on unrelated scene edits
-  const supplyBranchCount = branches.filter((b) => b.side === 'supply').length
+  // Stable primitive branch signature avoids rebuilding the cutaway on unrelated scene edits while reflecting real branches
+  const branchSignature = branches.map((b) => `${b.side}:${b.label}:${b.cfm}:${b.diameterIn}`).join('|')
+  const branchesRef = useRef<ReadonlyArray<DuctBranchAssignment>>(branches)
+  branchesRef.current = branches
 
   // Mount-only WebGLRenderer + ResizeObserver + Orbit Controls
   useEffect(() => {
@@ -76,7 +79,14 @@ export default function AirHandlerCutawayView({
     camera.position.set(0.55, 0.25, 2.35)
     camera.lookAt(0.2, 0.15, 0)
 
-    const renderer = new WebGLRenderer({ antialias: true, preserveDrawingBuffer: true })
+    let renderer: WebGLRenderer
+    try {
+      renderer = new WebGLRenderer({ antialias: true, preserveDrawingBuffer: true })
+    } catch (err) {
+      setWebglError(err instanceof Error ? err.message : 'WebGL context unavailable in this environment.')
+      return
+    }
+    setWebglError(null)
     renderer.setSize(width, height)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
     el.innerHTML = ''
@@ -150,7 +160,7 @@ export default function AirHandlerCutawayView({
     }
   }, [])
 
-  // Swap only the cutaway model Group when primitive tonnage, viewMode, or supply branch count changes
+  // Swap only the cutaway model Group when tonnage, viewMode, or real branch assignments change
   useEffect(() => {
     const scene = sceneRef.current
     const camera = cameraRef.current
@@ -163,17 +173,10 @@ export default function AirHandlerCutawayView({
       modelRef.current = null
     }
 
-    const syntheticBranches: DuctBranchAssignment[] = Array.from({ length: supplyBranchCount }, (_, i) => ({
-      index: i,
-      label: `Branch ${i + 1}`,
-      cfm: 120,
-      diameterIn: 6,
-      side: 'supply',
-    }))
     const model = buildWiredAirHandlerCutawayCad({
       coolingTons,
       viewMode,
-      branches: syntheticBranches,
+      branches: branchesRef.current,
     })
     model.rotation.y = rotYRef.current
     scene.add(model)
@@ -183,7 +186,7 @@ export default function AirHandlerCutawayView({
     return () => {
       if (rafId && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(rafId)
     }
-  }, [coolingTons, viewMode, supplyBranchCount])
+  }, [coolingTons, viewMode, branchSignature])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -215,17 +218,49 @@ export default function AirHandlerCutawayView({
         ))}
       </div>
 
-      <div
-        ref={containerRef}
-        style={{
-          width: '100%',
-          height: 340,
-          borderRadius: 8,
-          overflow: 'hidden',
-          border: '1px solid var(--border, rgba(255,255,255,0.16))',
-          cursor: 'grab',
-        }}
-      />
+      {webglError ? (
+        <div
+          style={{
+            padding: 14,
+            borderRadius: 8,
+            border: '1px solid rgba(245,158,11,0.5)',
+            background: 'rgba(245,158,11,0.12)',
+            fontSize: 11,
+          }}
+        >
+          3D WebGL preview unavailable ({webglError}). Branch takeoff assignments remain listed below.
+        </div>
+      ) : (
+        <div
+          ref={containerRef}
+          style={{
+            width: '100%',
+            height: 340,
+            borderRadius: 8,
+            overflow: 'hidden',
+            border: '1px solid var(--border, rgba(255,255,255,0.16))',
+            cursor: 'grab',
+          }}
+        />
+      )}
+
+      {branches.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, fontSize: 11 }}>
+          {branches.map((b) => (
+            <span
+              key={`${b.side}_${b.index}_${b.label}`}
+              style={{
+                padding: '3px 7px',
+                borderRadius: 6,
+                border: `1px solid ${b.side === 'return' ? 'rgba(124,58,237,0.55)' : 'rgba(56,189,248,0.55)'}`,
+                background: b.side === 'return' ? 'rgba(124,58,237,0.14)' : 'rgba(56,189,248,0.12)',
+              }}
+            >
+              {b.label} ({b.diameterIn}&quot; · {b.cfm} CFM)
+            </span>
+          ))}
+        </div>
+      )}
 
       <div style={{ fontSize: 11, opacity: 0.8 }}>
         Drag horizontally to orbit. Shows evaporator A-coil, ECM blower housing, MERV-13 filter rack, secondary galvanized

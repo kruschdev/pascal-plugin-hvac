@@ -140,7 +140,10 @@ export function calculateManualJLoad(params: {
   const rawTons = Math.max(1.5, totalCoolingBtuh / 12000)
   const recommendedTons =
     rawTons <= 5.0 ? Math.ceil(rawTons * 2) / 2 : Math.ceil(rawTons)
-  const designTotalCfm = Math.round(recommendedTons * 400)
+  const coolingCfm = Math.round(recommendedTons * 400)
+  // For heating-dominated cold climates, ensure design airflow keeps furnace temperature rise <= 55°F (below 70°F limit)
+  const heatingCfm = totalHeat > 0 ? Math.ceil(totalHeat / (1.08 * 55) / 25) * 25 : 0
+  const designTotalCfm = Math.max(coolingCfm, heatingCfm)
 
   // Prorate system airflow (400 CFM/ton) across rooms by dominant cooling/heating load
   const sumWeight = roomResults.reduce((s, r) => s + Math.max(r.coolingTotalBtuh, r.heatingBtuh), 0) || 1
@@ -429,7 +432,7 @@ export function sizeHvacEquipment(params: {
   const condenserBreakerAmps =
     tons <= 2.0 ? 25 : tons <= 3.0 ? 35 : tons <= 4.0 ? 45 : tons <= 5.0 ? 60 : Math.min(125, Math.ceil((tons * 12) / 10) * 10)
 
-  // Electric air handler backup heat-strip kit (5/10/15 kW) vs gas furnace blower (120V 15A)
+  // Electric air handler backup heat-strip kit (5/10/15/20 kW) vs gas furnace blower (120V 15A)
   const airHandlerBreakerAmps =
     systemType === 'split-gas-furnace'
       ? 15
@@ -437,7 +440,9 @@ export function sizeHvacEquipment(params: {
         ? 40
         : tons <= 3.5
           ? 60
-          : 60
+          : tons <= 5.0
+            ? 90
+            : 125
 
   // Furnace input capacity (96% AFUE, rounded to standard 20 kBTU/h steps)
   const furnaceInputBtuh =

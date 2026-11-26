@@ -131,7 +131,22 @@ export function getHvacEquipmentElectricalDemand(params: {
       }
     }
     case 'air-handler': {
-      const kw = Math.max(5, heatStripKw)
+      const kw = Math.max(0, heatStripKw)
+      if (kw <= 0) {
+        return {
+          required: true,
+          voltage: 120,
+          poles: 1,
+          breakerAmps: 15,
+          loadVa: 600,
+          continuous: false,
+          dedicatedCircuit: true,
+          gfciRequired: false,
+          afciRequired: false,
+          loadCategory: 'motor',
+          label: 'Air Handler Blower (No Aux Heat Strip)',
+        }
+      }
       const loadVa = Math.round(kw * 1000 + 600) // Aux heat strips + ECM blower
       const amps = nextStandardBreaker((loadVa / 240) * 1.25)
       return {

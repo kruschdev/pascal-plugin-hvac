@@ -291,7 +291,7 @@ export default function HvacScheduleView() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {audit.findings.length === 0 && (
             <div style={{ padding: 12, borderRadius: 8, background: 'rgba(34,197,94,0.14)', border: '1px solid #22c55e' }}>
-              0 Errors · 0 Warnings · 0 Info — All IMC / ACCA Manual D / IECC / NEC 110.26(E) &amp; Trade-Priority checks passed!
+              0 Errors · 0 Warnings · 0 Info: All IMC / ACCA Manual D / IECC / NEC 110.26(E) &amp; Trade-Priority checks passed!
             </div>
           )}
           {audit.findings.map((f) => (
