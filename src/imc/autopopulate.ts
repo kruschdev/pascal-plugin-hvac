@@ -21,6 +21,7 @@ import {
   getHvacEquipmentElectricalDemand,
 } from './framing-interop'
 import {
+  type HvacObstacle,
   extractHvacObstacles,
   extractRoomPolygons,
   extractWallSegments,
@@ -197,6 +198,71 @@ function sceneBounds(
   return { minX, maxX, minZ, maxZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2 }
 }
 
+function minClearanceToObstaclesXZ(
+  x: number,
+  z: number,
+  obstacles: ReadonlyArray<HvacObstacle>,
+): number {
+  let minDist = Infinity
+  for (const obs of obstacles) {
+    const dx = x < obs.box.minX ? obs.box.minX - x : x > obs.box.maxX ? x - obs.box.maxX : 0
+    const dz = z < obs.box.minZ ? obs.box.minZ - z : z > obs.box.maxZ ? z - obs.box.maxZ : 0
+    const d = Math.hypot(dx, dz)
+    if (d < minDist) minDist = d
+  }
+  return minDist
+}
+
+/**
+ * Pick an equipment placement spot near `basePos` that stays well clear of existing
+ * Priority #1 Structural columns, Priority #2 Plumbing equipment/manifolds/pipes,
+ * and NEC 110.26(E) electrical panels so HVAC never drops on top of a water heater or panel.
+ */
+function findClearMechanicalSpot(
+  baseX: number,
+  baseZ: number,
+  obstacles: ReadonlyArray<HvacObstacle>,
+  bounds: { minX: number; maxX: number; minZ: number; maxZ: number },
+  minClearanceM = 0.85,
+): [number, number] {
+  if (obstacles.length === 0) return [round2(baseX), round2(baseZ)]
+  const rings: ReadonlyArray<readonly [number, number]> = [
+    [0, 0],
+    [1.1, 0],
+    [-1.1, 0],
+    [0, 1.1],
+    [0, -1.1],
+    [1.3, 1.1],
+    [-1.3, 1.1],
+    [1.3, -1.1],
+    [-1.3, -1.1],
+    [2.0, 0],
+    [-2.0, 0],
+    [0, 2.0],
+    [0, -2.0],
+    [2.2, 1.6],
+    [-2.2, 1.6],
+    [2.2, -1.6],
+    [-2.2, -1.6],
+  ]
+  let best: [number, number] = [round2(baseX), round2(baseZ)]
+  let bestClear = -1
+  for (const [ox, oz] of rings) {
+    const cx = round2(baseX + ox)
+    const cz = round2(baseZ + oz)
+    if (cx < bounds.minX + 0.5 || cx > bounds.maxX - 0.5 || cz < bounds.minZ + 0.5 || cz > bounds.maxZ - 0.5) {
+      continue
+    }
+    const clear = minClearanceToObstaclesXZ(cx, cz, obstacles)
+    if (clear >= minClearanceM) return [cx, cz]
+    if (clear > bestClear) {
+      bestClear = clear
+      best = [cx, cz]
+    }
+  }
+  return best
+}
+
 /**
  * Generate a complete IMC / ACCA Manual J-D-S HVAC layout plan from live Pascal geometry.
  */
@@ -301,7 +367,8 @@ export function planHvacAutoPopulate(
     rooms.find((r) => r.category === 'hallway') ??
     rooms[0]!
 
-  const indoorPos: Vec3 = [round2(mechRoom.centroid[0]), 0, round2(mechRoom.centroid[1])]
+  const [clearX, clearZ] = findClearMechanicalSpot(mechRoom.centroid[0], mechRoom.centroid[1], obstacles, bounds, 1.4)
+  const indoorPos: Vec3 = [clearX, 0, clearZ]
   const outdoorPos: Vec3 = [round2(bounds.maxX + 0.95), 0, round2(indoorPos[2])]
   const plenumY =
     plenumLocation === 'attic'
@@ -772,7 +839,8 @@ export function planHvacAutoPopulate(
   // 4. Optional ASHRAE 62.2 ERV Fresh-Air Ventilator & Duct
   if (includeErv) {
     const ervId = nextEqId()
-    const ervPos: Vec3 = [round2(indoorPos[0] + 0.8), round2(Math.min(levelH - 0.55, 1.85)), round2(indoorPos[2])]
+    const [ervX, ervZ] = findClearMechanicalSpot(indoorPos[0] + 0.85, indoorPos[2] + 0.45, obstacles, bounds, 0.75)
+    const ervPos: Vec3 = [ervX, round2(Math.min(levelH - 0.55, 1.85)), ervZ]
     equipment.push({
       id: ervId,
       name: `ASHRAE 62.2 ERV (${ventilation.recommendedErvCfm} CFM)`,

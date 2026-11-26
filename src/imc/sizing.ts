@@ -99,17 +99,23 @@ export function calculateManualJLoad(params: {
     if (isUnconditioned) continue
 
     const ceilingMult = Math.max(0.85, (r.ceilingHeightFt ?? 8.5) / 8.5)
-    const winSqft = r.windowSqft ?? round2(r.areaSqft * windowRatio)
+    const baselineWinSqft = r.areaSqft * windowRatio
+    // Base zone.coolingBtuPerSqft already includes typical baseline glazing & latent humidity;
+    // only add excess solar gain when explicit windowSqft exceeds baseline glazing ratio.
+    const excessWinSqft = typeof r.windowSqft === 'number' ? Math.max(0, r.windowSqft - baselineWinSqft) : 0
     const kitchenApplianceGain = /kitchen/.test(cat) ? 1200 : 0
     const bathGain = /bath/.test(cat) ? 350 : 0
 
     const heatBtuh = Math.round(r.areaSqft * zone.heatingBtuPerSqft * insFactor * ceilingMult * occupancyMult)
-    const coolSensible = Math.round(
-      (r.areaSqft * zone.coolingBtuPerSqft * insFactor * ceilingMult + winSqft * 150 + kitchenApplianceGain + bathGain) *
+    const coolTotal = Math.round(
+      (r.areaSqft * zone.coolingBtuPerSqft * insFactor * ceilingMult +
+        excessWinSqft * 35 +
+        kitchenApplianceGain +
+        bathGain) *
         occupancyMult,
     )
-    const coolLatent = Math.round(coolSensible * (latentShare / (1 - latentShare)))
-    const coolTotal = coolSensible + coolLatent
+    const coolLatent = Math.round(coolTotal * latentShare)
+    const coolSensible = coolTotal - coolLatent
 
     totalSqft += r.areaSqft
     totalHeat += heatBtuh

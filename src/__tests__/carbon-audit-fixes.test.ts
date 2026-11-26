@@ -287,4 +287,27 @@ describe('Phase 1 Gemini 4 Carbon Audit Regression Suite (BUG-01..10, OPT-01..04
     })
     expect(bomFanOnly.lines.some((l) => l.item.includes('Secondary Condensate Pan'))).toBe(false)
   })
+
+  test('VIS-01 & VIS-02: 1975 sq ft Zone 4A home sizes to realistic 3.5-4.5 Tons (not 10T), and Air Handler offsets clear of existing Plumbing water heater', () => {
+    const scene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.55 },
+      r1: { id: 'r1', type: 'zone', name: 'Wawa Zone', parentId: 'level_0', polygon: [[0, 0], [6, 0], [6, 4], [0, 4]] },
+      r2: { id: 'r2', type: 'zone', name: 'Relax Zone', parentId: 'level_0', polygon: [[6, 0], [22, 0], [22, 10], [6, 10]] },
+      // Existing plumbing water heater sitting right at r1 centroid (3, 0, 2)
+      wh_existing: {
+        id: 'wh_existing',
+        type: 'plumbing:equipment',
+        name: 'Electric Water Heater',
+        parentId: 'level_0',
+        position: [3, 0, 2],
+      },
+    }
+    const plan = planHvacAutoPopulate(scene, { levelId: 'level_0', climateZone: '4A', systemType: 'split-heat-pump' })
+    expect(plan.load.recommendedTons).toBeGreaterThanOrEqual(3.5)
+    expect(plan.load.recommendedTons).toBeLessThanOrEqual(4.5)
+
+    const ahu = plan.equipment.find((e) => e.equipmentKind === 'air-handler')!
+    const distFromWh = Math.hypot(ahu.position[0] - 3, ahu.position[2] - 2)
+    expect(distFromWh).toBeGreaterThanOrEqual(0.85)
+  })
 })

@@ -76,16 +76,19 @@ export default function AirHandlerCutawayView({
     camera.position.set(0.55, 0.25, 2.35)
     camera.lookAt(0.2, 0.15, 0)
 
-    const renderer = new WebGLRenderer({ antialias: true })
+    const renderer = new WebGLRenderer({ antialias: true, preserveDrawingBuffer: true })
     renderer.setSize(width, height)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
     el.innerHTML = ''
     el.appendChild(renderer.domElement)
 
-    scene.add(new AmbientLight(0xffffff, 0.88))
-    const key = new DirectionalLight(0xffffff, 1.35)
+    scene.add(new AmbientLight(0xffffff, 1.25))
+    const key = new DirectionalLight(0xffffff, 1.45)
     key.position.set(2.5, 3.5, 4)
     scene.add(key)
+    const fill = new DirectionalLight(0xdbeafe, 0.95)
+    fill.position.set(-2.2, 0.8, 3.6)
+    scene.add(fill)
 
     sceneRef.current = scene
     cameraRef.current = camera
@@ -176,6 +179,10 @@ export default function AirHandlerCutawayView({
     scene.add(model)
     modelRef.current = model
     renderer.render(scene, camera)
+    const rafId = typeof requestAnimationFrame !== 'undefined' ? requestAnimationFrame(() => renderer.render(scene, camera)) : 0
+    return () => {
+      if (rafId && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(rafId)
+    }
   }, [coolingTons, viewMode, supplyBranchCount])
 
   return (

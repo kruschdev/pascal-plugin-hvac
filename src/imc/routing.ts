@@ -684,8 +684,12 @@ export function routeCondensateDrain(params: {
   if (clashes.length > 0) {
     for (const wp of [
       [[from[0], to[2]], [to[0], to[2]]] as const,
-      [[to[0], from[2] + 0.55], [to[0], to[2]]] as const,
-      [[to[0], from[2] - 0.55], [to[0], to[2]]] as const,
+      [[from[0], from[2] + 0.65], [to[0], from[2] + 0.65], [to[0], to[2]]] as const,
+      [[from[0], from[2] - 0.65], [to[0], from[2] - 0.65], [to[0], to[2]]] as const,
+      [[from[0], from[2] + 1.35], [to[0], from[2] + 1.35], [to[0], to[2]]] as const,
+      [[from[0], from[2] - 1.35], [to[0], from[2] - 1.35], [to[0], to[2]]] as const,
+      [[from[0] + 0.9, from[2]], [from[0] + 0.9, to[2]], [to[0], to[2]]] as const,
+      [[from[0] - 0.9, from[2]], [from[0] - 0.9, to[2]], [to[0], to[2]]] as const,
     ]) {
       const cand = buildSloped(wp)
       const c = detectHvacClashes(cand, obstacles, 0.02)
