@@ -229,8 +229,10 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
     // Both curb drop plenums sit directly under the RTU curb & strictly below the 3.0m roof deck, NOT at distant mechRoom centroid (12, 5)
     expect(Math.hypot(supPl.position[0] - rtu.position[0], supPl.position[2] - rtu.position[2])).toBeLessThan(0.6)
     expect(Math.hypot(retPl.position[0] - rtu.position[0], retPl.position[2] - rtu.position[2])).toBeLessThan(0.6)
+    expect(supPl.position[1]).toBeGreaterThanOrEqual(2.35)
     expect(supPl.position[1]).toBeLessThan(2.75)
     expect(supPl.position[1] + (supPl.heightM ?? 0.25)).toBeLessThanOrEqual(3.0)
+    expect(retPl.position[1]).toBeGreaterThanOrEqual(2.35)
     expect(retPl.position[1]).toBeLessThan(2.75)
     expect(retPl.position[1] + (retPl.heightM ?? 0.25)).toBeLessThanOrEqual(3.0)
 

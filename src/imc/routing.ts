@@ -270,11 +270,6 @@ export function resolveLevelHeightM(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   levelId: string | null = null,
 ): number {
-  const lvl = levelId ? nodes[levelId] : Object.values(nodes).find((n) => n.type === 'level')
-  const explicitLevelH =
-    typeof lvl?.height === 'number' && Number.isFinite(lvl.height) && lvl.height > 1.5
-      ? lvl.height
-      : null
   let maxExplicitWallH = 0
   for (const n of Object.values(nodes)) {
     if (n.type !== 'wall' || !belongsToLevel(nodes, n, levelId)) continue
@@ -282,13 +277,17 @@ export function resolveLevelHeightM(
       if (n.height > maxExplicitWallH) maxExplicitWallH = n.height
     }
   }
-  if (explicitLevelH !== null) {
-    // Use explicit level.height (or tallest perimeter wall if taller than a default level.height)
-    // and never average low interior partitions with tall outer commercial walls.
-    return Math.max(2.2, maxExplicitWallH > explicitLevelH ? maxExplicitWallH : explicitLevelH)
-  }
+  // Align with Structural roof-deck resolution: tallest explicit wall (> 1.5m) wins first
+  // so perimeter walls match the true physical roof deck even when level.height differs;
+  // never average short interior partitions with tall perimeter walls.
   if (maxExplicitWallH > 0) return Math.max(2.2, maxExplicitWallH)
-  return 2.6
+  const lvl = levelId ? nodes[levelId] : Object.values(nodes).find((n) => n.type === 'level')
+  const explicitLevelH =
+    typeof lvl?.height === 'number' && Number.isFinite(lvl.height) && lvl.height > 1.5
+      ? lvl.height
+      : null
+  if (explicitLevelH !== null) return Math.max(2.2, explicitLevelH)
+  return 2.7
 }
 
 export type XzBounds2D = {

@@ -190,24 +190,26 @@ function sceneBounds(
   let maxX = -Infinity
   let minZ = Infinity
   let maxZ = -Infinity
-  // When walls exist, derive building bounds strictly from walled geometry so outdoor pools,
-  // patios, decks, and yards never inflate the building envelope (VIS-06).
+  // When walls span a 2D footprint (> 0.5m in both X and Z), derive building bounds strictly
+  // from walled geometry so outdoor pools, patios, decks, and yards never inflate the envelope (VIS-06),
+  // while guarding single/collinear wall scenes from degenerate zero-width clamping (R2-HVC-03).
   for (const w of walls) {
     minX = Math.min(minX, w.start[0], w.end[0])
     maxX = Math.max(maxX, w.start[0], w.end[0])
     minZ = Math.min(minZ, w.start[1], w.end[1])
     maxZ = Math.max(maxZ, w.start[1], w.end[1])
   }
-  if (!Number.isFinite(minX)) {
-    const interiorRooms = rooms.filter((r) => r.category !== 'exterior')
-    const srcRooms = interiorRooms.length > 0 ? interiorRooms : rooms
-    for (const r of srcRooms) {
-      for (const [x, z] of r.polygon) {
-        minX = Math.min(minX, x)
-        maxX = Math.max(maxX, x)
-        minZ = Math.min(minZ, z)
-        maxZ = Math.max(maxZ, z)
-      }
+  if (Number.isFinite(minX) && maxX - minX > 0.5 && maxZ - minZ > 0.5) {
+    return { minX, maxX, minZ, maxZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2 }
+  }
+  const interiorRooms = rooms.filter((r) => r.category !== 'exterior')
+  const srcRooms = interiorRooms.length > 0 ? interiorRooms : rooms
+  for (const r of srcRooms) {
+    for (const [x, z] of r.polygon) {
+      minX = Math.min(minX, x)
+      maxX = Math.max(maxX, x)
+      minZ = Math.min(minZ, z)
+      maxZ = Math.max(maxZ, z)
     }
   }
   if (!Number.isFinite(minX)) return { minX: 0, maxX: 10, minZ: 0, maxZ: 8, cx: 5, cz: 4 }
@@ -1921,71 +1923,153 @@ export function planHvacAutoPopulate(
         const rank = (r: (typeof rooms)[number]) => (r.category === 'hallway' ? 3 : r.category === 'living' ? 2 : 1)
         return rank(b) - rank(a)
       })
-    if (eligibleReturnRooms.length > 0) {
-      const retGrilleY =
-        plenumLocation === 'attic' ? round2(levelH - 0.03) : round2(Math.min(levelH - 0.35, 2.2))
-      const retMinClear = Math.max(0.42, retClashSpan.horizontal + 0.08)
-      const retMaxY = maxPlenumYFor(retHalfV)
-      const retCeilingObstacles =
-        plenumLocation === 'attic'
-          ? obstacles.filter((o) => o.box.maxY >= retGrilleY - retClashSpan.vertical - 0.05)
-          : obstacles
-      const isInsideProhibitedOverlap = (px: number, pz: number): boolean =>
-        prohibitedReturnRooms.some((pr) => pointInPolygon2D(px, pz, pr.polygon))
+    const isSynthesizedCorridor = eligibleReturnRooms.length === 0
+    const returnCandidates: Array<{
+      name: string
+      polygon: ReadonlyArray<readonly [number, number]>
+      centroid: readonly [number, number]
+    }> =
+      eligibleReturnRooms.length > 0
+        ? eligibleReturnRooms
+        : [
+            {
+              name: 'Common Corridor',
+              polygon: [
+                [indoorBounds.minX, indoorBounds.minZ],
+                [indoorBounds.maxX, indoorBounds.minZ],
+                [indoorBounds.maxX, indoorBounds.maxZ],
+                [indoorBounds.minX, indoorBounds.maxZ],
+              ] as const,
+              centroid: [
+                round2((indoorBounds.minX + indoorBounds.maxX) / 2),
+                round2((indoorBounds.minZ + indoorBounds.maxZ) / 2),
+              ] as const,
+            },
+          ]
 
-      let chosenRetRoom = eligibleReturnRooms[0]!
-      let chosenRetPos: Vec3 = [
-        clampToSpan(chosenRetRoom.centroid[0], indoorBounds.minX, indoorBounds.maxX),
-        retGrilleY,
-        clampToSpan(chosenRetRoom.centroid[1], indoorBounds.minZ, indoorBounds.maxZ),
-      ]
-      let chosenRetRoute: ReturnType<typeof routeHvacDuctRun> | null = null
-      let chosenInProhibited = true
+    const retGrilleY =
+      plenumLocation === 'attic' ? round2(levelH - 0.03) : round2(Math.min(levelH - 0.35, 2.2))
+    const retMinClear = Math.max(0.42, retClashSpan.horizontal + 0.08)
+    const retMaxY = maxPlenumYFor(retHalfV)
+    const retCeilingObstacles =
+      plenumLocation === 'attic'
+        ? obstacles.filter((o) => o.box.maxY >= retGrilleY - retClashSpan.vertical - 0.05)
+        : obstacles
+    const isInsideProhibitedOverlap = (px: number, pz: number): boolean =>
+      prohibitedReturnRooms.some((pr) => pointInPolygon2D(px, pz, pr.polygon))
+    const isClearOfProhibitedCorridorMargin = (px: number, pz: number): boolean => {
+      if (isInsideProhibitedOverlap(px, pz)) return false
+      const m = 0.08
+      return (
+        !isInsideProhibitedOverlap(px + m, pz) &&
+        !isInsideProhibitedOverlap(px - m, pz) &&
+        !isInsideProhibitedOverlap(px, pz + m) &&
+        !isInsideProhibitedOverlap(px, pz - m)
+      )
+    }
 
-      for (const candRoom of eligibleReturnRooms) {
-        const retBaseX = candRoom.centroid[0]
-        const retBaseZ = pointInPolygon2D(retBaseX, candRoom.centroid[1] + 0.35, candRoom.polygon)
-          ? candRoom.centroid[1] + 0.35
-          : candRoom.centroid[1]
-        const spotRes = findClearSpotForRiser({
-          baseX: retBaseX,
-          baseZ: retBaseZ,
-          y0: retGrilleY,
-          y1: retPlenumY,
-          clashSpan: retClashSpan,
-          obstacles,
-          bounds,
-          minFloorClearanceM: retMinClear,
-          insidePolygon: candRoom.polygon,
-          excludePolygons: prohibitedReturnPolygons,
-          floorObstacles: retCeilingObstacles,
-        })
-        const candPos: Vec3 = [spotRes.spot[0], retGrilleY, spotRes.spot[1]]
-        const inProhibited = isInsideProhibitedOverlap(candPos[0], candPos[2])
-        const candRoute = routeHvacDuctRun({
-          from: candPos,
-          to: returnPlenumPos,
-          plenumY: retMaxY !== undefined ? Math.min(retPlenumY, retMaxY) : retPlenumY,
-          maxPlenumY: retMaxY,
-          ductHalfSpanM: retClashSpan,
-          allowDiagonalBranch: false,
-          obstacles,
-          xzBounds: indoorBounds,
-          roofEnvelope: atticRoof,
-        })
-        const better =
-          !chosenRetRoute ||
-          (chosenInProhibited && !inProhibited) ||
-          (chosenInProhibited === inProhibited && candRoute.clashes.length < chosenRetRoute.clashes.length)
-        if (better) {
-          chosenRetRoom = candRoom
-          chosenRetPos = candPos
-          chosenRetRoute = candRoute
-          chosenInProhibited = inProhibited
+    let chosenRetRoom = returnCandidates[0]!
+    let chosenRetPos: Vec3 = [
+      clampToSpan(chosenRetRoom.centroid[0], indoorBounds.minX, indoorBounds.maxX),
+      retGrilleY,
+      clampToSpan(chosenRetRoom.centroid[1], indoorBounds.minZ, indoorBounds.maxZ),
+    ]
+    let chosenRetRoute: ReturnType<typeof routeHvacDuctRun> | null = null
+    let chosenInProhibited = true
+    let hasValidReturnSpot = !isSynthesizedCorridor
+
+    for (const candRoom of returnCandidates) {
+      let retBaseX = candRoom.centroid[0]
+      let retBaseZ = pointInPolygon2D(retBaseX, candRoom.centroid[1] + 0.35, candRoom.polygon)
+        ? candRoom.centroid[1] + 0.35
+        : candRoom.centroid[1]
+      let spotRes = findClearSpotForRiser({
+        baseX: retBaseX,
+        baseZ: retBaseZ,
+        y0: retGrilleY,
+        y1: retPlenumY,
+        clashSpan: retClashSpan,
+        obstacles,
+        bounds,
+        minFloorClearanceM: retMinClear,
+        insidePolygon: candRoom.polygon,
+        excludePolygons: prohibitedReturnPolygons,
+        floorObstacles: retCeilingObstacles,
+      })
+
+      // For partially-zoned houses (R2-HVC-02), if the center & 5x5 coarse grid missed an
+      // off-center unzoned hallway/living pocket inside indoorBounds, probe a denser 9x9 grid.
+      if (isSynthesizedCorridor && (!spotRes.foundValid || !isClearOfProhibitedCorridorMargin(spotRes.spot[0], spotRes.spot[1]))) {
+        const spanX = indoorBounds.maxX - indoorBounds.minX
+        const spanZ = indoorBounds.maxZ - indoorBounds.minZ
+        if (spanX > 0.25 && spanZ > 0.25) {
+          let seedSpot: [number, number] | null = null
+          let bestSeedDist = Infinity
+          const steps = 9
+          for (let ix = 1; ix <= steps; ix++) {
+            for (let iz = 1; iz <= steps; iz++) {
+              const gx = round2(indoorBounds.minX + (spanX * ix) / (steps + 1))
+              const gz = round2(indoorBounds.minZ + (spanZ * iz) / (steps + 1))
+              if (!isClearOfProhibitedCorridorMargin(gx, gz)) continue
+              const dist = Math.hypot(gx - candRoom.centroid[0], gz - candRoom.centroid[1])
+              if (dist < bestSeedDist) {
+                bestSeedDist = dist
+                seedSpot = [gx, gz]
+              }
+            }
+          }
+          if (seedSpot) {
+            retBaseX = seedSpot[0]
+            retBaseZ = seedSpot[1]
+            spotRes = findClearSpotForRiser({
+              baseX: retBaseX,
+              baseZ: retBaseZ,
+              y0: retGrilleY,
+              y1: retPlenumY,
+              clashSpan: retClashSpan,
+              obstacles,
+              bounds,
+              minFloorClearanceM: retMinClear,
+              insidePolygon: candRoom.polygon,
+              excludePolygons: prohibitedReturnPolygons,
+              floorObstacles: retCeilingObstacles,
+            })
+          }
         }
-        if (!inProhibited && candRoute.clashes.length === 0) break
       }
 
+      const candPos: Vec3 = [spotRes.spot[0], retGrilleY, spotRes.spot[1]]
+      const inProhibited = isSynthesizedCorridor
+        ? !spotRes.foundValid || !isClearOfProhibitedCorridorMargin(candPos[0], candPos[2])
+        : isInsideProhibitedOverlap(candPos[0], candPos[2])
+      if (isSynthesizedCorridor && inProhibited) continue
+
+      const candRoute = routeHvacDuctRun({
+        from: candPos,
+        to: returnPlenumPos,
+        plenumY: retMaxY !== undefined ? Math.min(retPlenumY, retMaxY) : retPlenumY,
+        maxPlenumY: retMaxY,
+        ductHalfSpanM: retClashSpan,
+        allowDiagonalBranch: false,
+        obstacles,
+        xzBounds: indoorBounds,
+        roofEnvelope: atticRoof,
+      })
+      const better =
+        !chosenRetRoute ||
+        (chosenInProhibited && !inProhibited) ||
+        (chosenInProhibited === inProhibited && candRoute.clashes.length < chosenRetRoute.clashes.length)
+      if (better) {
+        chosenRetRoom = candRoom
+        chosenRetPos = candPos
+        chosenRetRoute = candRoute
+        chosenInProhibited = inProhibited
+        hasValidReturnSpot = true
+      }
+      if (!inProhibited && candRoute.clashes.length === 0) break
+    }
+
+    if (hasValidReturnSpot) {
       const retGrilleId = nextTermId()
       terminals.push({
         id: retGrilleId,
@@ -2055,10 +2139,10 @@ export function planHvacAutoPopulate(
     throwFt: 0,
   })
 
-  // Helper to clamp exterior wall penetration height strictly below roof rafters or upper-story floor slab (VIS-01 / HVA-BUG-03)
+  // Helper to clamp exterior wall penetration height strictly below roof rafters or upper-story floor slab (VIS-01 / HVA-BUG-03 / R2-HVC-03)
   const clampExteriorExitY = (wx: number, wz: number, desiredY: number, halfSpan: number): number => {
     const soffitExitY = round2(Math.min(levelH - Math.max(0.18, halfSpan + 0.08), desiredY))
-    if (!useTrueAtticPlenum && (plenumLocation === 'attic' || plenumLocation === 'conditioned-soffit')) {
+    if (!roofEnvelope.hasRoofAbove || (!useTrueAtticPlenum && (plenumLocation === 'attic' || plenumLocation === 'conditioned-soffit'))) {
       return soffitExitY
     }
     if (!atticRoof) return desiredY
@@ -2348,12 +2432,15 @@ export function planHvacAutoPopulate(
         const exSized = sizeDuctForCfm({ cfm: 80, shape: 'round', material: 'galvanized-sheet', occupancy })
         const exHalfSpan = Math.max(0.06, (exSized.diameterIn * 0.0254) / 2)
         const exMaxY = maxPlenumYFor(exHalfSpan)
+        const exCappedBelowSlab = plenumLocation === 'conditioned-soffit' || !roofEnvelope.hasRoofAbove
+        const exSoffitCapY = round2(levelH - Math.max(0.16, exHalfSpan + 0.06))
         const fanY = round2(levelH - 0.05)
-        const rawExPlenumY =
-          plenumLocation === 'conditioned-soffit'
-            ? round2(levelH - Math.max(0.14, exHalfSpan + 0.06))
-            : round2(levelH + 0.3)
-        const exPlenumY = exMaxY !== undefined && plenumLocation === 'attic' ? Math.min(rawExPlenumY, exMaxY) : rawExPlenumY
+        const rawExPlenumY = exCappedBelowSlab ? exSoffitCapY : round2(levelH + 0.3)
+        const exPlenumY = exCappedBelowSlab
+          ? rawExPlenumY
+          : exMaxY !== undefined && plenumLocation === 'attic'
+            ? Math.min(rawExPlenumY, exMaxY)
+            : rawExPlenumY
         const fanRes = findClearSpotForRiser({
           baseX: room.centroid[0],
           baseZ: room.centroid[1],
@@ -2399,7 +2486,11 @@ export function planHvacAutoPopulate(
           (a, b) =>
             Math.hypot(a[0] - fanX, a[2] - fanZ) - Math.hypot(b[0] - fanX, b[2] - fanZ),
         )
-        const exRouteMaxY = exMaxY !== undefined && exMaxY > 0 ? exMaxY : undefined
+        const exRouteMaxY = exCappedBelowSlab
+          ? exSoffitCapY
+          : exMaxY !== undefined && exMaxY > 0
+            ? exMaxY
+            : undefined
         let exRoute = routeHvacDuctRun({
           from: fanPos,
           to: rawBathTargets[0]!,
@@ -2457,12 +2548,15 @@ export function planHvacAutoPopulate(
         const hoodDiam = Math.max(6, hoodSized.diameterIn)
         const hoodHalfSpan = Math.max(0.08, (hoodDiam * 0.0254) / 2)
         const hoodMaxY = maxPlenumYFor(hoodHalfSpan)
+        const hoodCappedBelowSlab = plenumLocation === 'conditioned-soffit' || !roofEnvelope.hasRoofAbove
+        const hoodSoffitCapY = round2(levelH - Math.max(0.16, hoodHalfSpan + 0.06))
         const hoodY = round2(Math.min(levelH - 0.5, 1.78))
-        const rawHoodPlenumY =
-          plenumLocation === 'conditioned-soffit'
-            ? round2(levelH - Math.max(0.16, hoodHalfSpan + 0.06))
-            : round2(levelH + 0.34)
-        const hoodPlenumY = hoodMaxY !== undefined && plenumLocation === 'attic' ? Math.min(rawHoodPlenumY, hoodMaxY) : rawHoodPlenumY
+        const rawHoodPlenumY = hoodCappedBelowSlab ? hoodSoffitCapY : round2(levelH + 0.34)
+        const hoodPlenumY = hoodCappedBelowSlab
+          ? rawHoodPlenumY
+          : hoodMaxY !== undefined && plenumLocation === 'attic'
+            ? Math.min(rawHoodPlenumY, hoodMaxY)
+            : rawHoodPlenumY
         const hoodRes = findClearSpotForRiser({
           baseX: room.centroid[0],
           baseZ: room.centroid[1],
@@ -2508,7 +2602,11 @@ export function planHvacAutoPopulate(
           (a, b) =>
             Math.hypot(a[0] - hoodX, a[2] - hoodZ) - Math.hypot(b[0] - hoodX, b[2] - hoodZ),
         )
-        const hoodRouteMaxY = hoodMaxY !== undefined && hoodMaxY > 0 ? hoodMaxY : undefined
+        const hoodRouteMaxY = hoodCappedBelowSlab
+          ? hoodSoffitCapY
+          : hoodMaxY !== undefined && hoodMaxY > 0
+            ? hoodMaxY
+            : undefined
         let hoodRoute = routeHvacDuctRun({
           from: hoodFrom,
           to: hoodTargets[0]!,

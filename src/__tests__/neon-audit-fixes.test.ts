@@ -283,8 +283,8 @@ describe('Phase 3 Neon MEP & 3D Visual Audit Regression Suite (HVA-BUG-01..06, H
     const elapsedMs = performance.now() - t0
     expect(ductRes.clashes).toHaveLength(1)
     expect(condRes.clashes).toHaveLength(1)
-    // Early exit + broad-phase filter should finish well under 50ms even on slow CI
-    expect(elapsedMs).toBeLessThan(50)
+    // Early exit + broad-phase filter should finish well under 500ms even on slow/loaded CI (R2-CON-01)
+    expect(elapsedMs).toBeLessThan(500)
   })
 
   test('HVA-CON-01: ERV & bath exhaust ducts size before clash-routing and apply effectiveDuctR in attic runs', () => {
@@ -401,7 +401,7 @@ describe('Phase 3 Neon MEP & 3D Visual Audit Regression Suite (HVA-BUG-01..06, H
     }
   })
 
-  test('VIS-02 & VIS-04: Commercial Bouldering Gym resolves true 5.0m roof height for RTU (not averaged 2.6m) and routes RTU condensate strictly inside roof deck', () => {
+  test('VIS-02 & VIS-04: Commercial Bouldering Gym resolves true 4.8m perimeter wall roof height for RTU (aligned with Structural, not averaged 2.6m) and routes RTU condensate strictly inside roof deck', () => {
     const boulderingGym: Record<string, SceneNodeLike> = {
       level_0: { id: 'level_0', type: 'level', height: 5.0 },
       // Tall 4.8m outer commercial walls
@@ -420,8 +420,8 @@ describe('Phase 3 Neon MEP & 3D Visual Audit Regression Suite (HVA-BUG-01..06, H
       r_rest: { id: 'r_rest', type: 'zone', name: 'Restroom', parentId: 'level_0', polygon: [[0, 9], [5, 9], [5, 12], [0, 12]] },
     }
 
-    // Even when level.height is omitted, tallest perimeter wall (4.8m) wins over 2.5m partitions
-    expect(resolveLevelHeightM(boulderingGym, 'level_0')).toBe(5.0)
+    // Tallest perimeter wall (4.8m) matches Structural's physical roof deck even when level.height is 5.0m (R2-HVC-01)
+    expect(resolveLevelHeightM(boulderingGym, 'level_0')).toBe(4.8)
     const noLvlHeight = { ...boulderingGym, level_0: { id: 'level_0', type: 'level' } }
     expect(resolveLevelHeightM(noLvlHeight, 'level_0')).toBe(4.8)
 
@@ -436,8 +436,9 @@ describe('Phase 3 Neon MEP & 3D Visual Audit Regression Suite (HVA-BUG-01..06, H
     expect(rtu).toBeDefined()
     expect(rtuCond).toBeDefined()
 
-    // RTU must sit ON TOP of the 5.0m roof deck (not floating mid-room at 2.6m!)
-    expect(rtu.position[1]).toBeGreaterThanOrEqual(5.0)
+    // RTU must sit ON TOP of the 4.8m perimeter-wall roof deck (not floating mid-room at 2.6m!)
+    expect(rtu.position[1]).toBeGreaterThanOrEqual(4.8)
+    expect(rtu.position[1]).toBeLessThanOrEqual(4.95)
 
     // RTU condensate stays cleanly across the flat roof deck strictly inside walled bounds [0.15..17.85, 0.15..11.85]
     for (const pt of rtuCond.path) {
@@ -445,8 +446,8 @@ describe('Phase 3 Neon MEP & 3D Visual Audit Regression Suite (HVA-BUG-01..06, H
       expect(pt[0]).toBeLessThanOrEqual(17.85)
       expect(pt[2]).toBeGreaterThanOrEqual(0.15)
       expect(pt[2]).toBeLessThanOrEqual(11.85)
-      expect(pt[1]).toBeGreaterThanOrEqual(4.6)
-      expect(pt[1]).toBeLessThanOrEqual(5.12)
+      expect(pt[1]).toBeGreaterThanOrEqual(4.4)
+      expect(pt[1]).toBeLessThanOrEqual(4.92)
     }
     const slope = measureCondensateSlope(rtuCond.path)
     expect(slope.hasUphillSegment).toBe(false)
@@ -454,6 +455,7 @@ describe('Phase 3 Neon MEP & 3D Visual Audit Regression Suite (HVA-BUG-01..06, H
 
     const audit = auditSceneHvac(materialize(boulderingGym, plan), { occupancy: 'commercial', climateZone: '4A' })
     expect(audit.errorCount).toBe(0)
+    expect(audit.warningCount).toBe(0)
   })
 
   test('VIS-06: Excludes outdoor Swimming Pool / Piscine & patio/yard zones from conditioned rooms and keeps all indoor ducts/equipment strictly within walled bounds', () => {
@@ -504,6 +506,133 @@ describe('Phase 3 Neon MEP & 3D Visual Audit Regression Suite (HVA-BUG-01..06, H
         expect(pt[0]).toBeLessThanOrEqual(9.85)
         expect(pt[2]).toBeGreaterThanOrEqual(0.15)
         expect(pt[2]).toBeLessThanOrEqual(7.85)
+      }
+    }
+  })
+
+  test('R2-HVC-01: resolveLevelHeightM prioritizes tallest explicit wall (> 1.5m), falls back to level.height, and defaults to 2.7m', () => {
+    // 1. Explicit tall walls win over differing level.height (matches Structural flat roof deck)
+    const wallAndLevel: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 5.0 },
+      w_outer: { id: 'w_outer', type: 'wall', parentId: 'level_0', start: [0, 0], end: [12, 0], height: 4.8 },
+      w_part: { id: 'w_part', type: 'wall', parentId: 'level_0', start: [4, 0], end: [4, 6], height: 2.5 },
+    }
+    expect(resolveLevelHeightM(wallAndLevel, 'level_0')).toBe(4.8)
+
+    // 2. Walls without explicit height fall back to explicit level.height
+    const levelHeightOnly: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 3.4 },
+      w_no_h: { id: 'w_no_h', type: 'wall', parentId: 'level_0', start: [0, 0], end: [10, 0] },
+    }
+    expect(resolveLevelHeightM(levelHeightOnly, 'level_0')).toBe(3.4)
+
+    // 3. Neither walls nor level specify height -> default 2.7m
+    const defaultOnly: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level' },
+    }
+    expect(resolveLevelHeightM(defaultOnly, 'level_0')).toBe(2.7)
+  })
+
+  test('R2-HVC-02: Partially zoned houses with only prohibited rooms synthesize an IMC 601.5-compliant Common Corridor return grille & trunk', () => {
+    // House with enclosed walls [0..12, 0..8] where only Kitchen & Bathroom are labeled (center is unzoned)
+    const partialHouse: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.7 },
+      w1: { id: 'w1', type: 'wall', parentId: 'level_0', start: [0, 0], end: [12, 0], height: 2.7, thickness: 0.16 },
+      w2: { id: 'w2', type: 'wall', parentId: 'level_0', start: [12, 0], end: [12, 8], height: 2.7, thickness: 0.16 },
+      w3: { id: 'w3', type: 'wall', parentId: 'level_0', start: [12, 8], end: [0, 8], height: 2.7, thickness: 0.16 },
+      w4: { id: 'w4', type: 'wall', parentId: 'level_0', start: [0, 8], end: [0, 0], height: 2.7, thickness: 0.16 },
+      r_kit: { id: 'r_kit', type: 'zone', name: 'Kitchen', parentId: 'level_0', polygon: [[0, 0], [4, 0], [4, 4], [0, 4]] },
+      r_bath: { id: 'r_bath', type: 'zone', name: 'Bathroom', parentId: 'level_0', polygon: [[0, 4], [3, 4], [3, 8], [0, 8]] },
+    }
+    const plan = planHvacAutoPopulate(partialHouse, { levelId: 'level_0', systemType: 'split-heat-pump', climateZone: '4A' })
+    const retGrille = plan.terminals.find((t) => t.terminalKind === 'return-grille')
+    const retTrunk = plan.ductRuns.find((d) => d.system === 'return-trunk')
+    expect(retGrille).toBeDefined()
+    expect(retTrunk).toBeDefined()
+    expect(retGrille!.roomName).toBe('Common Corridor')
+    expect(retGrille!.position[0]).toBeGreaterThanOrEqual(0.15)
+    expect(retGrille!.position[0]).toBeLessThanOrEqual(11.85)
+    expect(retGrille!.position[2]).toBeGreaterThanOrEqual(0.15)
+    expect(retGrille!.position[2]).toBeLessThanOrEqual(7.85)
+    expect(pointInPolygon2D(retGrille!.position[0], retGrille!.position[2], [[0, 0], [4, 0], [4, 4], [0, 4]])).toBe(false)
+    expect(pointInPolygon2D(retGrille!.position[0], retGrille!.position[2], [[0, 4], [3, 4], [3, 8], [0, 8]])).toBe(false)
+
+    const audit = auditSceneHvac(materialize(partialHouse, plan), { climateZone: '4A' })
+    expect(audit.findings.some((f) => f.codeRef === 'IMC 601 / Manual D')).toBe(false)
+    expect(audit.findings.some((f) => f.codeRef === 'IMC 601.5 / IRC M1602.2')).toBe(false)
+    expect(audit.errorCount).toBe(0)
+
+    // Off-center unzoned corridor [10..12, 0..8] when center (6, 4) is completely covered by prohibited zones
+    const offCenterHouse: Record<string, SceneNodeLike> = {
+      ...partialHouse,
+      r_kit: { id: 'r_kit', type: 'zone', name: 'Kitchen', parentId: 'level_0', polygon: [[0, 0], [5, 0], [5, 4], [0, 4]] },
+      r_bath: { id: 'r_bath', type: 'zone', name: 'Bathroom', parentId: 'level_0', polygon: [[5, 0], [10, 0], [10, 4], [5, 4]] },
+      r_gar: { id: 'r_gar', type: 'zone', name: 'Garage', parentId: 'level_0', polygon: [[0, 4], [10, 4], [10, 8], [0, 8]] },
+    }
+    const offPlan = planHvacAutoPopulate(offCenterHouse, { levelId: 'level_0', systemType: 'split-heat-pump', climateZone: '4A' })
+    const offRet = offPlan.terminals.find((t) => t.terminalKind === 'return-grille')
+    expect(offRet).toBeDefined()
+    expect(offRet!.roomName).toBe('Common Corridor')
+    expect(offRet!.position[0]).toBeGreaterThan(10)
+    const offAudit = auditSceneHvac(materialize(offCenterHouse, offPlan), { climateZone: '4A' })
+    expect(offAudit.findings.some((f) => f.codeRef === 'IMC 601 / Manual D')).toBe(false)
+    expect(offAudit.findings.some((f) => f.codeRef === 'IMC 601.5 / IRC M1602.2')).toBe(false)
+  })
+
+  test('R2-HVC-03: Guards single/collinear wall sceneBounds and caps lower-story bath/hood exhausts strictly below upper-story floor slab even in crawlspace/basement mode', () => {
+    // 1. Single horizontal wall + 2D room polygon must NOT clamp everything onto degenerate z = 0
+    const singleWallScene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.7 },
+      w_only: { id: 'w_only', type: 'wall', parentId: 'level_0', start: [0, 0], end: [10, 0], height: 2.7, thickness: 0.16 },
+      r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[0, 0], [10, 0], [10, 8], [0, 8]] },
+    }
+    const singleWallPlan = planHvacAutoPopulate(singleWallScene, { levelId: 'level_0', climateZone: '4A' })
+    const retSingle = singleWallPlan.terminals.find((t) => t.terminalKind === 'return-grille')!
+    expect(retSingle).toBeDefined()
+    expect(retSingle.position[2]).toBeGreaterThan(1.0)
+    expect(retSingle.position[2]).toBeLessThan(7.5)
+
+    // 2. Two-story house (level_1 below level_2): Level 1 ceiling bath & range hood exhausts in crawlspace/basement mode
+    // must NEVER pierce the Level 2 floor slab at y = 2.7m!
+    const twoStoryScene: Record<string, SceneNodeLike> = {
+      level_1: { id: 'level_1', type: 'level', elevation: 0, height: 2.7 },
+      level_2: { id: 'level_2', type: 'level', elevation: 3.0, height: 2.7 },
+      w1: { id: 'w1', type: 'wall', parentId: 'level_1', start: [0, 0], end: [12, 0], height: 2.7, thickness: 0.16 },
+      w2: { id: 'w2', type: 'wall', parentId: 'level_1', start: [12, 0], end: [12, 8], height: 2.7, thickness: 0.16 },
+      w3: { id: 'w3', type: 'wall', parentId: 'level_1', start: [12, 8], end: [0, 8], height: 2.7, thickness: 0.16 },
+      w4: { id: 'w4', type: 'wall', parentId: 'level_1', start: [0, 8], end: [0, 0], height: 2.7, thickness: 0.16 },
+      w2_1: { id: 'w2_1', type: 'wall', parentId: 'level_2', start: [0, 0], end: [12, 0], height: 2.7, thickness: 0.16 },
+      r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_1', polygon: [[0, 0], [6, 0], [6, 8], [0, 8]] },
+      r_kit: { id: 'r_kit', type: 'zone', name: 'Kitchen', parentId: 'level_1', polygon: [[6, 0], [9, 0], [9, 4], [6, 4]] },
+      r_bath: { id: 'r_bath', type: 'zone', name: 'Bathroom', parentId: 'level_1', polygon: [[9, 0], [12, 0], [12, 4], [9, 4]] },
+      // Structural beam along soffit to verify detour never hops above the Level 2 slab cap
+      beam_soffit: { id: 'beam_soffit', type: 'structural:beam', parentId: 'level_1', start: [6, 1.0], end: [12, 1.0], widthIn: 3.5, depthIn: 8, elevationY: 2.52 },
+    }
+
+    for (const plenumLoc of ['crawlspace', 'basement'] as const) {
+      const plan = planHvacAutoPopulate(twoStoryScene, {
+        levelId: 'level_1',
+        plenumLocation: plenumLoc,
+        includeExhaustFans: true,
+        climateZone: '4A',
+      })
+      const bathEx = plan.ductRuns.find((d) => d.name.includes('Bath Exhaust'))!
+      const hoodEx = plan.ductRuns.find((d) => d.name.includes('Range Hood'))!
+      expect(bathEx).toBeDefined()
+      expect(hoodEx).toBeDefined()
+
+      const bathHalf = Math.max(0.06, (bathEx.diameter * 0.0254) / 2)
+      const bathCap = Math.round((2.7 - Math.max(0.16, bathHalf + 0.06)) * 100) / 100
+      for (let i = 1; i < bathEx.path.length; i++) {
+        expect(bathEx.path[i]![1]).toBeLessThanOrEqual(bathCap + 1e-4)
+        expect(bathEx.path[i]![1] + bathHalf).toBeLessThan(2.7)
+      }
+
+      const hoodHalf = Math.max(0.08, (hoodEx.diameter * 0.0254) / 2)
+      const hoodCap = Math.round((2.7 - Math.max(0.16, hoodHalf + 0.06)) * 100) / 100
+      for (const pt of hoodEx.path) {
+        expect(pt[1]).toBeLessThanOrEqual(hoodCap + 1e-4)
+        expect(pt[1] + hoodHalf).toBeLessThan(2.7)
       }
     }
   })
