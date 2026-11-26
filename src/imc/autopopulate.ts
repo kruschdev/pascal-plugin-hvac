@@ -224,33 +224,54 @@ function findClearMechanicalSpot(
   obstacles: ReadonlyArray<HvacObstacle>,
   bounds: { minX: number; maxX: number; minZ: number; maxZ: number },
   minClearanceM = 0.85,
+  compactRings = false,
 ): [number, number] {
   if (obstacles.length === 0) return [round2(baseX), round2(baseZ)]
-  const rings: ReadonlyArray<readonly [number, number]> = [
-    [0, 0],
-    [1.1, 0],
-    [-1.1, 0],
-    [0, 1.1],
-    [0, -1.1],
-    [1.3, 1.1],
-    [-1.3, 1.1],
-    [1.3, -1.1],
-    [-1.3, -1.1],
-    [2.0, 0],
-    [-2.0, 0],
-    [0, 2.0],
-    [0, -2.0],
-    [2.2, 1.6],
-    [-2.2, 1.6],
-    [2.2, -1.6],
-    [-2.2, -1.6],
-  ]
+  const rings: ReadonlyArray<readonly [number, number]> = compactRings
+    ? [
+        [0, 0],
+        [0.45, 0],
+        [-0.45, 0],
+        [0, 0.45],
+        [0, -0.45],
+        [0.65, 0.55],
+        [-0.65, 0.55],
+        [0.65, -0.55],
+        [-0.65, -0.55],
+        [0.95, 0],
+        [-0.95, 0],
+        [0, 0.95],
+        [0, -0.95],
+        [1.25, 0.85],
+        [-1.25, 0.85],
+        [1.25, -0.85],
+        [-1.25, -0.85],
+      ]
+    : [
+        [0, 0],
+        [1.1, 0],
+        [-1.1, 0],
+        [0, 1.1],
+        [0, -1.1],
+        [1.3, 1.1],
+        [-1.3, 1.1],
+        [1.3, -1.1],
+        [-1.3, -1.1],
+        [2.0, 0],
+        [-2.0, 0],
+        [0, 2.0],
+        [0, -2.0],
+        [2.2, 1.6],
+        [-2.2, 1.6],
+        [2.2, -1.6],
+        [-2.2, -1.6],
+      ]
   let best: [number, number] = [round2(baseX), round2(baseZ)]
   let bestClear = -1
   for (const [ox, oz] of rings) {
     const cx = round2(baseX + ox)
     const cz = round2(baseZ + oz)
-    if (cx < bounds.minX + 0.5 || cx > bounds.maxX - 0.5 || cz < bounds.minZ + 0.5 || cz > bounds.maxZ - 0.5) {
+    if (cx < bounds.minX + 0.35 || cx > bounds.maxX - 0.35 || cz < bounds.minZ + 0.35 || cz > bounds.maxZ - 0.35) {
       continue
     }
     const clear = minClearanceToObstaclesXZ(cx, cz, obstacles)
@@ -636,7 +657,8 @@ export function planHvacAutoPopulate(
     })
 
     const returnPlenumId = nextPlId()
-    const returnPlenumPos: Vec3 = [round2(indoorPos[0] - 0.35), 0.25, indoorPos[2]]
+    const [rpX, rpZ] = findClearMechanicalSpot(indoorPos[0] - 0.35, indoorPos[2], obstacles, bounds, 0.45, true)
+    const returnPlenumPos: Vec3 = [rpX, 0.25, rpZ]
     plenums.push({
       id: returnPlenumId,
       name: `Return Plenum (${returnTrunkSize.widthIn}"x${returnTrunkSize.heightIn}")`,
@@ -710,7 +732,8 @@ export function planHvacAutoPopulate(
 
       for (let i = 0; i < regCount; i++) {
         const offsetX = regCount === 1 ? 0 : (i - (regCount - 1) / 2) * 1.4
-        const regPos: Vec3 = [round2(room.centroid[0] + offsetX), termY, round2(room.centroid[1])]
+        const [regX, regZ] = findClearMechanicalSpot(room.centroid[0] + offsetX, room.centroid[1], obstacles, bounds, 0.32, true)
+        const regPos: Vec3 = [regX, termY, regZ]
         const termId = nextTermId()
         terminals.push({
           id: termId,
@@ -775,10 +798,11 @@ export function planHvacAutoPopulate(
       rooms.find((r) => r.category === 'living') ??
       rooms[0]!
     const retGrilleId = nextTermId()
+    const [rgX, rgZ] = findClearMechanicalSpot(returnRoom.centroid[0], returnRoom.centroid[1] + 0.35, obstacles, bounds, 0.38, true)
     const retGrillePos: Vec3 = [
-      round2(returnRoom.centroid[0]),
+      rgX,
       round2(Math.min(levelH - 0.35, 2.2)),
-      round2(returnRoom.centroid[1] + 0.35),
+      rgZ,
     ]
     terminals.push({
       id: retGrilleId,
@@ -914,7 +938,8 @@ export function planHvacAutoPopulate(
     for (const room of rooms) {
       if (room.category === 'bathroom') {
         const fanId = nextEqId()
-        const fanPos: Vec3 = [round2(room.centroid[0]), round2(levelH - 0.05), round2(room.centroid[1])]
+        const [fanX, fanZ] = findClearMechanicalSpot(room.centroid[0], room.centroid[1], obstacles, bounds, 0.35, true)
+        const fanPos: Vec3 = [fanX, round2(levelH - 0.05), fanZ]
         equipment.push({
           id: fanId,
           name: `${room.name} Exhaust Fan (80 CFM)`,
@@ -936,7 +961,7 @@ export function planHvacAutoPopulate(
         })
         const exRoute = routeHvacDuctRun({
           from: fanPos,
-          to: [round2(room.centroid[0]), round2(levelH + 0.3), round2(bounds.minZ - 0.1)],
+          to: [fanX, round2(levelH + 0.3), round2(bounds.minZ - 0.1)],
           plenumY: round2(levelH + 0.3),
           ductHalfSpanM: 0.06,
           allowDiagonalBranch: false,
@@ -962,7 +987,8 @@ export function planHvacAutoPopulate(
         })
       } else if (room.category === 'kitchen') {
         const hoodId = nextEqId()
-        const hoodPos: Vec3 = [round2(room.centroid[0]), round2(Math.min(levelH - 0.5, 1.78)), round2(room.centroid[1])]
+        const [hoodX, hoodZ] = findClearMechanicalSpot(room.centroid[0], room.centroid[1], obstacles, bounds, 0.35, true)
+        const hoodPos: Vec3 = [hoodX, round2(Math.min(levelH - 0.5, 1.78)), hoodZ]
         const hoodCfm = Math.max(250, ventilation.kitchenExhaustCfm)
         equipment.push({
           id: hoodId,
