@@ -22,6 +22,7 @@ import {
 } from './framing-interop'
 import {
   type HvacObstacle,
+  detectHvacClashes,
   extractHvacObstacles,
   extractRoomPolygons,
   extractWallSegments,
@@ -214,10 +215,26 @@ function minClearanceToObstaclesXZ(
   return minDist
 }
 
+function isInsideWithMargin(
+  x: number,
+  z: number,
+  poly: ReadonlyArray<readonly [number, number]>,
+  margin = 0.22,
+): boolean {
+  return (
+    pointInPolygon2D(x, z, poly) &&
+    pointInPolygon2D(x + margin, z, poly) &&
+    pointInPolygon2D(x - margin, z, poly) &&
+    pointInPolygon2D(x, z + margin, poly) &&
+    pointInPolygon2D(x, z - margin, poly)
+  )
+}
+
 /**
  * Pick an equipment placement spot near `basePos` that stays well clear of existing
  * Priority #1 Structural columns, Priority #2 Plumbing equipment/manifolds/pipes,
- * and NEC 110.26(E) electrical panels so HVAC never drops on top of a water heater or panel.
+ * and NEC 110.26(A)/(E) electrical panel spaces so HVAC never drops on top of a water heater,
+ * invades a panel's working space, or escapes its target room polygon.
  */
 function findClearMechanicalSpot(
   baseX: number,
@@ -228,10 +245,15 @@ function findClearMechanicalSpot(
   compactRings = false,
   insidePolygon?: ReadonlyArray<readonly [number, number]>,
 ): [number, number] {
-  if (obstacles.length === 0) return [round2(baseX), round2(baseZ)]
+  const baseInside = !insidePolygon || pointInPolygon2D(baseX, baseZ, insidePolygon)
+  if (obstacles.length === 0 && baseInside) return [round2(baseX), round2(baseZ)]
   const rings: ReadonlyArray<readonly [number, number]> = compactRings
     ? [
         [0, 0],
+        [0.35, 0],
+        [-0.35, 0],
+        [0, 0.35],
+        [0, -0.35],
         [0.45, 0],
         [-0.45, 0],
         [0, 0.45],
@@ -251,6 +273,18 @@ function findClearMechanicalSpot(
       ]
     : [
         [0, 0],
+        [0.55, 0],
+        [-0.55, 0],
+        [0, 0.55],
+        [0, -0.55],
+        [0.85, 0],
+        [-0.85, 0],
+        [0, 0.85],
+        [0, -0.85],
+        [0.85, 0.65],
+        [-0.85, 0.65],
+        [0.85, -0.65],
+        [-0.85, -0.65],
         [1.1, 0],
         [-1.1, 0],
         [0, 1.1],
@@ -268,25 +302,146 @@ function findClearMechanicalSpot(
         [2.2, -1.6],
         [-2.2, -1.6],
       ]
-  let best: [number, number] = [round2(baseX), round2(baseZ)]
-  let bestClear = -1
-  for (const [ox, oz] of rings) {
-    const cx = round2(baseX + ox)
-    const cz = round2(baseZ + oz)
-    if (cx < bounds.minX + 0.35 || cx > bounds.maxX - 0.35 || cz < bounds.minZ + 0.35 || cz > bounds.maxZ - 0.35) {
-      continue
+
+  const evalPass = (requireMargin: boolean): { spot: [number, number] | null; clear: number; met: boolean } => {
+    let best: [number, number] | null = null
+    let bestClear = -1
+    for (const [ox, oz] of rings) {
+      const cx = round2(baseX + ox)
+      const cz = round2(baseZ + oz)
+      if (!insidePolygon) {
+        if (cx < bounds.minX + 0.35 || cx > bounds.maxX - 0.35 || cz < bounds.minZ + 0.35 || cz > bounds.maxZ - 0.35) {
+          continue
+        }
+      } else {
+        const ok = requireMargin ? isInsideWithMargin(cx, cz, insidePolygon, 0.22) : pointInPolygon2D(cx, cz, insidePolygon)
+        if (!ok) continue
+      }
+      const clear = minClearanceToObstaclesXZ(cx, cz, obstacles)
+      if (clear >= minClearanceM) return { spot: [cx, cz], clear, met: true }
+      if (clear > bestClear) {
+        bestClear = clear
+        best = [cx, cz]
+      }
     }
-    if (insidePolygon && !pointInPolygon2D(cx, cz, insidePolygon)) {
-      continue
+    return { spot: best, clear: bestClear, met: false }
+  }
+
+  if (insidePolygon) {
+    const withMargin = evalPass(true)
+    if (withMargin.met && withMargin.spot) return withMargin.spot
+    const strict = evalPass(false)
+    if (strict.met && strict.spot) return strict.spot
+    if (withMargin.spot && withMargin.clear >= strict.clear - 0.05) return withMargin.spot
+    if (strict.spot) return strict.spot
+  } else {
+    const res = evalPass(false)
+    if (res.spot) return res.spot
+  }
+  return [round2(baseX), round2(baseZ)]
+}
+
+function findWallTuckedCornerSpot(
+  room: { polygon: ReadonlyArray<readonly [number, number]>; centroid: readonly [number, number] },
+  obstacles: ReadonlyArray<HvacObstacle>,
+  bounds: { minX: number; maxX: number; minZ: number; maxZ: number },
+  insetM = 0.48,
+  minClearanceM = 1.1,
+  preferNearPt?: readonly [number, number] | null,
+): [number, number] {
+  const poly = room.polygon
+  const candidates: Array<readonly [number, number]> = []
+
+  // Gather corner-inset and wall-mid-inset candidates strictly inside the room so mechanical equipment
+  // tucks neatly against walls/corners instead of floating in the middle of living spaces.
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i]!
+    const b = poly[(i + 1) % poly.length]!
+    // Corner candidate inset toward room centroid
+    const dxC = room.centroid[0] - a[0]
+    const dzC = room.centroid[1] - a[1]
+    const lenC = Math.hypot(dxC, dzC)
+    if (lenC > insetM * 1.15) {
+      candidates.push([round2(a[0] + (dxC / lenC) * insetM), round2(a[1] + (dzC / lenC) * insetM)])
     }
+    // Wall midpoint candidate inset toward room centroid
+    const mx = (a[0] + b[0]) / 2
+    const mz = (a[1] + b[1]) / 2
+    const dxM = room.centroid[0] - mx
+    const dzM = room.centroid[1] - mz
+    const lenM = Math.hypot(dxM, dzM)
+    if (lenM > insetM * 1.1) {
+      candidates.push([round2(mx + (dxM / lenM) * insetM), round2(mz + (dzM / lenM) * insetM)])
+    }
+  }
+
+  let best: [number, number] | null = null
+  let bestScore = -Infinity
+  for (const [cx, cz] of candidates) {
+    if (!isInsideWithMargin(cx, cz, poly, 0.24)) continue
+    if (cx < bounds.minX + 0.3 || cx > bounds.maxX - 0.3 || cz < bounds.minZ + 0.3 || cz > bounds.maxZ - 0.3) continue
     const clear = minClearanceToObstaclesXZ(cx, cz, obstacles)
-    if (clear >= minClearanceM) return [cx, cz]
-    if (clear > bestClear) {
-      bestClear = clear
+    const prefPenalty = preferNearPt ? Math.hypot(cx - preferNearPt[0], cz - preferNearPt[1]) * 1.5 : 0
+    const score = (clear >= minClearanceM ? 100 : clear * 60) + Math.min(2.0, clear) * 10 - prefPenalty
+    if (score > bestScore) {
+      bestScore = score
       best = [cx, cz]
     }
   }
-  return best
+
+  if (best && minClearanceToObstaclesXZ(best[0], best[1], obstacles) >= minClearanceM * 0.75) {
+    return best
+  }
+  const fallbackBase = best ?? room.centroid
+  return findClearMechanicalSpot(fallbackBase[0], fallbackBase[1], obstacles, bounds, minClearanceM, false, poly)
+}
+
+function snapPointToRoomWall(
+  room: { polygon: ReadonlyArray<readonly [number, number]>; centroid: readonly [number, number] },
+  walls: ReadonlyArray<{
+    start: readonly [number, number]
+    end: readonly [number, number]
+    lengthM: number
+    thicknessM: number
+    ux: number
+    uz: number
+    nx: number
+    nz: number
+  }>,
+  y: number,
+  insetM = 0.06,
+): { position: Vec3; rotation: number } {
+  let bestPos: Vec3 = [round2(room.centroid[0]), round2(y), round2(room.centroid[1])]
+  let bestRot = 0
+  let bestScore = -Infinity
+
+  for (const w of walls) {
+    if (w.lengthM < 0.8) continue
+    // Sample midpoint along each wall and check whether the inward face lands inside the target room
+    for (const frac of [0.5, 0.35, 0.65]) {
+      const wx = w.start[0] + w.ux * w.lengthM * frac
+      const wz = w.start[1] + w.uz * w.lengthM * frac
+      const offset = w.thicknessM / 2 + insetM
+      for (const sign of [1, -1] as const) {
+        const px = round2(wx + w.nx * sign * offset)
+        const pz = round2(wz + w.nz * sign * offset)
+        if (!pointInPolygon2D(px, pz, room.polygon)) continue
+        const distToCentroid = Math.hypot(px - room.centroid[0], pz - room.centroid[1])
+        // Prefer interior partition walls (other side is also inside the building) and spots close to room center
+        const otherX = wx - w.nx * sign * (w.thicknessM / 2 + 0.35)
+        const otherZ = wz - w.nz * sign * (w.thicknessM / 2 + 0.35)
+        const isInteriorWall = !pointInPolygon2D(otherX, otherZ, room.polygon) && w.lengthM >= 1.2
+        const score = (isInteriorWall ? 20 : 0) + (frac === 0.5 ? 4 : 0) - distToCentroid
+        if (score > bestScore) {
+          bestScore = score
+          bestPos = [px, round2(y), pz]
+          bestRot = round2(Math.atan2(w.nx * sign, w.nz * sign))
+        }
+      }
+    }
+  }
+
+  return { position: bestPos, rotation: bestRot }
 }
 
 /**
@@ -388,13 +543,52 @@ export function planHvacAutoPopulate(
   const nextDuctId = () => allocId('hvacduct_auto', 'duct')
 
   // 1. Place Primary Mechanical Equipment (Indoor Air Handler/Furnace + Outdoor Condenser)
-  const mechRoom =
-    rooms.find((r) => r.category === 'utility' || r.category === 'laundry' || r.category === 'garage') ??
+  // Prefer a dedicated Utility/Mechanical/Laundry/Garage room; when none exists and plenumLocation is 'attic',
+  // mount the Air Handler & ERV realistically on an Attic Mechanical Platform (IMC 307.2.3 secondary pan + SS2)
+  // above the wet/service core so living rooms stay completely unobstructed and synchronized with Plumbing.
+  const dedicatedMechRoom =
+    rooms.find((r) => r.category === 'utility' || r.category === 'laundry' || r.category === 'garage') ?? null
+  const isAtticMountedAhu =
+    !dedicatedMechRoom &&
+    plenumLocation === 'attic' &&
+    (systemType === 'split-heat-pump' || systemType === 'split-gas-furnace')
+
+  const wetCoreRoom =
+    rooms.find((r) => r.category === 'kitchen') ??
+    rooms.find((r) => r.category === 'bathroom') ??
     rooms.find((r) => r.category === 'hallway') ??
+    null
+  const mechRoom =
+    dedicatedMechRoom ??
+    rooms.find((r) => r.category === 'hallway') ??
+    wetCoreRoom ??
     rooms[0]!
 
-  const [clearX, clearZ] = findClearMechanicalSpot(mechRoom.centroid[0], mechRoom.centroid[1], obstacles, bounds, 1.4)
-  const indoorPos: Vec3 = [clearX, 0, clearZ]
+  // Cross-trade synchronicity: align near existing plumbing water-heater/service core (offset >= 1.1m clear)
+  const existingWh = obstacles.find(
+    (o) => o.category === 'plumbing' && /water.?heater|wh_|manifold|tank/i.test(`${o.label} ${o.nodeId}`),
+  )
+  const preferServicePt: readonly [number, number] = existingWh
+    ? [(existingWh.box.minX + existingWh.box.maxX) / 2, (existingWh.box.minZ + existingWh.box.maxZ) / 2]
+    : wetCoreRoom
+      ? wetCoreRoom.centroid
+      : [bounds.maxX - 0.8, bounds.cz]
+
+  const atticPlatformY = round2(levelH + 0.08)
+  const [clearX, clearZ] = isAtticMountedAhu
+    ? findClearMechanicalSpot(
+        preferServicePt[0],
+        preferServicePt[1],
+        obstacles,
+        bounds,
+        1.1,
+        false,
+        wetCoreRoom?.polygon ?? mechRoom.polygon,
+      )
+    : findWallTuckedCornerSpot(mechRoom, obstacles, bounds, 0.48, 1.1, preferServicePt)
+
+  const indoorPos: Vec3 = [clearX, isAtticMountedAhu ? atticPlatformY : 0, clearZ]
+  const indoorRoomLabel = isAtticMountedAhu ? 'Attic Mechanical Platform' : mechRoom.name
   const outdoorPos: Vec3 = [round2(bounds.maxX + 0.95), 0, round2(indoorPos[2])]
   const hasOverheadSlabPlumbing = obstacles.some(
     (o) => o.category === 'plumbing' && o.box.maxY >= levelH - 0.35 && o.box.minY <= levelH,
@@ -438,7 +632,7 @@ export function planHvacAutoPopulate(
       equipmentKind: indoorKind,
       position: indoorPos,
       rotation: 0,
-      roomName: mechRoom.name,
+      roomName: indoorRoomLabel,
       coolingTons: load.recommendedTons,
       heatingBtuh: equipmentSpec.heatingOutputBtuh,
       gasBtuh: equipmentSpec.furnaceInputBtuh,
@@ -486,7 +680,7 @@ export function planHvacAutoPopulate(
 
     // Insulated Copper Refrigerant Lineset (Indoor Coil -> Outdoor Condenser)
     const linesetRoute = routeHvacDuctRun({
-      from: [indoorPos[0] + 0.22, 1.15, indoorPos[2]],
+      from: [indoorPos[0] + 0.22, round2(indoorPos[1] + 0.95), indoorPos[2]],
       to: [outdoorPos[0] - 0.35, 0.35, outdoorPos[2]],
       plenumY: plenumLocation === 'attic' ? round2(levelH + 0.12) : -0.18,
       ductHalfSpanM: 0.03,
@@ -515,7 +709,7 @@ export function planHvacAutoPopulate(
     // Sloped 3/4" PVC Condensate Drain (IMC 307.2)
     const condExitPos: Vec3 = [round2(bounds.maxX + 0.15), 0.05, round2(indoorPos[2] + 0.4)]
     const condRoute = routeCondensateDrain({
-      from: [indoorPos[0] + 0.25, 0.95, indoorPos[2] + 0.1],
+      from: [indoorPos[0] + 0.25, round2(indoorPos[1] + (isAtticMountedAhu ? 0.08 : 0.95)), indoorPos[2] + 0.1],
       to: condExitPos,
       obstacles,
     })
@@ -722,8 +916,51 @@ export function planHvacAutoPopulate(
     if (systemType === 'rooftop-package' && rtuPos) {
       returnPlenumPos = [round2(rtuPos[0] - 0.38), round2(levelH - 0.15), rtuPos[2]]
     } else {
-      const [rpX, rpZ] = findClearMechanicalSpot(indoorPos[0] - 0.35, indoorPos[2], obstacles, bounds, 0.45, true)
-      returnPlenumPos = [rpX, 0.25, rpZ]
+      // Side-return drop offset beside the air handler/furnace cabinet & supply plenum so the vertical
+      // return trunk never pierces the cabinet or blue supply plenum.
+      const cabScale = load.recommendedTons >= 4 ? 1.12 : load.recommendedTons <= 2 ? 0.92 : 1.0
+      const cabHalfX = Math.max((0.54 * cabScale) / 2, (supplyTrunkSize.widthIn * 0.0254) / 2)
+      const cabHalfZ = Math.max((indoorKind === 'air-handler' ? 0.56 : 0.72) / 2, (24 * 0.0254) / 2)
+      const retHalfM = (returnTrunkSize.widthIn * 0.0254) / 2
+      const lateralOffsetX = round2(cabHalfX + retHalfM + 0.08)
+      const lateralOffsetZ = round2(cabHalfZ + retHalfM + 0.08)
+      const retPlenumYPreview = round2(plenumY + (plenumLocation === 'attic' ? 0.24 : -0.24))
+      const retClashSpan = {
+        horizontal: Math.max(0.12, retHalfM),
+        vertical: Math.max(0.05, (returnTrunkSize.heightIn * 0.0254) / 2),
+      }
+      const sideCandidates: ReadonlyArray<readonly [number, number]> = [
+        [round2(indoorPos[0] - lateralOffsetX), indoorPos[2]],
+        [round2(indoorPos[0] + lateralOffsetX), indoorPos[2]],
+        [indoorPos[0], round2(indoorPos[2] + lateralOffsetZ)],
+        [indoorPos[0], round2(indoorPos[2] - lateralOffsetZ)],
+      ]
+      const retPlenumBaseY = isAtticMountedAhu ? round2(atticPlatformY + 0.25) : 0.25
+      let bestDrop: readonly [number, number] = sideCandidates[0]!
+      let bestScore = -Infinity
+      for (const [cx, cz] of sideCandidates) {
+        const inRoom = pointInPolygon2D(cx, cz, mechRoom.polygon)
+        const inBounds =
+          cx >= bounds.minX + 0.15 &&
+          cx <= bounds.maxX - 0.15 &&
+          cz >= bounds.minZ + 0.15 &&
+          cz <= bounds.maxZ - 0.15
+        const dropClashes = detectHvacClashes(
+          [
+            [cx, retPlenumYPreview, cz],
+            [cx, retPlenumBaseY, cz],
+          ],
+          obstacles,
+          retClashSpan,
+        ).length
+        const clear = Math.min(2.0, minClearanceToObstaclesXZ(cx, cz, obstacles))
+        const score = (dropClashes === 0 ? 100 : -dropClashes * 50) + (inRoom ? 20 : 0) + (inBounds ? 10 : 0) + clear
+        if (score > bestScore) {
+          bestScore = score
+          bestDrop = [cx, cz]
+        }
+      }
+      returnPlenumPos = [bestDrop[0], retPlenumBaseY, bestDrop[1]]
     }
     plenums.push({
       id: returnPlenumId,
@@ -897,7 +1134,7 @@ export function planHvacAutoPopulate(
       )
       const retGrillePos: Vec3 = [
         rgX,
-        round2(Math.min(levelH - 0.35, 2.2)),
+        isAtticMountedAhu ? round2(levelH - 0.03) : round2(Math.min(levelH - 0.35, 2.2)),
         rgZ,
       ]
       terminals.push({
@@ -911,18 +1148,31 @@ export function planHvacAutoPopulate(
         neckSizeIn: returnTrunkSize.diameterIn,
         throwFt: 0,
       })
+      const retClashSpan = {
+        horizontal: Math.max(0.12, (returnTrunkSize.widthIn * 0.0254) / 2),
+        vertical: Math.max(0.05, (returnTrunkSize.heightIn * 0.0254) / 2),
+      }
       const retRoute = routeHvacDuctRun({
         from: retGrillePos,
         to: returnPlenumPos,
         plenumY: round2(plenumY + (plenumLocation === 'attic' ? 0.24 : -0.24)),
         maxPlenumY,
-        ductHalfSpanM: {
-          horizontal: Math.max(0.12, (returnTrunkSize.widthIn * 0.0254) / 2),
-          vertical: Math.max(0.05, (returnTrunkSize.heightIn * 0.0254) / 2),
-        },
+        ductHalfSpanM: retClashSpan,
         allowDiagonalBranch: false,
         obstacles,
       })
+      const retPath: Vec3[] = [...retRoute.path]
+      if (systemType !== 'rooftop-package') {
+        const bootEntry: Vec3 = [indoorPos[0], returnPlenumPos[1], indoorPos[2]]
+        const lastPt = retPath[retPath.length - 1]
+        if (
+          lastPt &&
+          Math.hypot(bootEntry[0] - lastPt[0], bootEntry[2] - lastPt[2]) > 0.05 &&
+          detectHvacClashes([lastPt, bootEntry], obstacles, retClashSpan).length === 0
+        ) {
+          retPath.push(bootEntry)
+        }
+      }
       ductRuns.push({
         id: nextDuctId(),
         name: `${returnTrunkSize.widthIn}"x${returnTrunkSize.heightIn}" Return Air Trunk (${load.designTotalCfm} CFM)`,
@@ -932,11 +1182,11 @@ export function planHvacAutoPopulate(
         width: returnTrunkSize.widthIn,
         height: returnTrunkSize.heightIn,
         diameter: returnTrunkSize.diameterIn,
-        path: retRoute.path,
+        path: retPath,
         airflowCfm: load.designTotalCfm,
         velocityFpm: returnTrunkSize.velocityFpm,
         frictionRateInWgPer100Ft: returnTrunkSize.frictionRateInWgPer100Ft,
-        insulationR: effectiveDuctR(retRoute.path),
+        insulationR: effectiveDuctR(retPath),
         sourceNodeId: retGrilleId,
         targetNodeId: returnPlenumId,
         showFramingClearances: true,
@@ -946,17 +1196,18 @@ export function planHvacAutoPopulate(
     }
   }
 
-  // 3. Smart Thermostat in Hallway / Living Room (central interior reference)
+  // 3. Smart Thermostat in Hallway / Living Room (snapped flush onto an interior partition wall)
   const statRoom =
     rooms.find((r) => r.category === 'hallway') ??
     rooms.find((r) => r.category === 'living') ??
     rooms[0]!
+  const statSnap = snapPointToRoomWall(statRoom, walls, 1.52, 0.05)
   terminals.push({
     id: nextTermId(),
     name: `Smart Thermostat (${equipmentSpec.thermostatCable})`,
     terminalKind: 'smart-thermostat',
-    position: [round2(statRoom.centroid[0] + 0.3), 1.52, round2(statRoom.centroid[1])],
-    rotation: 0,
+    position: statSnap.position,
+    rotation: statSnap.rotation,
     roomName: statRoom.name,
     designCfm: 0,
     neckSizeIn: 0,
@@ -966,15 +1217,67 @@ export function planHvacAutoPopulate(
   // 4. Optional ASHRAE 62.2 ERV Fresh-Air Ventilator & Duct
   if (includeErv) {
     const ervId = nextEqId()
-    const [ervX, ervZ] = findClearMechanicalSpot(indoorPos[0] + 0.85, indoorPos[2] + 0.45, obstacles, bounds, 0.75)
-    const ervPos: Vec3 = [ervX, round2(Math.min(levelH - 0.55, 1.85)), ervZ]
+    const ervObstacles: HvacObstacle[] = [
+      ...obstacles,
+      {
+        id: indoorId,
+        nodeId: indoorId,
+        category: 'structural',
+        label: 'Primary Air Handler / Furnace Cabinet',
+        box: {
+          minX: indoorPos[0] - 0.34,
+          maxX: indoorPos[0] + 0.34,
+          minY: indoorPos[1],
+          maxY: indoorPos[1] + 1.85,
+          minZ: indoorPos[2] - 0.38,
+          maxZ: indoorPos[2] + 0.38,
+        },
+      },
+    ]
+    const ervBaseOffsets: ReadonlyArray<readonly [number, number]> = [
+      [0.85, 0.45],
+      [-0.85, 0.45],
+      [0.85, -0.45],
+      [-0.85, -0.45],
+      [0, 0.85],
+      [0, -0.85],
+      [0.85, 0],
+      [-0.85, 0],
+    ]
+    let ervBaseX = indoorPos[0]
+    let ervBaseZ = indoorPos[2]
+    for (const [ox, oz] of ervBaseOffsets) {
+      const tx = round2(indoorPos[0] + ox)
+      const tz = round2(indoorPos[2] + oz)
+      if (isAtticMountedAhu || isInsideWithMargin(tx, tz, mechRoom.polygon, 0.22)) {
+        if (tx >= bounds.minX + 0.4 && tx <= bounds.maxX - 0.4 && tz >= bounds.minZ + 0.4 && tz <= bounds.maxZ - 0.4) {
+          ervBaseX = tx
+          ervBaseZ = tz
+          break
+        }
+      }
+    }
+    const [ervX, ervZ] = findClearMechanicalSpot(
+      ervBaseX,
+      ervBaseZ,
+      ervObstacles,
+      bounds,
+      0.65,
+      true,
+      isAtticMountedAhu ? undefined : mechRoom.polygon,
+    )
+    const ervPos: Vec3 = [
+      ervX,
+      isAtticMountedAhu ? round2(atticPlatformY + 0.12) : round2(Math.min(levelH - 0.55, 1.85)),
+      ervZ,
+    ]
     equipment.push({
       id: ervId,
       name: `ASHRAE 62.2 ERV (${ventilation.recommendedErvCfm} CFM)`,
       equipmentKind: 'erv-ventilator',
       position: ervPos,
       rotation: 0,
-      roomName: mechRoom.name,
+      roomName: indoorRoomLabel,
       coolingTons: 0,
       heatingBtuh: 0,
       gasBtuh: 0,
@@ -989,7 +1292,7 @@ export function planHvacAutoPopulate(
     })
 
     const intakeId = nextTermId()
-    const intakePos: Vec3 = [round2(bounds.minX - 0.08), 2.1, round2(ervPos[2])]
+    const intakePos: Vec3 = [round2(bounds.minX - 0.08), isAtticMountedAhu ? round2(levelH + 0.25) : 2.1, round2(ervPos[2])]
     terminals.push({
       id: intakeId,
       name: `Fresh Air Intake Hood (${ventilation.continuousFreshAirCfm} CFM)`,

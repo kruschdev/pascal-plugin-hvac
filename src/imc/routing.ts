@@ -33,7 +33,7 @@ export type Aabb3 = {
 export type HvacObstacle = {
   id: string
   nodeId?: string
-  category: 'structural' | 'plumbing' | 'electrical-dedicated-space'
+  category: 'structural' | 'plumbing' | 'electrical-dedicated-space' | 'electrical-working-space'
   label: string
   box: Aabb3
 }
@@ -339,6 +339,13 @@ export function extractHvacObstacles(
     }
   }
 
+  const readYaw = (rotation: unknown): number =>
+    typeof rotation === 'number'
+      ? rotation
+      : Array.isArray(rotation) && typeof rotation[1] === 'number'
+        ? rotation[1]
+        : 0
+
   for (const n of Object.values(nodes)) {
     if (!belongsToLevel(nodes, n, levelId)) continue
     const pos =
@@ -351,12 +358,17 @@ export function extractHvacObstacles(
       const w = (typeof n.widthIn === 'number' ? n.widthIn : 5.5) * INCHES_TO_METERS
       const d = (typeof n.depthIn === 'number' ? n.depthIn : 5.5) * INCHES_TO_METERS
       const h = typeof n.heightM === 'number' ? n.heightM : levelH
+      const rot = readYaw(n.rotation)
+      const cosR = Math.abs(Math.cos(rot))
+      const sinR = Math.abs(Math.sin(rot))
+      const halfX = (w * cosR + d * sinR) / 2
+      const halfZ = (w * sinR + d * cosR) / 2
       obstacles.push({
         id: n.id,
         nodeId: n.id,
         category: 'structural',
         label: `Structural column (${n.name ?? n.id})`,
-        box: { minX: pos[0] - w / 2, maxX: pos[0] + w / 2, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - d / 2, maxZ: pos[2] + d / 2 },
+        box: { minX: pos[0] - halfX, maxX: pos[0] + halfX, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - halfZ, maxZ: pos[2] + halfZ },
       })
     } else if (n.type === 'structural:beam' && Array.isArray(n.start) && Array.isArray(n.end)) {
       const sx = Number(n.start[0])
@@ -371,12 +383,17 @@ export function extractHvacObstacles(
       const w = typeof n.width === 'number' ? n.width : 0.25
       const d = typeof n.depth === 'number' ? n.depth : 0.25
       const h = typeof n.height === 'number' ? n.height : levelH
+      const rot = readYaw(n.rotation)
+      const cosR = Math.abs(Math.cos(rot))
+      const sinR = Math.abs(Math.sin(rot))
+      const halfX = (w * cosR + d * sinR) / 2
+      const halfZ = (w * sinR + d * cosR) / 2
       obstacles.push({
         id: n.id,
         nodeId: n.id,
         category: 'structural',
         label: `Column (${n.name ?? n.id})`,
-        box: { minX: pos[0] - w / 2, maxX: pos[0] + w / 2, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - d / 2, maxZ: pos[2] + d / 2 },
+        box: { minX: pos[0] - halfX, maxX: pos[0] + halfX, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - halfZ, maxZ: pos[2] + halfZ },
       })
     } else if (n.type === 'beam' && Array.isArray(n.start) && Array.isArray(n.end)) {
       const sx = Number(n.start[0])
@@ -420,33 +437,58 @@ export function extractHvacObstacles(
           })
         }
       }
-    } else if ((n.type === 'plumbing:equipment' || n.type === 'plumbing:manifold') && pos) {
-      const halfW = n.type === 'plumbing:manifold' ? 0.24 : 0.30
-      const h = n.type === 'plumbing:manifold' ? 0.7 : 1.55
+    } else if (n.type === 'plumbing:manifold' && pos) {
+      // Center-anchored wall-mounted manifold (0.48m x 0.70m x 0.48m)
+      const halfW = 0.24
       obstacles.push({
         id: n.id,
         nodeId: n.id,
         category: 'plumbing',
-        label: `Plumbing ${n.type === 'plumbing:manifold' ? 'manifold' : 'equipment'} (${n.name ?? n.id})`,
+        label: `Plumbing manifold (${n.name ?? n.id})`,
         box: {
           minX: pos[0] - halfW,
           maxX: pos[0] + halfW,
-          minY: pos[1],
-          maxY: pos[1] + h,
+          minY: pos[1] - 0.35,
+          maxY: pos[1] + 0.35,
           minZ: pos[2] - halfW,
           maxZ: pos[2] + halfW,
         },
       })
-    } else if ((n.type === 'electrical:panel' || n.type === 'electrical:transformer') && pos) {
+    } else if (n.type === 'plumbing:equipment' && pos) {
+      const eqKind = typeof n.equipmentKind === 'string' ? n.equipmentKind : ''
+      const isCompact =
+        eqKind === 'expansion-tank' ||
+        eqKind === 'sump-pump' ||
+        eqKind === 'main-shutoff-prv' ||
+        eqKind === 'gas-meter'
+      const isTankless = eqKind.startsWith('water-heater-tankless')
+      const w = isCompact ? 0.32 : isTankless ? 0.45 : 0.6
+      const d = isCompact ? 0.32 : isTankless ? 0.3 : 0.6
+      const h = isCompact ? 0.45 : isTankless ? 0.65 : 1.55
+      const rot = readYaw(n.rotation)
+      const cosR = Math.abs(Math.cos(rot))
+      const sinR = Math.abs(Math.sin(rot))
+      const halfX = (w * cosR + d * sinR) / 2
+      const halfZ = (w * sinR + d * cosR) / 2
+      obstacles.push({
+        id: n.id,
+        nodeId: n.id,
+        category: 'plumbing',
+        label: `Plumbing equipment (${n.name ?? n.id})`,
+        box: {
+          minX: pos[0] - halfX,
+          maxX: pos[0] + halfX,
+          minY: pos[1],
+          maxY: pos[1] + h,
+          minZ: pos[2] - halfZ,
+          maxZ: pos[2] + halfZ,
+        },
+      })
+    } else if (n.type === 'electrical:panel' && pos) {
       // NEC 110.26(E)(1)(a): Dedicated electrical space from floor (minY = 0) to 6 ft above panel
       const w = typeof n.width === 'number' ? n.width : 0.42
       const d = typeof n.depth === 'number' ? n.depth : 0.16
-      const rot =
-        typeof n.rotation === 'number'
-          ? n.rotation
-          : Array.isArray(n.rotation) && typeof n.rotation[1] === 'number'
-            ? n.rotation[1]
-            : 0
+      const rot = readYaw(n.rotation)
       const cosR = Math.abs(Math.cos(rot))
       const sinR = Math.abs(Math.sin(rot))
       const halfX = (w * cosR + d * sinR) / 2 + 0.03
@@ -462,6 +504,63 @@ export function extractHvacObstacles(
           maxX: pos[0] + halfX,
           minY: 0,
           maxY: Math.max(levelH + 0.6, panelTopY + 1.83),
+          minZ: pos[2] - halfZ,
+          maxZ: pos[2] + halfZ,
+        },
+      })
+      // NEC 110.26(A): 36" (0.914m) deep x 30" (0.762m) wide x 78" (1.981m) tall working space in front of panel
+      const fx = Math.sin(rot)
+      const fz = Math.cos(rot)
+      const tx = Math.cos(rot)
+      const tz = -Math.sin(rot)
+      const wsDepth = 0.914
+      const wsHalfW = Math.max(0.762, w) / 2
+      const fcX = pos[0] + fx * (d / 2)
+      const fcZ = pos[2] + fz * (d / 2)
+      const farX = fcX + fx * wsDepth
+      const farZ = fcZ + fz * wsDepth
+      const c0x = fcX - tx * wsHalfW
+      const c1x = fcX + tx * wsHalfW
+      const c2x = farX - tx * wsHalfW
+      const c3x = farX + tx * wsHalfW
+      const c0z = fcZ - tz * wsHalfW
+      const c1z = fcZ + tz * wsHalfW
+      const c2z = farZ - tz * wsHalfW
+      const c3z = farZ + tz * wsHalfW
+      obstacles.push({
+        id: `${n.id}:working-space`,
+        nodeId: n.id,
+        category: 'electrical-working-space',
+        label: `NEC 110.26(A) Working Space (${n.name ?? n.id})`,
+        box: {
+          minX: Math.min(c0x, c1x, c2x, c3x),
+          maxX: Math.max(c0x, c1x, c2x, c3x),
+          minY: 0,
+          maxY: Math.max(1.981, panelTopY),
+          minZ: Math.min(c0z, c1z, c2z, c3z),
+          maxZ: Math.max(c0z, c1z, c2z, c3z),
+        },
+      })
+    } else if (n.type === 'electrical:transformer' && pos) {
+      // NEC 110.26(E): Dry-type transformer footprint & overhead dedicated space
+      const w = typeof n.width === 'number' ? n.width : 0.76
+      const d = typeof n.depth === 'number' ? n.depth : 0.64
+      const rot = readYaw(n.rotation)
+      const cosR = Math.abs(Math.cos(rot))
+      const sinR = Math.abs(Math.sin(rot))
+      const halfX = (w * cosR + d * sinR) / 2 + 0.03
+      const halfZ = (w * sinR + d * cosR) / 2 + 0.03
+      const topY = pos[1] + (typeof n.height === 'number' ? n.height : 0.95)
+      obstacles.push({
+        id: n.id,
+        nodeId: n.id,
+        category: 'electrical-dedicated-space',
+        label: `NEC 110.26(E) Dedicated Space (${n.name ?? n.id})`,
+        box: {
+          minX: pos[0] - halfX,
+          maxX: pos[0] + halfX,
+          minY: 0,
+          maxY: Math.max(levelH + 0.6, topY + 1.83),
           minZ: pos[2] - halfZ,
           maxZ: pos[2] + halfZ,
         },
@@ -518,9 +617,10 @@ export function detectHvacClashes(
     const a = path[i - 1]!
     const b = path[i]!
     for (const obs of obstacles) {
-      if (seen.has(obs.id)) continue
+      const obsKey = obs.nodeId ?? obs.id
+      if (seen.has(obsKey)) continue
       if (segmentIntersectsAabb(a, b, obs.box, margin3)) {
-        seen.add(obs.id)
+        seen.add(obsKey)
         hits.push(obs)
       }
     }

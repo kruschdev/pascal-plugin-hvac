@@ -15,9 +15,12 @@ import {
 import {
   type SceneNodeLike,
   auditSceneHvac,
+  buildHvacElectricalCoordination,
   buildHvacSchedule,
   calculateManualJLoad,
   classifyHvacRoomName,
+  detectHvacClashes,
+  extractHvacFramingContext,
   extractHvacObstacles,
   extractRoomPolygons,
   getHvacEquipmentElectricalDemand,
@@ -708,5 +711,217 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
     expect(lineNode.width).toBe(2)
     expect(lineNode.height).toBe(2)
     expect(lineNode.diameter).toBe(2)
+  })
+
+  test('Cross-Trade & Visual Interoperability Audit (XT-02, VIS-01, VIS-03, XT-06, XT-08, XT-10, XT-12, XT-13)', () => {
+    // 1. XT-02: Commercial occupancy inferred from '120/208V-3P', '277/480V-3P', panel occupancy='commercial', or 'rooftop-package-unit'
+    // A supply trunk at 1100 FPM exceeds residential 900 FPM limit but passes commercial 1400 FPM limit!
+    const makeVelScene = (extraNode: SceneNodeLike): Record<string, SceneNodeLike> => ({
+      level_0: { id: 'level_0', type: 'level', height: 3.0 },
+      extra: extraNode,
+      trunk_1100: {
+        id: 'trunk_1100',
+        type: 'hvac:duct-run',
+        parentId: 'level_0',
+        system: 'supply-trunk',
+        shape: 'rectangular',
+        material: 'galvanized-sheet',
+        width: 18,
+        height: 8, // 1.0 sq ft -> 1100 CFM = 1100 FPM (>900 res, <=1400 com)
+        airflowCfm: 1100,
+        insulationR: 8,
+        path: [[1, 3.2, 1], [6, 3.2, 1]],
+      },
+      ret_ok: { id: 'ret_ok', type: 'hvac:terminal', parentId: 'level_0', terminalKind: 'return-grille', roomName: 'Lobby', position: [1, 2.2, 1] },
+    })
+    const resAudit208 = auditSceneHvac(makeVelScene({ id: 'p_208', type: 'electrical:panel', parentId: 'level_0', voltageSystem: '120/208V-3P', position: [9, 1.5, 9] }))
+    expect(resAudit208.findings.some((f) => f.title.includes('velocity'))).toBe(false)
+    const resAudit480 = auditSceneHvac(makeVelScene({ id: 'p_480', type: 'electrical:panel', parentId: 'level_0', voltageSystem: '277/480V-3P', position: [9, 1.5, 9] }))
+    expect(resAudit480.findings.some((f) => f.title.includes('velocity'))).toBe(false)
+    const resAuditRtu = auditSceneHvac(makeVelScene({ id: 'rtu_c', type: 'hvac:equipment', parentId: 'level_0', equipmentKind: 'rooftop-package-unit', hasDisconnectWithinSight: true }))
+    expect(resAuditRtu.findings.some((f) => f.title.includes('velocity'))).toBe(false)
+    const resAudit120 = auditSceneHvac(makeVelScene({ id: 'p_120', type: 'electrical:panel', parentId: 'level_0', voltageSystem: '120/240V-1P', position: [9, 1.5, 9] }))
+    expect(resAudit120.findings.some((f) => f.title.includes('velocity'))).toBe(true)
+
+    // 2. VIS-01 & VIS-03: Side-return drop stays clear of air handler & supply plenum; AHU & ERV stay inside mechRoom & clear of MDP-1 working space!
+    const utilPoly: ReadonlyArray<readonly [number, number]> = [[9, 0], [12, 0], [12, 4], [9, 4]]
+    const tightMechScene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.7 },
+      w1: { id: 'w1', type: 'wall', parentId: 'level_0', start: [0, 0], end: [12, 0], height: 2.7, thickness: 0.16 },
+      w2: { id: 'w2', type: 'wall', parentId: 'level_0', start: [12, 0], end: [12, 8], height: 2.7, thickness: 0.16 },
+      w3: { id: 'w3', type: 'wall', parentId: 'level_0', start: [12, 8], end: [0, 8], height: 2.7, thickness: 0.16 },
+      w4: { id: 'w4', type: 'wall', parentId: 'level_0', start: [0, 8], end: [0, 0], height: 2.7, thickness: 0.16 },
+      r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[0, 0], [9, 0], [9, 5], [0, 5]] },
+      r_bed: { id: 'r_bed', type: 'zone', name: 'Primary Bedroom', parentId: 'level_0', polygon: [[9, 4], [12, 4], [12, 8], [9, 8]] },
+      r_bath: { id: 'r_bath', type: 'zone', name: 'Master Bath', parentId: 'level_0', polygon: [[6, 5], [9, 5], [9, 8], [6, 8]] },
+      r_util: { id: 'r_util', type: 'zone', name: 'Utility', parentId: 'level_0', polygon: utilPoly },
+      // Water heater at utility centroid + MDP-1 on north wall facing +Z into Utility
+      wh_1: { id: 'wh_1', type: 'plumbing:equipment', equipmentKind: 'water-heater-tank-electric', parentId: 'level_0', position: [10.5, 0, 2.0] },
+      mdp_1: { id: 'mdp_1', type: 'electrical:panel', name: 'MDP-1', parentId: 'level_0', position: [10.5, 1.5, 0.2], width: 0.42, depth: 0.16, height: 0.92, rotation: 0 },
+    }
+    const plan = planHvacAutoPopulate(tightMechScene, { levelId: 'level_0', systemType: 'split-heat-pump', includeErv: true })
+    const ahu = plan.equipment.find((e) => e.equipmentKind === 'air-handler')!
+    const erv = plan.equipment.find((e) => e.equipmentKind === 'erv-ventilator')!
+    const supPl = plan.plenums.find((p) => p.plenumKind === 'supply-plenum')!
+    const retTrunk = plan.ductRuns.find((d) => d.system === 'return-trunk')!
+
+    // VIS-03: Both air-handler AND ERV stay strictly inside Utility Room polygon!
+    expect(pointInPolygon2D(ahu.position[0], ahu.position[2], utilPoly)).toBe(true)
+    expect(pointInPolygon2D(erv.position[0], erv.position[2], utilPoly)).toBe(true)
+
+    // VIS-03: Extract NEC 110.26(A) working space prism in front of MDP-1 (capped at max(1.981, panelTopY)) and verify attic ducts pass above it
+    const mechObs = extractHvacObstacles(tightMechScene, 'level_0')
+    const wsObs = mechObs.find((o) => o.category === 'electrical-working-space')!
+    expect(wsObs).toBeDefined()
+    expect(wsObs.nodeId).toBe('mdp_1')
+    expect(wsObs.box.minY).toBe(0)
+    expect(wsObs.box.maxY).toBeCloseTo(1.981, 2)
+    expect(wsObs.box.maxZ - wsObs.box.minZ).toBeCloseTo(0.914, 2)
+    expect(wsObs.box.maxX - wsObs.box.minX).toBeCloseTo(0.762, 2)
+    // Attic duct running at y=2.98 right over MDP-1 working space (outside panel footprint) must NOT clash with working space!
+    expect(detectHvacClashes([[9.5, 2.98, 0.8], [11.5, 2.98, 0.8]], [wsObs], 0.1)).toHaveLength(0)
+
+    // VIS-01: Vertical return trunk drop segment X/Z footprint must NOT overlap air handler cabinet OR supply plenum!
+    const cabScale = ahu.coolingTons >= 4 ? 1.12 : ahu.coolingTons <= 2 ? 0.92 : 1.0
+    const cabHalfX = Math.max((0.54 * cabScale) / 2, (supPl.widthIn * 0.0254) / 2)
+    const cabHalfZ = Math.max(0.56 / 2, (supPl.depthIn * 0.0254) / 2)
+    const retHalfM = (retTrunk.width * 0.0254) / 2
+    const verticalReturnSegs = []
+    for (let i = 1; i < retTrunk.path.length; i++) {
+      const a = retTrunk.path[i - 1]!
+      const b = retTrunk.path[i]!
+      if (Math.abs(b[1] - a[1]) > 0.5 && Math.hypot(b[0] - a[0], b[2] - a[2]) < 0.05) {
+        // Drop segment near air handler (reaches y <= 0.5)
+        if (Math.min(a[1], b[1]) <= 0.5) verticalReturnSegs.push(a)
+      }
+    }
+    expect(verticalReturnSegs.length).toBeGreaterThanOrEqual(1)
+    for (const pt of verticalReturnSegs) {
+      const overlapsX = Math.abs(pt[0] - ahu.position[0]) < cabHalfX + retHalfM
+      const overlapsZ = Math.abs(pt[2] - ahu.position[2]) < cabHalfZ + retHalfM
+      expect(overlapsX && overlapsZ).toBe(false)
+    }
+
+    // 3. XT-06: Commercial 208V/480V panel voltage derivation in buildHvacElectricalCoordination
+    const commCoord = buildHvacElectricalCoordination({
+      level_0: { id: 'level_0', type: 'level' },
+      panel_208: { id: 'panel_208', type: 'electrical:panel', parentId: 'level_0', voltageSystem: '120/208V-3P', position: [0, 1.5, 0] },
+      rtu_208: {
+        id: 'rtu_208',
+        type: 'hvac:equipment',
+        parentId: 'level_0',
+        equipmentKind: 'rooftop-package-unit',
+        occupancy: 'commercial',
+        coolingTons: 5,
+        position: [2, 0, 2],
+        electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'rooftop-package-unit', coolingTons: 5, occupancy: 'commercial' }),
+      },
+      dev_208: {
+        id: 'dev_208',
+        type: 'electrical:device',
+        parentId: 'level_0',
+        panelId: 'panel_208',
+        circuitNumber: 1,
+        poles: 3,
+        breakerAmps: 40,
+        // Note: d.voltage omitted -> must derive 208V from panel_208.voltageSystem === '120/208V-3P'!
+        position: [2.3, 1.0, 2.0],
+      },
+    })
+    expect(commCoord[0]!.voltage).toBe(208)
+    expect(commCoord[0]!.wired).toBe(true)
+
+    // 4. XT-08, XT-10, XT-13: Center-anchored manifold, rotated column, transformer dims, plumbing equipment footprints, & detectHvacClashes dedup
+    const obsScene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.7 },
+      man_1: { id: 'man_1', type: 'plumbing:manifold', parentId: 'level_0', position: [1, 1.3, 1] },
+      col_rot: { id: 'col_rot', type: 'structural:column', parentId: 'level_0', position: [3, 0, 3], widthIn: 12, depthIn: 4, heightM: 2.7, rotation: Math.PI / 2 },
+      xfmr_1: { id: 'xfmr_1', type: 'electrical:transformer', parentId: 'level_0', position: [5, 0, 5] },
+      exp_tank: { id: 'exp_tank', type: 'plumbing:equipment', equipmentKind: 'expansion-tank', parentId: 'level_0', position: [7, 0, 1] },
+      tankless_wh: { id: 'tankless_wh', type: 'plumbing:equipment', equipmentKind: 'water-heater-tankless-gas', parentId: 'level_0', position: [7, 0, 3] },
+      diag_beam: { id: 'diag_beam', type: 'structural:beam', parentId: 'level_0', start: [0, 0], end: [6, 6], widthIn: 4, depthIn: 12, elevationY: 2.2 },
+    }
+    const obsList = extractHvacObstacles(obsScene, 'level_0')
+    const manObs = obsList.find((o) => o.id === 'man_1')!
+    expect(manObs.box.minY).toBeCloseTo(0.95, 2)
+    expect(manObs.box.maxY).toBeCloseTo(1.65, 2)
+
+    const colObs = obsList.find((o) => o.id === 'col_rot')!
+    expect(colObs.box.maxZ - colObs.box.minZ).toBeCloseTo(12 * 0.0254, 2)
+    expect(colObs.box.maxX - colObs.box.minX).toBeCloseTo(4 * 0.0254, 2)
+
+    const xfmrObs = obsList.find((o) => o.id === 'xfmr_1')!
+    expect(xfmrObs.box.maxX - xfmrObs.box.minX).toBeCloseTo(0.76 + 0.06, 2)
+    expect(xfmrObs.box.maxZ - xfmrObs.box.minZ).toBeCloseTo(0.64 + 0.06, 2)
+    expect(xfmrObs.box.maxY).toBeGreaterThanOrEqual(0.95 + 1.83 - 0.01)
+
+    const expObs = obsList.find((o) => o.id === 'exp_tank')!
+    expect(expObs.box.maxX - expObs.box.minX).toBeCloseTo(0.32, 2)
+    expect(expObs.box.maxY).toBeCloseTo(0.45, 2)
+
+    const tanklessObs = obsList.find((o) => o.id === 'tankless_wh')!
+    expect(tanklessObs.box.maxX - tanklessObs.box.minX).toBeCloseTo(0.45, 2)
+    expect(tanklessObs.box.maxZ - tanklessObs.box.minZ).toBeCloseTo(0.30, 2)
+    expect(tanklessObs.box.maxY).toBeCloseTo(0.65, 2)
+
+    // Direct detectHvacClashes deduplicates diagonal beam sub-segments to 1 hit
+    const directHits = detectHvacClashes([[0, 2.2, 0], [6, 2.2, 6]], obsList, 0.1)
+    expect(directHits.filter((h) => h.nodeId === 'diag_beam')).toHaveLength(1)
+
+    // 5. XT-12: Stale electricalDemand recomputed when equipmentKind / tonnage changes or becomes passive
+    const staleCoord = buildHvacElectricalCoordination({
+      level_0: { id: 'level_0', type: 'level' },
+      // Switched from air-handler (240V 2P 60A) to gas-furnace-96 (120V 1P 15A) with stale demand
+      switched_furn: {
+        id: 'switched_furn',
+        type: 'hvac:equipment',
+        parentId: 'level_0',
+        equipmentKind: 'gas-furnace-96',
+        coolingTons: 3,
+        electricalDemand: { required: true, voltage: 240, poles: 2, breakerAmps: 60, loadVa: 10600, loadCategory: 'hvac-heating', label: 'Stale AHU' },
+      },
+      // Switched to passive mini-split-indoor with stale required:true demand
+      switched_passive: {
+        id: 'switched_passive',
+        type: 'hvac:equipment',
+        parentId: 'level_0',
+        equipmentKind: 'mini-split-indoor',
+        electricalDemand: { required: true, voltage: 240, poles: 2, breakerAmps: 30, loadVa: 3600, loadCategory: 'heat-pump', label: 'Stale' },
+      },
+      // Bumped condenser from 2T (25A) to 5T (60A) with stale 25A demand
+      bumped_hp: {
+        id: 'bumped_hp',
+        type: 'hvac:equipment',
+        parentId: 'level_0',
+        equipmentKind: 'heat-pump-condenser',
+        coolingTons: 5,
+        electricalDemand: { required: true, voltage: 240, poles: 2, breakerAmps: 25, loadVa: 2900, loadCategory: 'heat-pump', label: 'Stale 2T' },
+      },
+    })
+    expect(staleCoord.some((r) => r.sourceNodeId === 'switched_passive')).toBe(false)
+    const furnRow = staleCoord.find((r) => r.sourceNodeId === 'switched_furn')!
+    expect(furnRow.voltage).toBe(120)
+    expect(furnRow.poles).toBe(1)
+    expect(furnRow.breakerAmps).toBe(15)
+    const hpRow = staleCoord.find((r) => r.sourceNodeId === 'bumped_hp')!
+    expect(hpRow.breakerAmps).toBe(60)
+    expect(hpRow.loadVa).toBe(7250)
+
+    // 6. XT-13: Framing override preserves explicit 16" spacing on 24" assembly and treats shear walls as load-bearing
+    const framCtx = extractHvacFramingContext({
+      level_0: { id: 'level_0', type: 'level' },
+      asm_24: {
+        id: 'asm_24',
+        type: 'structural:assembly',
+        parentId: 'level_0',
+        studSpacingIn: 24,
+        wallOverrides: {
+          w_16: { construction: 'framed', studSpacingIn: 16, isLoadBearing: false },
+          w_shear: { construction: 'shear-wall', isShearWall: true },
+        },
+      },
+    }, 'level_0')
+    expect(framCtx.wallRules.get('w_16')?.spacingIn).toBe(16)
+    expect(framCtx.wallRules.get('w_shear')?.isLoadBearing).toBe(true)
   })
 })

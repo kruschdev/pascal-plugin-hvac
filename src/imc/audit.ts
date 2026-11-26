@@ -73,13 +73,12 @@ export function auditSceneHvac(
   const inferredCommercial = Object.values(nodes).some(
     (n) =>
       (n.type === 'hvac:equipment' &&
-        (n.equipmentKind === 'rooftop-package-unit' ||
-          n.equipmentKind === 'packaged-rtu' ||
-          n.equipmentKind === 'vrf-outdoor' ||
-          n.occupancy === 'commercial')) ||
+        (n.equipmentKind === 'rooftop-package-unit' || n.occupancy === 'commercial')) ||
       (n.type === 'hvac:duct-run' && n.occupancy === 'commercial') ||
       (n.type === 'electrical:panel' &&
-        (n.voltageSystem === '208Y/120V-3P' || n.voltageSystem === '480Y/277V-3P')),
+        (n.voltageSystem === '120/208V-3P' ||
+          n.voltageSystem === '277/480V-3P' ||
+          n.occupancy === 'commercial')),
   )
   const occupancy: OccupancyType = options.occupancy ?? (inferredCommercial ? 'commercial' : 'residential')
   const cacheKey = `${codeEdition}|${climateZone}|${occupancy}`
@@ -258,6 +257,15 @@ export function auditSceneHvac(
             title: 'HVAC duct invades electrical panel dedicated overhead space',
             detail: `${run.name ?? run.id} passes through ${obs.label}.`,
             suggestedFix: 'Offset ductwork horizontally clear of the electrical panel footprint.',
+            nodeIds: [run.id, baseObsId],
+          })
+        } else if (obs.category === 'electrical-working-space') {
+          push({
+            severity: 'error',
+            codeRef: 'NEC 110.26(A)',
+            title: 'HVAC duct invades electrical panel working space',
+            detail: `${run.name ?? run.id} passes through ${obs.label}.`,
+            suggestedFix: 'Offset ductwork above 6.5 ft (1.98 m) or outside the 30" x 36" clear working space in front of the panel.',
             nodeIds: [run.id, baseObsId],
           })
         } else if (obs.category === 'structural') {

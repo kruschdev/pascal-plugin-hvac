@@ -79,6 +79,78 @@ export type HvacSchedule = {
 
 function readHvacElectricalDemand(n: SceneNodeLike): ElectricalPowerDemand | null {
   const raw = n.electricalDemand as Partial<ElectricalPowerDemand> | undefined
+  const kind =
+    n.type === 'hvac:equipment' && typeof n.equipmentKind === 'string'
+      ? (n.equipmentKind as HvacEquipmentKind)
+      : null
+
+  if (kind) {
+    const inferredOccupancy: OccupancyType =
+      n.occupancy === 'commercial' || raw?.voltage === 208 || raw?.voltage === 480 || raw?.poles === 3
+        ? 'commercial'
+        : 'residential'
+    const coolingTons = typeof n.coolingTons === 'number' ? n.coolingTons : 3
+    const heatStripKw =
+      typeof n.heatStripKw === 'number'
+        ? n.heatStripKw
+        : kind === 'air-handler'
+          ? raw && raw.required === true && raw.voltage === 120 && raw.poles === 1 && raw.loadCategory === 'motor'
+            ? 0
+            : coolingTons <= 2.5
+              ? 5
+              : coolingTons <= 3.5
+                ? 10
+                : coolingTons <= 5.0
+                  ? 15
+                  : 20
+          : undefined
+    const expected = getHvacEquipmentElectricalDemand({
+      kind,
+      coolingTons,
+      ...(heatStripKw !== undefined ? { heatStripKw } : {}),
+      occupancy: inferredOccupancy,
+    })
+
+    if (!expected.required) return null
+
+    if (raw && typeof raw === 'object' && raw.required === true) {
+      const rawVoltage = raw.voltage === 240 || raw.voltage === 208 || raw.voltage === 480 ? raw.voltage : 120
+      const rawPoles: 1 | 2 | 3 = raw.poles === 3 || raw.poles === 2 ? raw.poles : 1
+      const rawAmps = typeof raw.breakerAmps === 'number' ? raw.breakerAmps : 0
+      const rawVa = typeof raw.loadVa === 'number' ? raw.loadVa : 0
+      const isValidCustomAirHandlerStrip =
+        kind === 'air-handler' &&
+        rawVoltage === 240 &&
+        rawPoles === 2 &&
+        rawAmps >= 30 &&
+        rawVa >= 5600 &&
+        raw.loadCategory === 'hvac-heating'
+      const matchesExpected =
+        isValidCustomAirHandlerStrip ||
+        (rawVoltage === expected.voltage &&
+          rawPoles === expected.poles &&
+          rawAmps >= expected.breakerAmps &&
+          rawVa > 0 &&
+          raw.loadCategory === expected.loadCategory)
+      if (matchesExpected) {
+        return {
+          required: true,
+          voltage: rawVoltage,
+          poles: rawPoles,
+          breakerAmps: rawAmps,
+          loadVa: rawVa,
+          continuous: Boolean(raw.continuous),
+          dedicatedCircuit: Boolean(raw.dedicatedCircuit),
+          gfciRequired: Boolean(raw.gfciRequired),
+          afciRequired: Boolean(raw.afciRequired),
+          loadCategory: raw.loadCategory as ElectricalPowerDemand['loadCategory'],
+          label: typeof raw.label === 'string' && raw.label ? raw.label : expected.label,
+        }
+      }
+    }
+    return expected
+  }
+
   if (raw && typeof raw === 'object') {
     if (raw.required === false) return null
     if (raw.required === true) {
@@ -96,13 +168,6 @@ function readHvacElectricalDemand(n: SceneNodeLike): ElectricalPowerDemand | nul
         label: typeof raw.label === 'string' && raw.label ? raw.label : (n.name ?? n.id),
       }
     }
-  }
-  if (n.type === 'hvac:equipment' && typeof n.equipmentKind === 'string') {
-    const fallback = getHvacEquipmentElectricalDemand({
-      kind: n.equipmentKind as HvacEquipmentKind,
-      coolingTons: typeof n.coolingTons === 'number' ? n.coolingTons : 3,
-    })
-    return fallback.required ? fallback : null
   }
   return null
 }
@@ -165,7 +230,25 @@ export function buildHvacElectricalCoordination(
       const dist = Math.hypot(pos[0] - dPos[0], pos[2] - dPos[2])
       const dPoles = typeof d.poles === 'number' ? d.poles : 1
       const dAmps = typeof d.breakerAmps === 'number' ? d.breakerAmps : 15
-      const dVoltage = typeof d.voltage === 'number' ? d.voltage : dPoles >= 2 ? 240 : 120
+      const panelNode = typeof d.panelId === 'string' ? nodes[d.panelId] : undefined
+      const panelVS = typeof panelNode?.voltageSystem === 'string' ? panelNode.voltageSystem : undefined
+      const derivedVoltage =
+        panelVS === '120/208V-3P'
+          ? dPoles >= 2
+            ? 208
+            : 120
+          : panelVS === '277/480V-3P'
+            ? dPoles >= 2
+              ? 480
+              : 277
+            : panelVS === '120/240V-1P'
+              ? dPoles >= 2
+                ? 240
+                : 120
+              : dPoles >= 2
+                ? 240
+                : 120
+      const dVoltage = typeof d.voltage === 'number' ? d.voltage : derivedVoltage
       if (dist > 1.8 || dPoles !== demand.poles || dVoltage !== demand.voltage || dAmps < demand.breakerAmps) continue
 
       if (demand.dedicatedCircuit) {

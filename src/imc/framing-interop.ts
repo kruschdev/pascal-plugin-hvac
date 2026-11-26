@@ -395,8 +395,8 @@ export function extractHvacFramingContext(
       const rawSpacing = r.studSpacingIn ?? r.spacingIn
       wallRules.set(wallId, {
         construction: typeof r.construction === 'string' ? r.construction : 'framed',
-        spacingIn: rawSpacing === 12 ? 12 : rawSpacing === 24 ? 24 : studSpacingIn,
-        isLoadBearing: Boolean(r.isLoadBearing),
+        spacingIn: rawSpacing === 12 ? 12 : rawSpacing === 16 ? 16 : rawSpacing === 24 ? 24 : studSpacingIn,
+        isLoadBearing: Boolean(r.isLoadBearing || r.isShearWall || r.construction === 'shear-wall'),
       })
     }
   }
