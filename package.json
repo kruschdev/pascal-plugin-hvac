@@ -64,6 +64,10 @@
     "test": "bun test src",
     "check:render": "bun scripts/check-render-entry.ts",
     "export:cad": "bun scripts/export-cad-catalog.ts",
+    "render:cad-thumbs": "bun scripts/render-cad-thumbnails.ts",
+    "render:cutaway": "bun scripts/render-air-handler-cutaway.ts",
+    "render:walkthrough": "bun scripts/render-walkthrough-video.ts",
+    "render:social": "bun scripts/render-social-preview.ts",
     "check": "bun run check-types && bun test && bun run check:render && bun run build"
   },
   "peerDependencies": {

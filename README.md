@@ -1,30 +1,55 @@
-# `@kruschdev/pascal-plugin-hvac`
+# Pascal Plugin HVAC (`@kruschdev/pascal-plugin-hvac`)
 
-> Residential & Light-Commercial IMC / UMC / ACCA Manual J-D-S / ASHRAE 62.2 / IECC HVAC Plugin for [Pascal Editor](https://github.com/pascalorg/editor) (`apiVersion: 1`, MIT).
+[![License: MIT](https://img.shields.io/badge/License-MIT-sky.svg)](./LICENSE)
+[![Pascal Plugin API v1](https://img.shields.io/badge/Pascal_Plugin_API-v1-38bdf8.svg)](https://github.com/pascalorg/editor)
+[![3D CAD Models](https://img.shields.io/badge/MIT_3D_CAD_Models-42_.glb-10b981.svg)](./docs/CAD-CATALOG.md)
+[![IMC Tests](https://img.shields.io/badge/Tests-45%2F45_Passing-22c55e.svg)](./src/__tests__)
+
+An open-source, MIT-licensed **Residential and Light-Commercial IMC / UMC / ACCA Manual J-D-S / ASHRAE 62.2 / IECC HVAC** plugin for [Pascal Editor](https://github.com/pascalorg/editor).
 
 I built `@kruschdev/pascal-plugin-hvac` to complete the 4-trade MEP stack inside Pascal Editor alongside Structural (Priority #1), Plumbing (Priority #2), and Electrical (Priority #4). Every calculation runs deterministically in TypeScript with zero cloud dependencies, zero global CSS, and strict runtime boundary isolation across all 6 subpath exports.
 
-## Capabilities
+## Walkthrough Video (Recorded Live in Pascal Editor)
 
-- **4 Native Pascal Node Kinds (`hvac:*`)**:
-  - `hvac:equipment`: Split heat pump condensers, AC condensers, variable-speed air handlers, 96% and 80% gas furnaces, packaged rooftop units (RTU), multi-zone mini-splits, ASHRAE 62.2 ERV ventilators, whole-house dehumidifiers, bath exhaust fans, and kitchen range hoods.
-  - `hvac:plenum`: Supply plenums, return plenums, outdoor-air mixing boxes, and motorized multi-zone damper trunk manifolds.
-  - `hvac:terminal`: Floor registers, ceiling 4-way diffusers, sidewall registers, filter-back return grilles, bedroom transfer grilles, exhaust grilles, fresh-air intake hoods, mini-split wall heads, smart thermostats, and remote zone sensors.
-  - `hvac:duct-run`: Rectangular sheet-metal trunks, round flex/rigid branches, ERV/exhaust ducts, insulated copper refrigerant linesets, and gravity-sloped 3/4" PVC condensate drains.
-- **Framework-Free Engineering Engine (`./imc`)**:
-  - Room-by-room simplified **ACCA Manual J** heating and cooling loads (sensible + latent) across all 14 ASHRAE Climate Zones (`1A` through `7`), with wall/attic R-value multipliers and occupancy scaling.
-  - **ACCA Manual D** equal-friction duct sizing and Huebscher rectangular equivalent diameter (`Deq = 1.30 * (a*b)^0.625 / (a+b)^0.25`) with residential and commercial velocity limits.
-  - **ACCA Manual S** equipment selection (`SEER2` / `HSPF2`), A2L refrigerant (`R-454B`, `R-32`, `R-410A`) lineset sizing, and thermostat cable specifications.
-  - **ASHRAE 62.2** continuous fresh-air ERV ventilation and local bath/kitchen exhaust sizing.
-  - **IECC** building envelope insulation takeoffs (wall batts, blown-in attic cellulose, rim-joist closed-cell spray foam, and air-sealing caulk/foam).
-- **4-Trade MEP Coordination (Priority #3)**:
-  - **Priority #1 Structural & Bones Framing**: Reads `structural:assembly` and `bones:framing` framing metadata (stud spacing, joist depth, floor system, load-bearing wall overrides) to evaluate wall penetration openings, double top-plate straps, and dropped-soffit chases per IRC R502.8 / R602.6 / R302.11, and detours ductwork around `structural:beam` and `structural:column` collision obstacles.
-  - **Priority #2 Plumbing**: Detours ductwork around gravity DWV drains, stacks, manifolds, and plumbing equipment without forcing gravity drains to move. Gas furnaces publish `gasBtuh` so `@kruschdev/pascal-plugin-plumbing` automatically includes furnace demand in its IFGC fuel-gas main sizing.
-  - **Priority #4 Electrical**: Every powered `hvac:equipment` node publishes a standardized `electricalDemand` payload (NEC Art. 440 / 424 voltage, poles, breaker amps, VA, dedicated circuit flag) consumed automatically by `@kruschdev/pascal-plugin-electrical`. Duct routing also respects `NEC 110.26(E)` dedicated panel footprints down to the floor (`minY = 0`).
-- **42-Part Clean-Room MIT 3D CAD Library (`./cad`)**:
-  - Procedural Three.js geometry for all 12 equipment types, 4 plenums, 10 terminals/controls, 9 sheet-metal/flex duct fittings, 5 refrigerant/condensate accessories, and 2 assemblies including an open-front **3D Air Handler, Supply/Return Plenum & Joist-Bay Cutaway**.
-- **8 Pure Agent Tools & Operations (`./agent-tools`, `./agent-operations`)**:
-  - `hvac_place_equipment`, `hvac_place_plenum`, `hvac_place_terminal`, `hvac_route_duct`, `hvac_autopopulate`, `hvac_calculate_loads`, `hvac_generate_schedule`, and `hvac_audit_imc`.
+![Live Pascal Editor Walkthrough: One-Click IMC / ACCA Manual J Auto-Populate on a Two-Bedroom House, Priority #3 3D Duct Routing Around Plumbing DWV, Interactive 3D Air Handler & Joist-Bay Cutaway, Live Manual J Schedule, Cross-Trade Electrical Power Handoff, Priced BOM with IECC Insulation, and IMC Audit](./assets/demo-walkthrough.gif)
+
+**[Watch Full 720p HD Narrated Walkthrough Video Recorded in Pascal Editor (`assets/demo-walkthrough.mp4`)](./assets/demo-walkthrough.mp4)**
+
+1. **One-Click IMC / Manual J-D-S Auto-Populate & Catalog Placement**: Scans every room and exterior wall across all 14 ASHRAE Climate Zones (`1A` through `7`) to compute room-by-room heating and sensible/latent cooling BTU/h, select equipment tonnage (`SEER2` / `HSPF2`), A2L refrigerant linesets (`R-454B`, `R-32`, `R-410A`), continuous ASHRAE 62.2 ERV ventilation, bath exhaust fans, and vented kitchen range hoods, and drop in 26 live equipment, plenum, and terminal kinds directly from the HVAC rail.
+2. **4-Trade Priority #3 3D Duct Routing, Layer Filtering & 2D Floorplan**: Routes color-coded 3D rectangular trunks, R-8 flex/rigid branches, return drops, ERV fresh-air ducts, exhaust runs, insulated copper refrigerant linesets, and gravity-sloped 3/4" PVC condensate drains while yielding around Structural beams/columns and Priority #2 Plumbing DWV pipes. Toggle any of the 8 mechanical layers live or switch to the color-matched 2D HVAC floorplan schematic.
+3. **Interactive 3D Air Handler, Supply/Return Plenum & Joist-Bay Cutaway**: Opens inside Pascal's split-pane `HVAC Schedule` view with live drag-to-orbit and 3 view modes (`Joist-Bay & Open Air Handler`, `Cabinet Cover Off`, `Cabinet Door Closed`) showing the overhead 16" OC joists, evaporator A-coil, copper lineset stubs, ECM blower housing, MERV-13 filter rack, secondary galvanized overflow pan with SS2 float switch (`IMC 307.2`), manual balancing dampers, and live room branch tags.
+4. **Live Manual J Schedule, Manual S Sizing & Cross-Trade Power/Gas Handoff**: Inspects room-by-room heating/cooling loads and airflows, installed ductwork velocities (`FPM`), Manual S capacity and lineset sizing, structural framing/soffit clearances (`IRC R502.8 / R602.6 / R302.11`), furnace `gasBtuh` sync for `@kruschdev/pascal-plugin-plumbing`, and automatic `NEC Art. 440 / 424` breaker handoff to `@kruschdev/pascal-plugin-electrical`.
+5. **Live Priced BOM + IECC Envelope Insulation & IMC/IECC Audit**: Adjust Labor (`$/hr`), Material Markup (`%`), Sales Tax (`%`), and optional IECC building envelope insulation (wall batts, attic cellulose, rim-joist spray foam, air sealing) with one-click CSV export alongside the live IMC / Manual D / IECC / `NEC 110.26(E)` compliance audit.
+
+## Showcase Gallery
+
+![4-Panel 3D Air Handler, Plenum & Joist-Bay Cutaway + Commercial Packaged RTU Showcase](./assets/demo-air-handler-cutaway.png)
+
+![Live Pascal Editor HVAC Rail and 3D Priority #3 Duct Routing: Color-Coded Supply Trunk, R-8 Branches, Return Plenum, ASHRAE 62.2 ERV, Exhaust, Refrigerant Lineset, and Condensate Drain](./assets/demo-3d-duct-routing.png)
+
+![Split-Pane Pascal Editor 3D Viewport and Live Populated ACCA Manual J Room Load & Ductwork Summary Schedule](./assets/demo-hvac-schedule.png)
+
+![42 Clean-Room MIT HVAC CAD Material Models (.glb): Heat Pumps, Condensing Furnaces, Commercial RTUs, Multi-Zone Mini-Splits, ERVs, Plenums, Motorized Zone Dampers, Registers, Smart Thermostats, Duct Fittings, Linesets, Condensate Traps, and 3D Air Handler Cutaways](./assets/cad-material-catalog.png)
+
+### 42-Model Clean-Room MIT CAD Library (6 Categories)
+
+| Category | Count | Included Highlights |
+|---|---|---|
+| **Heat Pumps, Furnaces & Mechanical Equipment** | 12 | 3-Ton Split Heat Pump & AC Condensers (`SEER2`), Variable-Speed Air Handler w/ A-Coil, 96% & 80% AFUE Gas Furnaces, Commercial Packaged Rooftop Unit (RTU), Inverter Multi-Zone Mini-Split Outdoor & Wall Heads, ASHRAE 62.2 ERV, Whole-House Ducted Dehumidifier, Bath Exhaust Fan, Vented Kitchen Range Hood |
+| **Plenums & Zone Damper Manifolds** | 4 | Insulated Sheet-Metal Supply Plenum, Return Air Plenum & Filter Box, Fresh-Air / Return Mixing Box, Motorized Multi-Zone Damper Trunk Manifold |
+| **Registers, Grilles & Smart Controls** | 10 | 4x10 Floor Supply Register + Boot, Ceiling 4-Way Diffuser, High-Sidewall Register, Filter-Back Central Return Grille, Bedroom Transfer Grille, Ceiling Exhaust Grille, Exterior Fresh-Air Intake Hood, Mini-Split Wall Head, Smart Wi-Fi Thermostat (`18/8`), Remote Room Temp/RH Sensor |
+| **Duct Fittings, Boots & Transitions** | 9 | Rectangular 90° Trunk Elbow, Sheet-Metal Trunk Transition Reducer, 45° Round Duct Wye Branch, Start Collar w/ Manual Balancing Damper, 4x10 Floor End Boot, R-8 Insulated Ceiling Register Box, Motorized 24V Round Zone Damper, R-8 Insulated Flex Duct, Roof Exhaust Vent Jack w/ Backdraft Damper |
+| **Lineset, Condensate & Electrical Accessories** | 5 | 36x36 Composite Condenser Pad, 60A Weatherproof AC Disconnect (`NEC 440.14`), Insulated Copper Refrigerant Lineset Pair, 3/4" PVC Condensate P-Trap & SS2 Float Switch (`IMC 307.2.3`), MERV-13 4" Media Filter Rack |
+| **Air Handler & Joist-Bay Cutaway Assemblies** | 2 | 3D Air Handler, Supply/Return Plenum & Joist-Bay Cutaway (`IRC R502.8`), 3D Air Handler Cover-Off Evaporator A-Coil & Blower View |
+
+> **Drafting and engineering aid, not stamped engineering.** Always verify Manual J/D/S calculations, duct sizing, clearances, and local AHJ amendments with a licensed mechanical engineer or HVAC contractor before construction.
+
+## Core Principle: 4-Trade MEP Coordination (Priority #3)
+
+1. **Priority #1 Structural & Bones Framing**: Reads `structural:assembly` and `bones:framing` framing metadata (stud spacing, joist depth, floor system, load-bearing wall overrides) to evaluate wall penetration openings, double top-plate straps, and dropped-soffit chases per `IRC R502.8 / R602.6 / R302.11`, and detours ductwork around `structural:beam` and `structural:column` obstacles.
+2. **Priority #2 Plumbing**: Detours ductwork around gravity DWV drains, stacks, manifolds, and plumbing equipment without forcing gravity drains to move. Gas furnaces publish `gasBtuh` so `@kruschdev/pascal-plugin-plumbing` automatically includes furnace demand in its IFGC fuel-gas main sizing.
+3. **Priority #3 HVAC (`hvac:*`)**: Sizes and routes rigid trunks, R-8 flex branches, ERV ducts, exhaust ducts, insulated copper refrigerant linesets, and gravity-sloped 3/4" PVC condensate drains while respecting `NEC 110.26(E)` dedicated electrical space down to the floor (`minY = 0`).
+4. **Priority #4 Electrical**: Every powered `hvac:equipment` node publishes a standardized `electricalDemand` payload (`NEC Art. 440 / 424` voltage, poles, breaker amps, VA, dedicated circuit flag) consumed automatically by `@kruschdev/pascal-plugin-electrical`.
 
 ## Installation & Subpath Exports
 
@@ -44,36 +69,45 @@ bun add @kruschdev/pascal-plugin-hvac
 ## Host Registration Example
 
 ```ts
-import { registerPlugin } from '@pascal-app/core'
+import { extendPluginDiscovery } from '@pascal-app/core'
 import { registerEditorHostPanel, registerEditorHostView, registerPluginChatExtension } from '@pascal-app/editor'
 import {
-  hvacPlugin,
-  hvacHostPanel,
-  hvacScheduleView,
   hvacChatExtension,
+  hvacHostPanel,
+  hvacPlugin,
+  hvacScheduleView,
 } from '@kruschdev/pascal-plugin-hvac'
 
-registerPlugin(hvacPlugin)
+extendPluginDiscovery(async () => [hvacPlugin])
 registerEditorHostPanel(hvacHostPanel)
 registerEditorHostView(hvacScheduleView)
 registerPluginChatExtension(hvacChatExtension)
 ```
 
+## Documentation
+
+| Guide | What It Covers |
+|---|---|
+| **[Architecture & Trade Priority](./docs/ARCHITECTURE.md)** | System diagram, 6 entrypoint boundary gates, 4 `hvac:*` node kinds, Priority #3 routing, and 3D cutaway pipeline |
+| **[IMC / ACCA / IECC Engineering Reference](./docs/IMC-REFERENCE.md)** | Manual J (14 ASHRAE zones), Manual D equal-friction + Huebscher `Deq`, Manual S A2L linesets, ASHRAE 62.2 ERV, IECC insulation, and audit rules |
+| **[42-Model MIT 3D CAD Catalog](./docs/CAD-CATALOG.md)** | Full inventory of all 42 `.glb` models across 6 categories, code references, and programmatic `./cad` usage |
+| **[Agent Tools & Operations Reference (`E-016`)](./docs/AGENT-TOOLS.md)** | All 8 pure Zod agent tools and headless scene operations for MCP servers and Pascal AI Chat |
+| **[Media Kit & Launch Copy](./docs/MEDIA-KIT.md)** | Social preview (`1280 x 640`), HD narrated walkthrough video, high-res screenshots, CAD contact sheet, and launch copy |
+| **[Walkthrough Voiceover Script](./docs/WALKTHROUGH-SCRIPT.md)** | Timed `69.6s` narration beat sheet and one-command Gemini TTS (`gemini-3.8-flash-tts`) + `ffmpeg` muxing script (`scripts/add-voiceover.sh`) |
+
 ## Development & Verification
 
 ```bash
 bun install
-bun run check        # tsc + tests + 5/5 entry boundary gates + ESM build
-bun run export:cad   # Export all 42 .glb CAD assets into assets/cad/
+bun run check              # tsc + 45/45 tests + 5/5 entry boundary gates + ESM build
+bun run export:cad         # Export all 42 .glb CAD assets into assets/cad/
+bun run render:cad-thumbs  # Re-render all 42 thumbnails + 6x7 contact sheet
+bun run render:cutaway     # Re-render 4-panel 3D Air Handler Cutaway showcase
+PASCAL_EDITOR_URL=http://localhost:3210/project/<id> bun run render:walkthrough
+bun run render:social      # Re-render 1280x640 OpenGraph social preview
+bash scripts/add-voiceover.sh --voice Charon
 ```
-
-## Documentation
-
-- [Architecture & Trade Priority](docs/ARCHITECTURE.md)
-- [IMC / ACCA / IECC Engineering Reference](docs/IMC-REFERENCE.md)
-- [Agent Tools & Operations Reference](docs/AGENT-TOOLS.md)
-- [3D CAD Catalog (42 Models)](docs/CAD-CATALOG.md)
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. Created by Kevin Ruschman ([@kruschdev](https://github.com/kruschdev)). See [LICENSE](LICENSE).
