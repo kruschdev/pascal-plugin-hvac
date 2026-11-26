@@ -589,7 +589,28 @@ export function planHvacAutoPopulate(
 
   const indoorPos: Vec3 = [clearX, isAtticMountedAhu ? atticPlatformY : 0, clearZ]
   const indoorRoomLabel = isAtticMountedAhu ? 'Attic Mechanical Platform' : mechRoom.name
-  const outdoorPos: Vec3 = [round2(bounds.maxX + 0.95), 0, round2(indoorPos[2])]
+  // Place outdoor condenser on the nearest exterior side wall to the mechanical core, maintaining >= 1.2m
+  // ignition-source clearance from any exterior fuel-gas meter/regulator vent (IFGC / NFPA 54).
+  const outdoorOnWest = Math.abs(indoorPos[0] - bounds.minX) < Math.abs(bounds.maxX - indoorPos[0])
+  const outdoorX = round2(outdoorOnWest ? bounds.minX - 0.95 : bounds.maxX + 0.95)
+  const extWallObstacles = obstacles.filter(
+    (o) =>
+      o.category === 'plumbing' &&
+      Math.abs((o.box.minX + o.box.maxX) / 2 - (outdoorOnWest ? bounds.minX : bounds.maxX)) <= 1.5,
+  )
+  let outdoorZ = round2(indoorPos[2])
+  const isOutdoorClear = (tz: number): boolean =>
+    extWallObstacles.every((o) => Math.abs(tz - (o.box.minZ + o.box.maxZ) / 2) >= 1.2)
+  if (!isOutdoorClear(outdoorZ)) {
+    for (const dz of [1.4, -1.4, 2.2, -2.2]) {
+      const candZ = round2(indoorPos[2] + dz)
+      if (candZ >= bounds.minZ + 0.4 && candZ <= bounds.maxZ - 0.4 && isOutdoorClear(candZ)) {
+        outdoorZ = candZ
+        break
+      }
+    }
+  }
+  const outdoorPos: Vec3 = [outdoorX, 0, outdoorZ]
   const hasOverheadSlabPlumbing = obstacles.some(
     (o) => o.category === 'plumbing' && o.box.maxY >= levelH - 0.35 && o.box.minY <= levelH,
   )
@@ -680,8 +701,8 @@ export function planHvacAutoPopulate(
 
     // Insulated Copper Refrigerant Lineset (Indoor Coil -> Outdoor Condenser)
     const linesetRoute = routeHvacDuctRun({
-      from: [indoorPos[0] + 0.22, round2(indoorPos[1] + 0.95), indoorPos[2]],
-      to: [outdoorPos[0] - 0.35, 0.35, outdoorPos[2]],
+      from: [round2(indoorPos[0] + (outdoorOnWest ? -0.22 : 0.22)), round2(indoorPos[1] + 0.95), indoorPos[2]],
+      to: [round2(outdoorPos[0] + (outdoorOnWest ? 0.35 : -0.35)), 0.35, outdoorPos[2]],
       plenumY: plenumLocation === 'attic' ? round2(levelH + 0.12) : -0.18,
       ductHalfSpanM: 0.03,
       allowDiagonalBranch: false,
@@ -707,9 +728,17 @@ export function planHvacAutoPopulate(
     })
 
     // Sloped 3/4" PVC Condensate Drain (IMC 307.2)
-    const condExitPos: Vec3 = [round2(bounds.maxX + 0.15), 0.05, round2(indoorPos[2] + 0.4)]
+    const condExitPos: Vec3 = [
+      round2(outdoorOnWest ? bounds.minX - 0.15 : bounds.maxX + 0.15),
+      0.05,
+      round2(indoorPos[2] + 0.4),
+    ]
     const condRoute = routeCondensateDrain({
-      from: [indoorPos[0] + 0.25, round2(indoorPos[1] + (isAtticMountedAhu ? 0.08 : 0.95)), indoorPos[2] + 0.1],
+      from: [
+        round2(indoorPos[0] + (outdoorOnWest ? -0.25 : 0.25)),
+        round2(indoorPos[1] + (isAtticMountedAhu ? 0.08 : 0.95)),
+        indoorPos[2] + 0.1,
+      ],
       to: condExitPos,
       obstacles,
     })
@@ -841,7 +870,7 @@ export function planHvacAutoPopulate(
         throwFt: 18,
       })
       const lineRoute = routeHvacDuctRun({
-        from: [outdoorPos[0] - 0.25, 0.45, outdoorPos[2]],
+        from: [round2(outdoorPos[0] + (outdoorOnWest ? 0.25 : -0.25)), 0.45, outdoorPos[2]],
         to: headPos,
         plenumY: round2(levelH + 0.12),
         maxPlenumY,
@@ -1292,7 +1321,12 @@ export function planHvacAutoPopulate(
     })
 
     const intakeId = nextTermId()
-    const intakePos: Vec3 = [round2(bounds.minX - 0.08), isAtticMountedAhu ? round2(levelH + 0.25) : 2.1, round2(ervPos[2])]
+    const intakeOnWest = Math.abs(ervPos[0] - bounds.minX) <= Math.abs(bounds.maxX - ervPos[0])
+    const intakePos: Vec3 = [
+      round2(intakeOnWest ? bounds.minX - 0.08 : bounds.maxX + 0.08),
+      isAtticMountedAhu ? round2(levelH + 0.25) : 2.1,
+      round2(ervPos[2]),
+    ]
     terminals.push({
       id: intakeId,
       name: `Fresh Air Intake Hood (${ventilation.continuousFreshAirCfm} CFM)`,

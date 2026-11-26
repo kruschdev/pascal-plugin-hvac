@@ -153,4 +153,47 @@ describe('Cross-Trade 4-MEP Coordination Regression Suite (XTRADE-04)', () => {
     expect(audit.errorCount).toBe(0)
     expect(audit.warningCount).toBe(0)
   })
+
+  test('Shared Mechanical Room + Plumbing synchronicity: places AHU & ERV clear of WH/Manifold and condenser on nearest exterior wall clear of Gas Meter', () => {
+    const sharedScene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.6 },
+      w_n: { id: 'w_n', type: 'wall', parentId: 'level_0', start: [-7, -4.5], end: [7, -4.5], height: 2.6, thickness: 0.16 },
+      w_e: { id: 'w_e', type: 'wall', parentId: 'level_0', start: [7, -4.5], end: [7, 4.5], height: 2.6, thickness: 0.16 },
+      w_s: { id: 'w_s', type: 'wall', parentId: 'level_0', start: [7, 4.5], end: [-7, 4.5], height: 2.6, thickness: 0.16 },
+      w_w: { id: 'w_w', type: 'wall', parentId: 'level_0', start: [-7, 4.5], end: [-7, -4.5], height: 2.6, thickness: 0.16 },
+      r_mech: { id: 'r_mech', type: 'zone', name: 'Mechanical Room', parentId: 'level_0', polygon: [[-7, -4.5], [-4, -4.5], [-4, -0.5], [-7, -0.5]] },
+      r_bath: { id: 'r_bath', type: 'zone', name: 'Bath', parentId: 'level_0', polygon: [[-1.6, -4.5], [1.4, -4.5], [1.4, -0.5], [-1.6, -0.5]] },
+      r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[-7, -0.5], [2.2, -0.5], [2.2, 4.5], [-7, 4.5]] },
+      r_kit: { id: 'r_kit', type: 'zone', name: 'Kitchen', parentId: 'level_0', polygon: [[2.2, -0.5], [7, -0.5], [7, 4.5], [2.2, 4.5]] },
+      wh_gas: { id: 'wh_gas', type: 'plumbing:equipment', equipmentKind: 'water-heater-tank-gas', name: 'Gas Water Heater (40 gal)', parentId: 'level_0', position: [-5.5, 0, -4.08] },
+      man_pex: { id: 'man_pex', type: 'plumbing:manifold', name: 'PEX Home-Run Manifold', parentId: 'level_0', position: [-4.85, 1.35, -4.08] },
+      gas_mtr: { id: 'gas_mtr', type: 'plumbing:equipment', equipmentKind: 'gas-meter', name: 'Natural Gas Meter', parentId: 'level_0', position: [-7.15, 0.9, -3.28] },
+    }
+    const plan = planHvacAutoPopulate(sharedScene, {
+      levelId: 'level_0',
+      climateZone: '4A',
+      systemType: 'split-heat-pump',
+      plenumLocation: 'attic',
+      includeErv: true,
+    })
+    const ahu = plan.equipment.find((e) => e.equipmentKind === 'air-handler')!
+    const cond = plan.equipment.find((e) => e.equipmentKind === 'heat-pump-condenser')!
+    // Air Handler stays inside Mechanical Room and clear of Plumbing WH/Manifold
+    expect(ahu.roomName).toBe('Mechanical Room')
+    expect(ahu.position[0]).toBeGreaterThanOrEqual(-7)
+    expect(ahu.position[0]).toBeLessThanOrEqual(-4)
+    expect(Math.hypot(ahu.position[0] - -5.5, ahu.position[2] - -4.08)).toBeGreaterThanOrEqual(1.1)
+    // Outdoor Condenser mounts on nearest exterior West wall (x < -7), >= 1.2m clear of Gas Meter
+    expect(cond.position[0]).toBeLessThan(-7)
+    expect(Math.abs(cond.position[2] - -3.28)).toBeGreaterThanOrEqual(1.2)
+
+    const fullScene: Record<string, SceneNodeLike> = { ...sharedScene }
+    for (const eq of plan.equipment) fullScene[eq.id] = { ...eq, type: 'hvac:equipment', parentId: 'level_0' }
+    for (const pl of plan.plenums) fullScene[pl.id] = { ...pl, type: 'hvac:plenum', parentId: 'level_0' }
+    for (const t of plan.terminals) fullScene[t.id] = { ...t, type: 'hvac:terminal', parentId: 'level_0' }
+    for (const d of plan.ductRuns) fullScene[d.id] = { ...d, type: 'hvac:duct-run', parentId: 'level_0' }
+    const audit = auditSceneHvac(fullScene, { climateZone: '4A' })
+    expect(audit.errorCount).toBe(0)
+    expect(audit.warningCount).toBe(0)
+  })
 })

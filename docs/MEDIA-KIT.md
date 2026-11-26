@@ -7,14 +7,14 @@ Ready-to-share narrated video, high-resolution screenshots, 42-model 3D CAD cont
 | Asset | Resolution / Format | Best Use |
 |---|---|---|
 | [`assets/social-preview.png`](../assets/social-preview.png) | `1280 x 640` PNG | GitHub Social Preview, OpenGraph card, LinkedIn/X link banner |
-| [`assets/demo-walkthrough.mp4`](../assets/demo-walkthrough.mp4) | `1280 x 720` H.264 MP4 (`69.6s`, narrated 48 kHz AAC + `+faststart`) | X video post, LinkedIn native video, YouTube, GitHub Release |
+| [`assets/demo-walkthrough.mp4`](../assets/demo-walkthrough.mp4) | `1280 x 720` H.264 MP4 (`87.0s`, narrated 48 kHz AAC + `+faststart`) | X video post, LinkedIn native video, YouTube, GitHub Release |
 | [`assets/demo-walkthrough.gif`](../assets/demo-walkthrough.gif) | `640px` palette-optimized GIF | README preview, Reddit, Discord, Slack |
 | [`assets/demo-3d-duct-routing.png`](../assets/demo-3d-duct-routing.png) | `1440 x 810` PNG | Live Pascal Editor 3D HVAC routing, Manual J summary & Duct/Mechanical Layer rail |
 | [`assets/demo-air-handler-cutaway.png`](../assets/demo-air-handler-cutaway.png) | `1920 x 760` PNG | 4-panel 3D Air Handler, Plenum & Joist-Bay Cutaway + Commercial Packaged RTU showcase |
 | [`assets/demo-hvac-schedule.png`](../assets/demo-hvac-schedule.png) | `1440 x 810` PNG | Live split-pane 3D house + populated ACCA Manual J room load & ductwork schedule |
 | [`assets/cad-material-catalog.png`](../assets/cad-material-catalog.png) | `1820 x 1780` PNG | Complete 42-model clean-room MIT HVAC CAD catalog contact sheet (6x7 studio grid) |
 | [`assets/screenshots/`](../assets/screenshots) | `1440 x 810` PNGs (9 shots) | Full step-by-step live editor capture set (Before Auto-Populate, 3D Routing, 2D Floorplan, Open/Closed Cutaway, Manual J, Loads & Power/Gas, Priced BOM + IECC, IMC Audit Pass) |
-| [`docs/WALKTHROUGH-SCRIPT.md`](./WALKTHROUGH-SCRIPT.md) | Markdown Beat Sheet | Timed `69.6s` chapter-by-chapter narration script & TTS input text |
+| [`docs/WALKTHROUGH-SCRIPT.md`](./WALKTHROUGH-SCRIPT.md) | Markdown Beat Sheet | Timed `87.0s` chapter-by-chapter narration script & TTS input text |
 | [`scripts/add-voiceover.sh`](../scripts/add-voiceover.sh) | Bash (`gemini-api tts` + `ffmpeg`) | One-command Gemini TTS synthesis (`gemini-3.8-flash-tts`) and loudnorm AAC muxing into `assets/demo-walkthrough.mp4` |
 
 ## Project Facts (Quick Reference)
@@ -26,7 +26,7 @@ Ready-to-share narrated video, high-resolution screenshots, 42-model 3D CAD cont
 - **3D CAD Library**: 42 exported binary `.glb` models + 42 studio thumbnails across 6 categories (Heat Pumps & Furnaces, Plenums & Zone Damper Manifolds, Registers & Smart Controls, Duct Fittings & Transitions, Lineset/Condensate Accessories, and 3D Air Handler Cutaway Assemblies)
 - **Live Editor Equipment & Controls**: 26 live placeable kinds (`12` `hvac:equipment`, `4` `hvac:plenum`, `10` `hvac:terminal`) plus `8` color-coded `hvac:duct-run` systems with live layer toggles, 2D floorplan symbols, interactive 3D Air Handler Cutaway, IMC/IECC audit, and contractor-priced BOM + IECC envelope insulation takeoff
 - **4-Trade MEP Coordination (Priority #3)**: Reads `structural:assembly` and `bones:framing` for wall openings and dropped-soffit chases (`IRC R502.8 / R602.6 / R302.11`), routes cleanly around Priority #1 Structural beams/columns and Priority #2 Plumbing DWV/stacks, respects `NEC 110.26(E)` electrical panel space, publishes `gasBtuh` for Plumbing IFGC gas mains, and publishes standardized `electricalDemand` (`NEC Art. 440 / 424`) for automatic breaker handoff in `@kruschdev/pascal-plugin-electrical`
-- **Verification**: 45/45 deterministic IMC, ACCA Manual J/D/S, ASHRAE 62.2, IECC, cross-trade 4-MEP coordination, CAD, and boundary tests (`817` assertions), `tsc --noEmit` clean, 5/5 entrypoint boundary gates, compiled Node 22 ESM + Bun `dist/` build
+- **Verification**: 46/46 deterministic IMC, ACCA Manual J/D/S, ASHRAE 62.2, IECC, cross-trade 4-MEP coordination, CAD, and boundary tests (`825` assertions), `tsc --noEmit` clean, 5/5 entrypoint boundary gates, compiled Node 22 ESM + Bun `dist/` build
 
 ## Ready-to-Post Copy
 
@@ -78,7 +78,7 @@ registerEditorHostView(hvacScheduleView)
 registerPluginChatExtension(hvacChatExtension)
 ```
 
-Or clone and run the full deterministic check suite locally (`45/45` tests, `817` assertions, typecheck, 5/5 entry boundary gates, and compiled `dist/` build):
+Or clone and run the full deterministic check suite locally (`46/46` tests, `825` assertions, typecheck, 5/5 entry boundary gates, and compiled `dist/` build):
 
 ```bash
 git clone https://github.com/kruschdev/pascal-plugin-hvac.git

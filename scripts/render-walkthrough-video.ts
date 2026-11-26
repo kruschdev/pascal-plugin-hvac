@@ -473,11 +473,11 @@ try {
 
   // ─── CHAPTER 1: Real Pascal Two-Bedroom House + One-Click HVAC Auto-Populate ──
   markChapter('Chapter 1: One-Click HVAC Auto-Populate & Catalog Placement')
-  await setBanner('1 / 5 · Pascal Editor Two-Bedroom House · Ready for One-Click IMC / Manual J HVAC')
+  await setBanner('1 / 5 · Shared Mechanical Room + Live Plumbing · Ready for One-Click IMC / Manual J HVAC')
   await captureCleanShot('01-pascal-hvac-before-autopop.png')
   await captureFrames(18, 80, '01_before_autopop', true)
 
-  await setBanner('1 / 5 · One-Click Auto-Populate: Manual J Loads, Air Handler, Heat Pump, ERV & 3D Ductwork')
+  await setBanner('1 / 5 · One-Click Auto-Populate: Manual J Loads, Mechanical Room AHU/ERV & 3D Ductwork')
   await smoothClickButton('Auto-Populate HVAC', false, 6, 30, '02_after_autopop')
 
   // Place a Smart Wi-Fi Thermostat from the 42-model catalog quick-placer

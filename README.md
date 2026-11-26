@@ -3,11 +3,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-sky.svg)](./LICENSE)
 [![Pascal Plugin API v1](https://img.shields.io/badge/Pascal_Plugin_API-v1-38bdf8.svg)](https://github.com/pascalorg/editor)
 [![3D CAD Models](https://img.shields.io/badge/MIT_3D_CAD_Models-42_.glb-10b981.svg)](./docs/CAD-CATALOG.md)
-[![IMC Tests](https://img.shields.io/badge/Tests-45%2F45_Passing-22c55e.svg)](./src/__tests__)
+[![IMC Tests](https://img.shields.io/badge/Tests-46%2F46_Passing-22c55e.svg)](./src/__tests__)
 
 An open-source, MIT-licensed **Residential and Light-Commercial IMC / UMC / ACCA Manual J-D-S / ASHRAE 62.2 / IECC HVAC** plugin for [Pascal Editor](https://github.com/pascalorg/editor).
 
 I built `@kruschdev/pascal-plugin-hvac` to complete the 4-trade MEP stack inside Pascal Editor alongside Structural (Priority #1), Plumbing (Priority #2), and Electrical (Priority #4). Every calculation runs deterministically in TypeScript with zero cloud dependencies, zero global CSS, and strict runtime boundary isolation across all 6 subpath exports.
+
+> [!NOTE]
+> **Early Development Status:** This plugin is still in the beginning stages of being refined and is not yet at the same level of polish, depth, or completeness as my [Pascal Electrical Plugin (`@kruschdev/pascal-plugin-electrical`)](https://github.com/kruschdev/pascal-plugin-electrical). Expect active iteration on layout rules, 3D routing, and edge cases as I continue building it out.
 
 ## Walkthrough Video (Recorded Live in Pascal Editor)
 
@@ -93,13 +96,13 @@ registerPluginChatExtension(hvacChatExtension)
 | **[42-Model MIT 3D CAD Catalog](./docs/CAD-CATALOG.md)** | Full inventory of all 42 `.glb` models across 6 categories, code references, and programmatic `./cad` usage |
 | **[Agent Tools & Operations Reference (`E-016`)](./docs/AGENT-TOOLS.md)** | All 8 pure Zod agent tools and headless scene operations for MCP servers and Pascal AI Chat |
 | **[Media Kit & Launch Copy](./docs/MEDIA-KIT.md)** | Social preview (`1280 x 640`), HD narrated walkthrough video, high-res screenshots, CAD contact sheet, and launch copy |
-| **[Walkthrough Voiceover Script](./docs/WALKTHROUGH-SCRIPT.md)** | Timed `69.6s` narration beat sheet and one-command Gemini TTS (`gemini-3.8-flash-tts`) + `ffmpeg` muxing script (`scripts/add-voiceover.sh`) |
+| **[Walkthrough Voiceover Script](./docs/WALKTHROUGH-SCRIPT.md)** | Timed `87.0s` narration beat sheet and one-command Gemini TTS (`gemini-3.8-flash-tts`) + `ffmpeg` muxing script (`scripts/add-voiceover.sh`) |
 
 ## Development & Verification
 
 ```bash
 bun install
-bun run check              # tsc + 45/45 tests + 5/5 entry boundary gates + ESM build
+bun run check              # tsc + 46/46 tests + 5/5 entry boundary gates + ESM build
 bun run export:cad         # Export all 42 .glb CAD assets into assets/cad/
 bun run render:cad-thumbs  # Re-render all 42 thumbnails + 6x7 contact sheet
 bun run render:cutaway     # Re-render 4-panel 3D Air Handler Cutaway showcase
