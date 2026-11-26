@@ -11,8 +11,9 @@ export function buildHvacEquipmentCad(params: {
   equipmentKind: HvacEquipmentKind
   coolingTons?: number
   hasSecondaryDrainPan?: boolean
+  orientation?: 'vertical' | 'horizontal'
 }): Group {
-  const { equipmentKind, coolingTons = 3, hasSecondaryDrainPan = true } = params
+  const { equipmentKind, coolingTons = 3, hasSecondaryDrainPan = true, orientation = 'vertical' } = params
   const pool = createHvacMaterialPool()
   const g = new Group()
   g.name = `hvac-equipment-${equipmentKind}`
@@ -45,6 +46,32 @@ export function buildHvacEquipmentCad(params: {
   }
 
   if (equipmentKind === 'air-handler' || equipmentKind === 'gas-furnace-96' || equipmentKind === 'gas-furnace-80') {
+    if (orientation === 'horizontal') {
+      // Low-profile horizontal attic cabinet (~0.52m total height including 0.05m drain pan)
+      const len = 1.32
+      const h = 0.47
+      const d = 0.54 * scale
+      const baseY = hasSecondaryDrainPan ? 0.05 : 0
+      if (hasSecondaryDrainPan) {
+        const pan = new Mesh(new BoxGeometry(len + 0.1, 0.05, d + 0.1), pool.galvanizedSheet)
+        pan.position.y = 0.025
+        g.add(pan)
+      }
+      const cabinet = new Mesh(
+        new BoxGeometry(len, h, d),
+        equipmentKind === 'air-handler' ? pool.cabinetSlate : pool.cabinetLight,
+      )
+      cabinet.position.y = baseY + h / 2
+      g.add(cabinet)
+      const coilCap = new Mesh(new BoxGeometry(0.34, h + 0.01, d + 0.01), pool.galvanizedSheet)
+      coilCap.position.set(len / 2 - 0.17, baseY + h / 2, 0)
+      g.add(coilCap)
+      const cond = new Mesh(new CylinderGeometry(0.014, 0.014, 0.14, 10), pool.condensateWhite)
+      cond.rotation.x = Math.PI / 2
+      cond.position.set(len / 2 - 0.18, baseY + 0.1, d / 2 + 0.06)
+      g.add(cond)
+      return g
+    }
     const w = 0.54 * scale
     const h = 1.38
     const d = equipmentKind === 'air-handler' ? 0.56 : 0.72

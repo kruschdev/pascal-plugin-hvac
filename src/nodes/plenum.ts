@@ -38,6 +38,7 @@ export const HvacPlenumNode = BaseNode.extend({
   airflowCfm: z.number().min(0).max(15000).default(1200),
   staticPressureInWg: z.number().min(-2).max(2).default(0.25),
   insulationR: z.number().min(0).max(16).default(8),
+  heightM: z.number().positive().optional(),
 })
 
 export type HvacPlenumNode = z.infer<typeof HvacPlenumNode>

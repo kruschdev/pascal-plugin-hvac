@@ -226,11 +226,13 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
     expect(rtuCond).toBeDefined()
     expect(rtuCond!.diameter).toBe(0.75)
 
-    // Both curb drop plenums sit directly under the RTU curb (levelH - 0.15 = 2.85), NOT at distant mechRoom centroid (12, 5)
+    // Both curb drop plenums sit directly under the RTU curb & strictly below the 3.0m roof deck, NOT at distant mechRoom centroid (12, 5)
     expect(Math.hypot(supPl.position[0] - rtu.position[0], supPl.position[2] - rtu.position[2])).toBeLessThan(0.6)
     expect(Math.hypot(retPl.position[0] - rtu.position[0], retPl.position[2] - rtu.position[2])).toBeLessThan(0.6)
-    expect(supPl.position[1]).toBeCloseTo(2.85, 2)
-    expect(retPl.position[1]).toBeCloseTo(2.85, 2)
+    expect(supPl.position[1]).toBeLessThan(2.75)
+    expect(supPl.position[1] + (supPl.heightM ?? 0.25)).toBeLessThanOrEqual(3.0)
+    expect(retPl.position[1]).toBeLessThan(2.75)
+    expect(retPl.position[1] + (retPl.heightM ?? 0.25)).toBeLessThanOrEqual(3.0)
 
     const materialized: Record<string, SceneNodeLike> = { ...base }
     for (const eq of plan.equipment) materialized[eq.id] = { ...eq, type: 'hvac:equipment', parentId: 'level_0' }
@@ -247,8 +249,8 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
     expect(classifyHvacRoomName('Master Bath')).toBe('bathroom')
     expect(classifyHvacRoomName('Primary Bath')).toBe('bathroom')
     expect(classifyHvacRoomName('Guest Bath')).toBe('bathroom')
-    expect(classifyHvacRoomName('Master Closet')).toBe('utility')
-    expect(classifyHvacRoomName('Primary Walk-In Closet')).toBe('utility')
+    expect(classifyHvacRoomName('Master Closet')).toBe('closet')
+    expect(classifyHvacRoomName('Primary Walk-In Closet')).toBe('closet')
     expect(classifyHvacRoomName('Unconditioned Attic')).toBe('attic')
     expect(classifyHvacRoomName('Master Bedroom')).toBe('bedroom')
     expect(classifyHvacRoomName('Primary Bedroom')).toBe('bedroom')
@@ -421,11 +423,13 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
   })
 
   test('HVC-07: Box3 checks confirm zero floating CAD air gaps, grounded air handler without pan, live supply plenum seating, and hollow collars', () => {
-    // 1. Live supply-plenum sits flush on top of air handler cabinet (0 mm gap!)
+    // 1. Live supply-plenum sits flush on top of vertical air handler cabinet (0 mm gap!)
+    //    and horizontal attic air handler seats supply-plenum flush to its discharge face
     const plan = planHvacAutoPopulate(
       {
         level_0: { id: 'level_0', type: 'level', height: 2.7 },
-        r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[0, 0], [8, 0], [8, 6], [0, 6]] },
+        r_util: { id: 'r_util', type: 'zone', name: 'Utility Room', parentId: 'level_0', polygon: [[0, 0], [3, 0], [3, 3], [0, 3]] },
+        r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[3, 0], [8, 0], [8, 6], [3, 6]] },
       },
       { levelId: 'level_0', systemType: 'split-heat-pump' },
     )
@@ -435,8 +439,10 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
       equipmentKind: 'air-handler',
       coolingTons: ahu.coolingTons,
       hasSecondaryDrainPan: ahu.hasSecondaryDrainPan,
+      orientation: ahu.orientation,
     })
     ahuGroup.position.set(ahu.position[0], ahu.position[1], ahu.position[2])
+    ahuGroup.rotation.y = ahu.rotation
     ahuGroup.updateMatrixWorld(true)
     const ahuBox = new Box3().setFromObject(ahuGroup)
 
@@ -447,6 +453,7 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
       depthIn: supPl.depthIn,
     })
     plGroup.position.set(supPl.position[0], supPl.position[1], supPl.position[2])
+    plGroup.rotation.y = supPl.rotation
     plGroup.updateMatrixWorld(true)
     const plBox = new Box3().setFromObject(plGroup)
 

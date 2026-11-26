@@ -71,6 +71,8 @@ export const HvacEquipmentNode = BaseNode.extend({
   hasSecondaryDrainPan: z.boolean().default(true),
   hasFloatSwitch: z.boolean().default(true),
   hasDisconnectWithinSight: z.boolean().default(true),
+  orientation: z.enum(['vertical', 'horizontal']).optional(),
+  heightM: z.number().positive().optional(),
   electricalDemand: ElectricalDemandSchema.nullable().optional(),
 })
 
@@ -132,6 +134,16 @@ export function getHvacEquipmentPorts(node: HvacEquipmentNode): NodePort[] {
       },
     ]
   }
+  if (node.orientation === 'horizontal') {
+    const horizLen = 1.32
+    const horizH = node.heightM ?? 0.52
+    const [sx, sz] = rot2d(x, zPos, horizLen / 2, 0, rot)
+    const [rx, rz] = rot2d(x, zPos, -horizLen / 2, 0, rot)
+    return [
+      { id: 'supply-out', position: [sx, y + horizH * 0.5, sz], direction: [Math.cos(rot), 0, -Math.sin(rot)], diameter: 14, system: 'hvac' },
+      { id: 'return-in', position: [rx, y + horizH * 0.5, rz], direction: [-Math.cos(rot), 0, Math.sin(rot)], diameter: 14, system: 'hvac' },
+    ]
+  }
   const [rx, rz] = rot2d(x, zPos, -wM / 2, 0, rot)
   return [
     { id: 'supply-out', position: [x, y + hM, zPos], direction: [0, 1, 0], diameter: 14, system: 'hvac' },
@@ -147,6 +159,7 @@ export function buildHvacEquipmentGeometry(node: HvacEquipmentNode, _ctx: Geomet
       equipmentKind: node.equipmentKind as HvacEquipmentKind,
       coolingTons: node.coolingTons,
       hasSecondaryDrainPan: node.hasSecondaryDrainPan,
+      orientation: node.orientation,
     }),
   )
   return group
@@ -158,8 +171,8 @@ export function buildHvacEquipmentFloorplan(node: HvacEquipmentNode, ctx: Geomet
   const [cx, , cz] = node.position
   const rot = node.rotation ?? 0
   const spec = HVAC_EQUIPMENT_SPECS[node.equipmentKind as HvacEquipmentKind]
-  const hw = (spec?.dimensionsM[0] ?? 0.6) / 2
-  const hd = (spec?.dimensionsM[2] ?? 0.6) / 2
+  const hw = node.orientation === 'horizontal' ? 0.66 : (spec?.dimensionsM[0] ?? 0.6) / 2
+  const hd = node.orientation === 'horizontal' ? 0.28 : (spec?.dimensionsM[2] ?? 0.6) / 2
   const baseStroke = spec?.isOutdoor ? '#ea580c' : '#0284c7'
   const stroke = selected && view?.palette ? view.palette.selectedStroke : baseStroke
 
@@ -215,7 +228,7 @@ export const hvacEquipmentRenderDefinition: NodeDefinition<typeof HvacEquipmentN
     snappable: {},
   },
   geometry: buildHvacEquipmentGeometry,
-  geometryKey: (n) => JSON.stringify([n.equipmentKind, n.coolingTons, n.hasSecondaryDrainPan]),
+  geometryKey: (n) => JSON.stringify([n.equipmentKind, n.coolingTons, n.hasSecondaryDrainPan, n.orientation ?? 'vertical']),
   ports: getHvacEquipmentPorts,
   floorplan: buildHvacEquipmentFloorplan,
   presentation: {

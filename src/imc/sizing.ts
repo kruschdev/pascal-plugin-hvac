@@ -95,7 +95,10 @@ export function calculateManualJLoad(params: {
   for (const r of rooms) {
     if (r.areaSqft <= 1) continue
     const cat = r.category.toLowerCase()
-    const isUnconditioned = /garage|porch|patio|deck|exterior|attic/.test(cat)
+    const isUnconditioned =
+      /garage|porch|patio|deck|exterior|attic|pool|swimming|piscine|piscina|terrace|balcon|yard|garden|lanai|courtyard|driveway/.test(
+        cat,
+      )
     if (isUnconditioned) continue
 
     const ceilingMult = Math.max(0.85, (r.ceilingHeightFt ?? 8.5) / 8.5)

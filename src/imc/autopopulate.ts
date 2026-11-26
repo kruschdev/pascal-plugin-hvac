@@ -21,8 +21,11 @@ import {
   getHvacEquipmentElectricalDemand,
 } from './framing-interop'
 import {
+  type AtticRoofEnvelope,
   type DuctClashMargin,
   type HvacObstacle,
+  type XzBounds2D,
+  buildAtticRoofEnvelope,
   detectHvacClashes,
   extractHvacObstacles,
   extractRoomPolygons,
@@ -31,6 +34,7 @@ import {
   resolveLevelHeightM,
   routeCondensateDrain,
   routeHvacDuctRun,
+  safeRoofCorridorHalfWidth,
 } from './routing'
 import {
   calculateAshrae622Ventilation,
@@ -88,6 +92,8 @@ export type PlannedHvacEquipmentSpec = {
   hasSecondaryDrainPan: boolean
   hasFloatSwitch: boolean
   hasDisconnectWithinSight: boolean
+  orientation?: 'vertical' | 'horizontal'
+  heightM?: number
   electricalDemand: ElectricalPowerDemand
 }
 
@@ -103,6 +109,7 @@ export type PlannedHvacPlenumSpec = {
   airflowCfm: number
   staticPressureInWg: number
   insulationR: number
+  heightM?: number
 }
 
 export type PlannedHvacTerminalSpec = {
@@ -177,28 +184,39 @@ function nearestPointOnSpine(spine: ReadonlyArray<Vec3>, x: number, z: number, f
 
 function sceneBounds(
   walls: ReadonlyArray<{ start: readonly [number, number]; end: readonly [number, number] }>,
-  rooms: ReadonlyArray<{ polygon: ReadonlyArray<readonly [number, number]> }>,
+  rooms: ReadonlyArray<{ category?: string; polygon: ReadonlyArray<readonly [number, number]> }>,
 ) {
   let minX = Infinity
   let maxX = -Infinity
   let minZ = Infinity
   let maxZ = -Infinity
+  // When walls exist, derive building bounds strictly from walled geometry so outdoor pools,
+  // patios, decks, and yards never inflate the building envelope (VIS-06).
   for (const w of walls) {
     minX = Math.min(minX, w.start[0], w.end[0])
     maxX = Math.max(maxX, w.start[0], w.end[0])
     minZ = Math.min(minZ, w.start[1], w.end[1])
     maxZ = Math.max(maxZ, w.start[1], w.end[1])
   }
-  for (const r of rooms) {
-    for (const [x, z] of r.polygon) {
-      minX = Math.min(minX, x)
-      maxX = Math.max(maxX, x)
-      minZ = Math.min(minZ, z)
-      maxZ = Math.max(maxZ, z)
+  if (!Number.isFinite(minX)) {
+    const interiorRooms = rooms.filter((r) => r.category !== 'exterior')
+    const srcRooms = interiorRooms.length > 0 ? interiorRooms : rooms
+    for (const r of srcRooms) {
+      for (const [x, z] of r.polygon) {
+        minX = Math.min(minX, x)
+        maxX = Math.max(maxX, x)
+        minZ = Math.min(minZ, z)
+        maxZ = Math.max(maxZ, z)
+      }
     }
   }
   if (!Number.isFinite(minX)) return { minX: 0, maxX: 10, minZ: 0, maxZ: 8, cx: 5, cz: 4 }
   return { minX, maxX, minZ, maxZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2 }
+}
+
+function clampToSpan(val: number, lo: number, hi: number): number {
+  if (hi < lo) return round2((lo + hi) / 2)
+  return round2(Math.max(lo, Math.min(hi, val)))
 }
 
 function minClearanceToObstaclesXZ(
@@ -352,8 +370,10 @@ function findClearSpotForRiser(params: {
   bounds: { minX: number; maxX: number; minZ: number; maxZ: number }
   minFloorClearanceM?: number
   insidePolygon?: ReadonlyArray<readonly [number, number]>
+  excludePolygons?: ReadonlyArray<ReadonlyArray<readonly [number, number]>>
   floorObstacles?: ReadonlyArray<HvacObstacle>
-}): { spot: [number, number]; riserClashes: number; floorClear: number } {
+  roofConstraint?: { roof: AtticRoofEnvelope; requiredTopY: number; preferRidgeWeight?: number }
+}): { spot: [number, number]; riserClashes: number; floorClear: number; foundValid: boolean } {
   const {
     baseX,
     baseZ,
@@ -364,8 +384,15 @@ function findClearSpotForRiser(params: {
     bounds,
     minFloorClearanceM = 0.35,
     insidePolygon,
+    excludePolygons,
     floorObstacles = obstacles,
+    roofConstraint,
   } = params
+
+  const hasValidWallSpan = bounds.maxX - bounds.minX > 0.35 && bounds.maxZ - bounds.minZ > 0.35
+  const inWallEnvelope = (x: number, z: number, inset: number): boolean =>
+    !hasValidWallSpan ||
+    (x >= bounds.minX + inset && x <= bounds.maxX - inset && z >= bounds.minZ + inset && z <= bounds.maxZ - inset)
 
   const candSet: Array<readonly [number, number]> = [[round2(baseX), round2(baseZ)]]
   for (const r of [0.35, 0.55, 0.78, 1.05, 1.4, 1.85, 2.4, 3.1]) {
@@ -402,7 +429,26 @@ function findClearSpotForRiser(params: {
     }
   }
 
-  let bestSpot: [number, number] = [round2(baseX), round2(baseZ)]
+  // When searching for attic placement under a pitched roof, also sample along the ridge centerline
+  if (roofConstraint?.roof.hasRoofAbove) {
+    const r = roofConstraint.roof
+    const ridgeSteps = 9
+    for (let i = 1; i <= ridgeSteps; i++) {
+      const frac = i / (ridgeSteps + 1)
+      if (r.ridgeAlongX) {
+        const rx = round2(bounds.minX + 0.45 + (bounds.maxX - bounds.minX - 0.9) * frac)
+        candSet.push([rx, round2(r.center)])
+      } else {
+        const rz = round2(bounds.minZ + 0.45 + (bounds.maxZ - bounds.minZ - 0.9) * frac)
+        candSet.push([round2(r.center), rz])
+      }
+    }
+  }
+
+  let bestSpot: [number, number] = [
+    hasValidWallSpan ? clampToSpan(baseX, bounds.minX + 0.15, bounds.maxX - 0.15) : round2(baseX),
+    hasValidWallSpan ? clampToSpan(baseZ, bounds.minZ + 0.15, bounds.maxZ - 0.15) : round2(baseZ),
+  ]
   let bestClashes = Infinity
   let bestClear = -1
   let bestScore = -Infinity
@@ -416,14 +462,18 @@ function findClearSpotForRiser(params: {
     let hasMargin = true
     if (insidePolygon) {
       if (!pointInPolygon2D(cx, cz, insidePolygon)) continue
+      if (!inWallEnvelope(cx, cz, 0.15)) continue
       hasMargin = isInsideWithMargin(cx, cz, insidePolygon, 0.18)
-    } else if (
-      cx < bounds.minX + 0.25 ||
-      cx > bounds.maxX - 0.25 ||
-      cz < bounds.minZ + 0.25 ||
-      cz > bounds.maxZ - 0.25
-    ) {
+    } else if (!inWallEnvelope(cx, cz, 0.25)) {
       continue
+    }
+
+    if (excludePolygons && excludePolygons.length > 0 && excludePolygons.some((ep) => pointInPolygon2D(cx, cz, ep))) {
+      continue
+    }
+
+    if (roofConstraint && roofConstraint.roof.hasRoofAbove) {
+      if (roofConstraint.roof.roofYAt(cx, cz) < roofConstraint.requiredTopY) continue
     }
 
     const riserClashes = detectHvacClashes(
@@ -436,12 +486,18 @@ function findClearSpotForRiser(params: {
     ).length
     const floorClear = minClearanceToObstaclesXZ(cx, cz, floorObstacles)
     const distPen = Math.hypot(cx - baseX, cz - baseZ) * 4
+    const ridgePen =
+      roofConstraint && roofConstraint.roof.hasRoofAbove
+        ? Math.abs((roofConstraint.roof.ridgeAlongX ? cz : cx) - roofConstraint.roof.center) *
+          (roofConstraint.preferRidgeWeight ?? 22)
+        : 0
     const score =
       (riserClashes === 0 ? 1000 : -riserClashes * 220) +
       (floorClear >= minFloorClearanceM ? 100 : floorClear * 80) +
       Math.min(1.5, floorClear) * 8 +
       (hasMargin ? 12 : 0) -
-      distPen
+      distPen -
+      ridgePen
 
     if (score > bestScore) {
       bestScore = score
@@ -451,21 +507,25 @@ function findClearSpotForRiser(params: {
     }
   }
 
-  if (!Number.isFinite(bestClashes)) {
+  const foundValid = Number.isFinite(bestClashes)
+  if (!foundValid) {
     const fallback = findClearMechanicalSpot(baseX, baseZ, floorObstacles, bounds, minFloorClearanceM, true, insidePolygon)
-    bestSpot = fallback
+    bestSpot = [
+      hasValidWallSpan ? clampToSpan(fallback[0], bounds.minX + 0.15, bounds.maxX - 0.15) : fallback[0],
+      hasValidWallSpan ? clampToSpan(fallback[1], bounds.minZ + 0.15, bounds.maxZ - 0.15) : fallback[1],
+    ]
     bestClashes = detectHvacClashes(
       [
-        [fallback[0], y0, fallback[1]],
-        [fallback[0], y1, fallback[1]],
+        [bestSpot[0], y0, bestSpot[1]],
+        [bestSpot[0], y1, bestSpot[1]],
       ],
       obstacles,
       clashSpan,
     ).length
-    bestClear = minClearanceToObstaclesXZ(fallback[0], fallback[1], floorObstacles)
+    bestClear = minClearanceToObstaclesXZ(bestSpot[0], bestSpot[1], floorObstacles)
   }
 
-  return { spot: bestSpot, riserClashes: bestClashes, floorClear: bestClear }
+  return { spot: bestSpot, riserClashes: bestClashes, floorClear: bestClear, foundValid }
 }
 
 function findWallTuckedCornerSpot(
@@ -641,6 +701,39 @@ export function planHvacAutoPopulate(
   const levelH = resolveLevelHeightM(nodes, levelId)
   const obstacles = extractHvacObstacles(nodes, levelId)
   const bounds = sceneBounds(walls, rawRooms)
+  const indoorBounds: XzBounds2D = {
+    minX: bounds.maxX - bounds.minX > 0.35 ? round2(bounds.minX + 0.15) : round2(bounds.minX),
+    maxX: bounds.maxX - bounds.minX > 0.35 ? round2(bounds.maxX - 0.15) : round2(bounds.maxX),
+    minZ: bounds.maxZ - bounds.minZ > 0.35 ? round2(bounds.minZ + 0.15) : round2(bounds.minZ),
+    maxZ: bounds.maxZ - bounds.minZ > 0.35 ? round2(bounds.maxZ - 0.15) : round2(bounds.maxZ),
+  }
+  const roofEnvelope = buildAtticRoofEnvelope(nodes, levelId, bounds, levelH)
+  const atticRoof = plenumLocation === 'attic' && roofEnvelope.hasRoofAbove ? roofEnvelope : undefined
+  const ridgeCenterX = roofEnvelope.ridgeAlongX ? bounds.cx : roofEnvelope.center
+  const ridgeCenterZ = roofEnvelope.ridgeAlongX ? roofEnvelope.center : bounds.cz
+  const ridgePeakY = roofEnvelope.roofYAt(ridgeCenterX, ridgeCenterZ)
+
+  const wallMinX = bounds.maxX - bounds.minX > 0.65 ? round2(bounds.minX + 0.3) : round2(bounds.cx)
+  const wallMaxX = bounds.maxX - bounds.minX > 0.65 ? round2(bounds.maxX - 0.3) : round2(bounds.cx)
+  const wallMinZ = bounds.maxZ - bounds.minZ > 0.65 ? round2(bounds.minZ + 0.3) : round2(bounds.cz)
+  const wallMaxZ = bounds.maxZ - bounds.minZ > 0.65 ? round2(bounds.maxZ - 0.3) : round2(bounds.cz)
+
+  const maxPlenumYFor = (halfV: number): number | undefined => {
+    if (systemType === 'rooftop-package') {
+      return round2(levelH - Math.max(0.14, halfV + 0.06))
+    }
+    if (plenumLocation === 'conditioned-soffit' || (plenumLocation === 'attic' && !roofEnvelope.hasRoofAbove)) {
+      return round2(levelH - Math.max(0.08, halfV + 0.04))
+    }
+    if (plenumLocation === 'crawlspace' || plenumLocation === 'basement') {
+      return round2(-Math.max(0.1, halfV + 0.04))
+    }
+    if (atticRoof) {
+      const soffitCap = round2(levelH - Math.max(0.08, halfV + 0.04))
+      return round2(Math.max(soffitCap, ridgePeakY - halfV - 0.1))
+    }
+    return undefined
+  }
 
   // Synthesize a fallback room if scene has walls/bounds without explicit room polygons
   const rooms =
@@ -737,28 +830,48 @@ export function planHvacAutoPopulate(
   const retHalfX = Math.max(0.12, (returnTrunkSize.widthIn * 0.0254) / 2)
   const retHalfV = Math.max(0.05, (returnTrunkSize.heightIn * 0.0254) / 2)
   const retClashSpan = { horizontal: retHalfX, vertical: retHalfV }
+  const supplyPlenumH = Math.max(0.2, supplyTrunkSize.heightIn * 0.0254)
+  const retPlenumH = Math.max(0.2, returnTrunkSize.heightIn * 0.0254)
 
   const hasOverheadSlabPlumbing = obstacles.some(
     (o) => o.category === 'plumbing' && o.box.maxY >= levelH - 0.35 && o.box.minY <= levelH,
   )
-  const plenumY =
-    plenumLocation === 'attic'
-      ? round2(Math.max(levelH + 0.28, levelH + supplyHalfV + 0.08))
-      : plenumLocation === 'conditioned-soffit'
+  const useTrueAtticPlenum = plenumLocation === 'attic' && roofEnvelope.hasRoofAbove && systemType !== 'rooftop-package'
+  let plenumY = useTrueAtticPlenum
+    ? round2(Math.max(levelH + 0.28, levelH + supplyHalfV + 0.08))
+    : systemType === 'rooftop-package'
+      ? round2(levelH - Math.max(0.28, supplyHalfV + 0.12))
+      : plenumLocation === 'conditioned-soffit' || plenumLocation === 'attic'
         ? hasOverheadSlabPlumbing
           ? round2(Math.max(2.35, levelH - 0.54))
-          : round2(levelH - 0.22)
-        : -0.26
-  const retPlenumY =
-    plenumLocation === 'attic'
-      ? round2(Math.max(plenumY + 0.24, levelH + retHalfV + 0.14))
+          : round2(levelH - Math.max(0.22, supplyHalfV + 0.08))
+        : round2(Math.min(-0.26, maxPlenumYFor(supplyHalfV) ?? -0.26))
+  let retPlenumY = useTrueAtticPlenum
+    ? round2(Math.max(plenumY + 0.24, levelH + retHalfV + 0.14))
+    : systemType === 'rooftop-package'
+      ? round2(Math.min(plenumY - 0.16, levelH - Math.max(0.34, retHalfV + 0.14)))
       : round2(plenumY - 0.24)
+
+  if (atticRoof) {
+    const ridgeSupCap = round2(ridgePeakY - supplyHalfV - 0.1)
+    const ridgeRetCap = round2(ridgePeakY - retHalfV - 0.1)
+    if (ridgeSupCap <= levelH + 0.05) {
+      plenumY = round2(levelH - Math.max(0.18, supplyHalfV + 0.06))
+    } else if (plenumY > ridgeSupCap) {
+      plenumY = ridgeSupCap
+    }
+    if (ridgeRetCap <= levelH + 0.05) {
+      retPlenumY = round2(levelH - Math.max(0.24, retHalfV + 0.08))
+    } else if (retPlenumY > ridgeRetCap) {
+      retPlenumY = ridgeRetCap
+    }
+  }
 
   // 1. Place Primary Mechanical Equipment (Indoor Air Handler/Furnace + Outdoor Condenser)
   // Prefer a dedicated Utility/Mechanical/Laundry/Garage room that actually has clash-free floor & riser clearance
   // away from Priority #1 headers/columns and Priority #2 water heaters/manifolds; when no floor mechanical room
   // fits cleanly and plenumLocation is 'attic', mount the Air Handler & ERV on an Attic Mechanical Platform
-  // (IMC 307.2.3 secondary pan + SS2) above the wet/service core so living rooms stay unobstructed.
+  // (IMC 307.2.3 secondary pan + SS2) along the ridge centerline with verified roof-rafter clearance.
   const wetCoreRoom =
     rooms.find((r) => r.category === 'kitchen') ??
     rooms.find((r) => r.category === 'bathroom') ??
@@ -791,6 +904,7 @@ export function planHvacAutoPopulate(
 
   const canMountInAttic =
     plenumLocation === 'attic' &&
+    roofEnvelope.hasRoofAbove &&
     (systemType === 'split-heat-pump' || systemType === 'split-gas-furnace')
 
   let chosenDedicatedRoom: (typeof rooms)[number] | null = null
@@ -802,7 +916,7 @@ export function planHvacAutoPopulate(
     floorClear: number
   } | null = null
 
-  const supplyPlenumMidOffset = 0.05 + 1.38 + Math.max(0.2, supplyTrunkSize.heightIn * 0.0254) / 2
+  const supplyPlenumMidOffset = 0.05 + 1.38 + supplyPlenumH / 2
   const ahuMinFloorClear = Math.max(0.72, supplyHalfX + 0.34)
   for (const candRoom of dedicatedMechCandidates) {
     const evalRes = findWallTuckedCornerSpot(
@@ -834,7 +948,92 @@ export function planHvacAutoPopulate(
     }
   }
 
-  const isAtticMountedAhu = !chosenDedicatedRoom && canMountInAttic
+  // Evaluate attic headroom under pitched roof (VIS-01):
+  // Prefer ridge centerline; switch to horizontal low-profile attic orientation (0.52m tall)
+  // when vertical cabinet + top plenum cannot clear rafters with >= 12 cm margin;
+  // fall back to interior floor placement if even horizontal attic orientation does not fit.
+  const ridgeSpanM = roofEnvelope.ridgeAlongX ? bounds.maxX - bounds.minX : bounds.maxZ - bounds.minZ
+  const vertAtticRequiredRoofY = atticPlatformY + 1.43 + Math.max(0.45, supplyPlenumH) + 0.12
+  const horizAtticRequiredRoofY = atticPlatformY + 0.52 + 0.12
+  const horizPlenumRequiredRoofY = atticPlatformY + 0.05 + Math.max(0.45, supplyPlenumH) + 0.12
+  let isAtticMountedAhu = !chosenDedicatedRoom && canMountInAttic
+  let isHorizontalAtticAhu = false
+
+  let clearX: number | null = null
+  let clearZ: number | null = null
+
+  if (isAtticMountedAhu) {
+    const ridgeInset = Math.min(1.1, Math.max(0.45, ridgeSpanM * 0.15))
+    const ridgeBaseX = roofEnvelope.ridgeAlongX
+      ? clampToSpan(preferServicePt[0], bounds.minX + ridgeInset, bounds.maxX - ridgeInset)
+      : round2(roofEnvelope.center)
+    const ridgeBaseZ = roofEnvelope.ridgeAlongX
+      ? round2(roofEnvelope.center)
+      : clampToSpan(preferServicePt[1], bounds.minZ + ridgeInset, bounds.maxZ - ridgeInset)
+
+    const tryAtticMode = (
+      requiredRoofY: number,
+      topCheckY: number,
+      gableInsetM = 0.45,
+    ): [number, number] | null => {
+      if (atticRoof && ridgePeakY < requiredRoofY) return null
+      const searchBounds =
+        gableInsetM > 0.5 && ridgeSpanM > gableInsetM * 2 + 0.3
+          ? roofEnvelope.ridgeAlongX
+            ? {
+                ...bounds,
+                minX: round2(bounds.minX + gableInsetM),
+                maxX: round2(bounds.maxX - gableInsetM),
+              }
+            : {
+                ...bounds,
+                minZ: round2(bounds.minZ + gableInsetM),
+                maxZ: round2(bounds.maxZ - gableInsetM),
+              }
+          : bounds
+      const baseSearchX = roofEnvelope.ridgeAlongX
+        ? clampToSpan(ridgeBaseX, searchBounds.minX, searchBounds.maxX)
+        : ridgeBaseX
+      const baseSearchZ = roofEnvelope.ridgeAlongX
+        ? ridgeBaseZ
+        : clampToSpan(ridgeBaseZ, searchBounds.minZ, searchBounds.maxZ)
+      const res = findClearSpotForRiser({
+        baseX: baseSearchX,
+        baseZ: baseSearchZ,
+        y0: atticPlatformY,
+        y1: Math.max(plenumY, topCheckY),
+        clashSpan: supplyClashSpan,
+        obstacles,
+        bounds: searchBounds,
+        minFloorClearanceM: 0.95,
+        floorObstacles: atticLevelObstacles,
+        roofConstraint: atticRoof ? { roof: atticRoof, requiredTopY: requiredRoofY, preferRidgeWeight: 30 } : undefined,
+      })
+      if (res.foundValid && (!atticRoof || atticRoof.roofYAt(res.spot[0], res.spot[1]) >= requiredRoofY)) {
+        return res.spot
+      }
+      return null
+    }
+
+    const vertSpot = tryAtticMode(vertAtticRequiredRoofY, round2(atticPlatformY + supplyPlenumMidOffset), 0.45)
+    if (vertSpot) {
+      ;[clearX, clearZ] = vertSpot
+      isHorizontalAtticAhu = false
+    } else {
+      const horizReqY = Math.max(horizAtticRequiredRoofY, horizPlenumRequiredRoofY)
+      // Horizontal cabinet (1.32m) + end-mounted supply & return plenums need >= 1.2m gable inset on both ends
+      const horizSpot = ridgeSpanM >= 2.8 ? tryAtticMode(horizReqY, round2(atticPlatformY + 0.52), 1.2) : null
+      if (horizSpot) {
+        ;[clearX, clearZ] = horizSpot
+        isHorizontalAtticAhu = true
+      } else {
+        // Insufficient attic headroom even for horizontal low-profile unit -> mount indoors on floor
+        isAtticMountedAhu = false
+        isHorizontalAtticAhu = false
+      }
+    }
+  }
+
   const mechRoom =
     chosenDedicatedRoom ??
     (!isAtticMountedAhu ? bestFallbackDedicated?.room : null) ??
@@ -842,66 +1041,56 @@ export function planHvacAutoPopulate(
     wetCoreRoom ??
     rooms[0]!
 
-  let clearX: number
-  let clearZ: number
-  if (isAtticMountedAhu) {
-    const atticStartY = round2(atticPlatformY + supplyPlenumMidOffset)
-    const atticTryRoom = findClearSpotForRiser({
-      baseX: preferServicePt[0],
-      baseZ: preferServicePt[1],
-      y0: atticPlatformY,
-      y1: Math.max(plenumY, atticStartY),
-      clashSpan: supplyClashSpan,
-      obstacles,
-      bounds,
-      minFloorClearanceM: 1.1,
-      insidePolygon: wetCoreRoom?.polygon ?? mechRoom.polygon,
-      floorObstacles: obstacles,
-    })
-    if (atticTryRoom.riserClashes === 0 && atticTryRoom.floorClear >= 0.85) {
-      ;[clearX, clearZ] = atticTryRoom.spot
+  if (clearX === null || clearZ === null) {
+    if (chosenFloorSpot) {
+      ;[clearX, clearZ] = chosenFloorSpot
+    } else if (bestFallbackDedicated) {
+      ;[clearX, clearZ] = bestFallbackDedicated.spot
     } else {
-      const atticTryBounds = findClearSpotForRiser({
-        baseX: preferServicePt[0],
-        baseZ: preferServicePt[1],
-        y0: atticPlatformY,
-        y1: Math.max(plenumY, atticStartY),
-        clashSpan: supplyClashSpan,
-        obstacles,
+      const fallbackRes = findWallTuckedCornerSpot(
+        mechRoom,
+        floorLevelObstacles,
         bounds,
-        minFloorClearanceM: 1.1,
-        floorObstacles: obstacles,
-      })
-      ;[clearX, clearZ] =
-        atticTryBounds.riserClashes < atticTryRoom.riserClashes ||
-        (atticTryBounds.riserClashes === atticTryRoom.riserClashes && atticTryBounds.floorClear > atticTryRoom.floorClear)
-          ? atticTryBounds.spot
-          : atticTryRoom.spot
+        0.48,
+        1.1,
+        preferServicePt,
+        {
+          y0: supplyPlenumMidOffset,
+          y1: plenumY,
+          clashSpan: supplyClashSpan,
+          allObstacles: obstacles,
+        },
+      )
+      ;[clearX, clearZ] = fallbackRes.spot
     }
-  } else if (chosenFloorSpot) {
-    ;[clearX, clearZ] = chosenFloorSpot
-  } else if (bestFallbackDedicated) {
-    ;[clearX, clearZ] = bestFallbackDedicated.spot
-  } else {
-    const fallbackRes = findWallTuckedCornerSpot(
-      mechRoom,
-      floorLevelObstacles,
-      bounds,
-      0.48,
-      1.1,
-      preferServicePt,
-      {
-        y0: supplyPlenumMidOffset,
-        y1: plenumY,
-        clashSpan: supplyClashSpan,
-        allObstacles: obstacles,
-      },
-    )
-    ;[clearX, clearZ] = fallbackRes.spot
   }
 
-  const indoorPos: Vec3 = [clearX, isAtticMountedAhu ? atticPlatformY : 0, clearZ]
+  const indoorPos: Vec3 = [
+    clampToSpan(clearX, indoorBounds.minX, indoorBounds.maxX),
+    isAtticMountedAhu ? atticPlatformY : 0,
+    clampToSpan(clearZ, indoorBounds.minZ, indoorBounds.maxZ),
+  ]
   const indoorRoomLabel = isAtticMountedAhu ? 'Attic Mechanical Platform' : mechRoom.name
+  const horizAlongX = roofEnvelope.ridgeAlongX
+  const horizDischargeSign = horizAlongX
+    ? bounds.maxX - indoorPos[0] >= indoorPos[0] - bounds.minX
+      ? 1
+      : -1
+    : bounds.maxZ - indoorPos[2] >= indoorPos[2] - bounds.minZ
+      ? 1
+      : -1
+  // Three.js Y-rotation maps local +X (supply-out) -> (cos r, 0, -sin r):
+  // +X => 0, -X => PI, +Z => -PI/2, -Z => +PI/2 so supply/return plenums match CAD ports exactly!
+  const indoorRotation = isHorizontalAtticAhu
+    ? horizAlongX
+      ? horizDischargeSign === 1
+        ? 0
+        : round2(Math.PI)
+      : horizDischargeSign === 1
+        ? round2(-Math.PI / 2)
+        : round2(Math.PI / 2)
+    : 0
+
   // Place outdoor condenser on the nearest exterior side wall to the mechanical core, maintaining >= 1.2m
   // ignition-source clearance from any exterior fuel-gas meter/regulator vent (IFGC / NFPA 54).
   const outdoorOnWest = Math.abs(indoorPos[0] - bounds.minX) < Math.abs(bounds.maxX - indoorPos[0])
@@ -911,7 +1100,7 @@ export function planHvacAutoPopulate(
       o.category === 'plumbing' &&
       Math.abs((o.box.minX + o.box.maxX) / 2 - (outdoorOnWest ? bounds.minX : bounds.maxX)) <= 1.5,
   )
-  let outdoorZ = round2(indoorPos[2])
+  let outdoorZ = clampToSpan(indoorPos[2], bounds.minZ + 0.4, bounds.maxZ - 0.4)
   const isOutdoorClear = (tz: number): boolean =>
     extWallObstacles.every((o) => Math.abs(tz - (o.box.minZ + o.box.maxZ) / 2) >= 1.2)
   if (!isOutdoorClear(outdoorZ)) {
@@ -954,7 +1143,7 @@ export function planHvacAutoPopulate(
       name: `${HVAC_EQUIPMENT_SPECS[indoorKind].label} (${load.recommendedTons}-Ton)`,
       equipmentKind: indoorKind,
       position: indoorPos,
-      rotation: 0,
+      rotation: indoorRotation,
       roomName: indoorRoomLabel,
       coolingTons: load.recommendedTons,
       heatingBtuh: equipmentSpec.heatingOutputBtuh,
@@ -966,6 +1155,7 @@ export function planHvacAutoPopulate(
       hasSecondaryDrainPan: true,
       hasFloatSwitch: true,
       hasDisconnectWithinSight: true,
+      ...(isHorizontalAtticAhu ? { orientation: 'horizontal' as const, heightM: 0.52 } : {}),
       electricalDemand: getHvacEquipmentElectricalDemand({
         kind: indoorKind,
         coolingTons: load.recommendedTons,
@@ -1005,22 +1195,32 @@ export function planHvacAutoPopulate(
     // Try preferred outdoor-facing cabinet takeoff first; if adjacent plumbing equipment/vents block it,
     // rotate cleanly to the clearest takeoff face of the AHU/furnace.
     const outDir = outdoorOnWest ? -1 : 1
+    const coilTakeoffY = isHorizontalAtticAhu ? round2(indoorPos[1] + 0.28) : round2(indoorPos[1] + 0.95)
+    const coilHighY = isHorizontalAtticAhu ? round2(indoorPos[1] + 0.4) : round2(indoorPos[1] + 1.25)
     const linesetFaces: ReadonlyArray<Vec3> = [
-      [round2(indoorPos[0] + outDir * 0.22), round2(indoorPos[1] + 0.95), indoorPos[2]],
-      [indoorPos[0], round2(indoorPos[1] + 0.95), round2(indoorPos[2] + 0.24)],
-      [indoorPos[0], round2(indoorPos[1] + 0.95), round2(indoorPos[2] - 0.24)],
-      [round2(indoorPos[0] - outDir * 0.22), round2(indoorPos[1] + 0.95), indoorPos[2]],
-      [round2(indoorPos[0] + outDir * 0.22), round2(indoorPos[1] + 1.25), indoorPos[2]],
+      [round2(indoorPos[0] + outDir * 0.22), coilTakeoffY, indoorPos[2]],
+      [indoorPos[0], coilTakeoffY, round2(indoorPos[2] + 0.24)],
+      [indoorPos[0], coilTakeoffY, round2(indoorPos[2] - 0.24)],
+      [round2(indoorPos[0] - outDir * 0.22), coilTakeoffY, indoorPos[2]],
+      [round2(indoorPos[0] + outDir * 0.22), coilHighY, indoorPos[2]],
     ]
     const linesetTarget: Vec3 = [round2(outdoorPos[0] + (outdoorOnWest ? 0.35 : -0.35)), 0.35, outdoorPos[2]]
-    const linesetPlenumY = plenumLocation === 'attic' ? round2(levelH + 0.16) : -0.18
+    const linesetMaxY = maxPlenumYFor(0.03)
+    const linesetPlenumY =
+      plenumLocation === 'attic'
+        ? round2(Math.min(levelH + 0.16, linesetMaxY ?? levelH + 0.16))
+        : plenumLocation === 'conditioned-soffit'
+          ? round2(Math.min(levelH - 0.18, linesetMaxY ?? levelH - 0.18))
+          : round2(Math.min(-0.18, linesetMaxY ?? -0.18))
     let linesetRoute = routeHvacDuctRun({
       from: linesetFaces[0]!,
       to: linesetTarget,
       plenumY: linesetPlenumY,
+      maxPlenumY: linesetMaxY,
       ductHalfSpanM: 0.03,
       allowDiagonalBranch: false,
       obstacles,
+      roofEnvelope: atticRoof,
     })
     if (linesetRoute.clashes.length > 0) {
       for (let fi = 1; fi < linesetFaces.length; fi++) {
@@ -1028,9 +1228,11 @@ export function planHvacAutoPopulate(
           from: linesetFaces[fi]!,
           to: linesetTarget,
           plenumY: linesetPlenumY,
+          maxPlenumY: linesetMaxY,
           ductHalfSpanM: 0.03,
           allowDiagonalBranch: false,
           obstacles,
+          roofEnvelope: atticRoof,
         })
         if (cand.clashes.length < linesetRoute.clashes.length) {
           linesetRoute = cand
@@ -1058,9 +1260,8 @@ export function planHvacAutoPopulate(
     })
 
     // Sloped 3/4" PVC Condensate Drain (IMC 307.2)
-    // Choose the clearest AHU pan takeoff face and exterior wall termination away from water heaters,
-    // dryer vents, and wide exterior window/door headers.
-    const condY = round2(indoorPos[1] + (isAtticMountedAhu ? 0.08 : 0.95))
+    // Clamp all exterior wall discharge targets strictly to walled building spans (HVA-BUG-02).
+    const condY = round2(indoorPos[1] + (isAtticMountedAhu ? 0.06 : 0.95))
     const condFaces: ReadonlyArray<Vec3> = [
       [round2(indoorPos[0] + outDir * 0.25), condY, round2(indoorPos[2] + 0.1)],
       [indoorPos[0], condY, round2(indoorPos[2] + 0.28)],
@@ -1069,25 +1270,52 @@ export function planHvacAutoPopulate(
     ]
     const primaryExtX = round2(outdoorOnWest ? bounds.minX - 0.15 : bounds.maxX + 0.15)
     const oppExtX = round2(outdoorOnWest ? bounds.maxX + 0.15 : bounds.minX - 0.15)
-    const condExitTargets: ReadonlyArray<Vec3> = [
-      [primaryExtX, 0.05, round2(indoorPos[2] + 0.4)],
-      [primaryExtX, 0.05, round2(indoorPos[2] - 1.2)],
-      [primaryExtX, 0.05, round2(indoorPos[2] + 1.8)],
-      [primaryExtX, 0.05, round2(indoorPos[2] - 2.6)],
-      [primaryExtX, 0.05, round2(indoorPos[2] + 3.4)],
-      [round2(indoorPos[0]), 0.05, round2(bounds.minZ - 0.15)],
-      [round2(indoorPos[0]), 0.05, round2(bounds.maxZ + 0.15)],
-      [oppExtX, 0.05, round2(indoorPos[2] + 0.4)],
-    ]
+    const rawCondTargets: Vec3[] = []
+    const pushCondTarget = (tx: number, tz: number) => {
+      const pt: Vec3 = [round2(tx), 0.05, round2(tz)]
+      if (!rawCondTargets.some((e) => Math.abs(e[0] - pt[0]) < 0.05 && Math.abs(e[2] - pt[2]) < 0.05)) {
+        rawCondTargets.push(pt)
+      }
+    }
+    const addSideWallCond = (wx: number) => {
+      pushCondTarget(wx, clampToSpan(indoorPos[2] + 0.4, wallMinZ, wallMaxZ))
+      for (const dz of [-1.2, 1.8, -2.6, 3.4]) {
+        const cz = round2(indoorPos[2] + dz)
+        if (cz >= wallMinZ && cz <= wallMaxZ) pushCondTarget(wx, cz)
+      }
+    }
+    const addNorthSouthCond = () => {
+      const clampedX = clampToSpan(indoorPos[0], wallMinX, wallMaxX)
+      pushCondTarget(clampedX, round2(bounds.minZ - 0.15))
+      pushCondTarget(clampedX, round2(bounds.maxZ + 0.15))
+    }
+    // Prefer gable-end walls first in attic mode so sloped runs never clip low eave rafters
+    if (isAtticMountedAhu && atticRoof && !atticRoof.ridgeAlongX) {
+      addNorthSouthCond()
+      addSideWallCond(primaryExtX)
+      pushCondTarget(oppExtX, clampToSpan(indoorPos[2] + 0.4, wallMinZ, wallMaxZ))
+    } else {
+      addSideWallCond(primaryExtX)
+      addNorthSouthCond()
+      pushCondTarget(oppExtX, clampToSpan(indoorPos[2] + 0.4, wallMinZ, wallMaxZ))
+    }
+    const condExitTargets: ReadonlyArray<Vec3> = rawCondTargets
     let condRoute = routeCondensateDrain({
       from: condFaces[0]!,
       to: condExitTargets[0]!,
       obstacles,
+      roofEnvelope: atticRoof,
     })
     if (condRoute.clashes.length > 0) {
-      outerCond: for (const cf of condFaces) {
-        for (const ct of condExitTargets) {
-          const cand = routeCondensateDrain({ from: cf, to: ct, obstacles })
+      outerCond: for (let cfi = 0; cfi < condFaces.length; cfi++) {
+        for (let cti = 0; cti < condExitTargets.length; cti++) {
+          if (cfi === 0 && cti === 0) continue
+          const cand = routeCondensateDrain({
+            from: condFaces[cfi]!,
+            to: condExitTargets[cti]!,
+            obstacles,
+            roofEnvelope: atticRoof,
+          })
           if (cand.clashes.length < condRoute.clashes.length) {
             condRoute = cand
             if (cand.clashes.length === 0) break outerCond
@@ -1114,7 +1342,11 @@ export function planHvacAutoPopulate(
     })
   } else if (systemType === 'rooftop-package') {
     const [rtuX, rtuZ] = findClearMechanicalSpot(bounds.cx, bounds.cz, obstacles, bounds, 0.75)
-    rtuPos = [rtuX, round2(levelH + 0.15), rtuZ]
+    rtuPos = [
+      clampToSpan(rtuX, indoorBounds.minX, indoorBounds.maxX),
+      round2(levelH + 0.15),
+      clampToSpan(rtuZ, indoorBounds.minZ, indoorBounds.maxZ),
+    ]
     equipment.push({
       id: indoorId,
       name: `Packaged RTU (${load.recommendedTons}-Ton)`,
@@ -1139,22 +1371,54 @@ export function planHvacAutoPopulate(
       }),
     })
 
-    // Sloped 3/4" PVC RTU Condensate Drain from roof curb to roof edge/exterior (IMC 307.2)
-    const rtuCondFrom: Vec3 = [round2(rtuPos[0] + 0.45), round2(rtuPos[1] + 0.15), rtuPos[2]]
-    const rtuCondTargets: ReadonlyArray<Vec3> = [
-      [round2(bounds.maxX + 0.15), 0.05, rtuPos[2]],
-      [round2(bounds.minX - 0.15), 0.05, rtuPos[2]],
-      [rtuPos[0], 0.05, round2(bounds.minZ - 0.15)],
-      [rtuPos[0], 0.05, round2(bounds.maxZ + 0.15)],
+    // Sloped 3/4" PVC RTU Condensate Drain across flat roof deck (y ≈ levelH + 0.08 -> levelH + 0.02)
+    // to nearest interior roof drain / plumbing chase or roof-edge scupper strictly inside walls (VIS-04).
+    const rtuCondFrom: Vec3 = [
+      clampToSpan(rtuPos[0] + 0.45, indoorBounds.minX, indoorBounds.maxX),
+      round2(levelH + 0.08),
+      rtuPos[2],
     ]
+    const scupperInsetX = bounds.maxX - bounds.minX > 0.7 ? 0.25 : 0.15
+    const scupperInsetZ = bounds.maxZ - bounds.minZ > 0.7 ? 0.25 : 0.15
+    const makeRoofTarget = (tx: number, tz: number): Vec3 => {
+      const cx = clampToSpan(tx, bounds.minX + scupperInsetX, bounds.maxX - scupperInsetX)
+      const cz = clampToSpan(tz, bounds.minZ + scupperInsetZ, bounds.maxZ - scupperInsetZ)
+      const dist = Math.hypot(cx - rtuCondFrom[0], cz - rtuCondFrom[2])
+      const targetY = round2(Math.min(levelH + 0.03, rtuCondFrom[1] - Math.max(0.04, dist * (0.25 / 12))))
+      return [cx, targetY, cz]
+    }
+    const rtuCondTargetList: Vec3[] = []
+    if (wetCoreRoom) {
+      rtuCondTargetList.push(makeRoofTarget(wetCoreRoom.centroid[0], wetCoreRoom.centroid[1]))
+    }
+    const edgeScuppers: Vec3[] = [
+      makeRoofTarget(bounds.maxX - scupperInsetX, rtuPos[2]),
+      makeRoofTarget(bounds.minX + scupperInsetX, rtuPos[2]),
+      makeRoofTarget(rtuPos[0], bounds.minZ + scupperInsetZ),
+      makeRoofTarget(rtuPos[0], bounds.maxZ - scupperInsetZ),
+    ].sort(
+      (a, b) =>
+        Math.hypot(a[0] - rtuCondFrom[0], a[2] - rtuCondFrom[2]) -
+        Math.hypot(b[0] - rtuCondFrom[0], b[2] - rtuCondFrom[2]),
+    )
+    rtuCondTargetList.push(...edgeScuppers)
+
     let rtuCondRoute = routeCondensateDrain({
       from: rtuCondFrom,
-      to: rtuCondTargets[0]!,
+      to: rtuCondTargetList[0]!,
       obstacles,
+      xzBounds: indoorBounds,
+      roofEnvelope: atticRoof,
     })
     if (rtuCondRoute.clashes.length > 0) {
-      for (let ti = 1; ti < rtuCondTargets.length; ti++) {
-        const cand = routeCondensateDrain({ from: rtuCondFrom, to: rtuCondTargets[ti]!, obstacles })
+      for (let ti = 1; ti < rtuCondTargetList.length; ti++) {
+        const cand = routeCondensateDrain({
+          from: rtuCondFrom,
+          to: rtuCondTargetList[ti]!,
+          obstacles,
+          xzBounds: indoorBounds,
+          roofEnvelope: atticRoof,
+        })
         if (cand.clashes.length < rtuCondRoute.clashes.length) {
           rtuCondRoute = cand
           if (cand.clashes.length === 0) break
@@ -1215,16 +1479,33 @@ export function planHvacAutoPopulate(
 
   let omittedReturnNote = ''
 
-  const maxPlenumY = plenumLocation === 'conditioned-soffit' ? round2(levelH - 0.08) : undefined
   const effectiveDuctR = (path: ReadonlyArray<Vec3>): number =>
     path.some((p) => p[1] > levelH - 0.02) ? Math.max(ductR, zoneMeta.ieccAtticDuctR) : ductR
 
   if (systemType === 'mini-split-multizone') {
+    const msMaxY = maxPlenumYFor(0.03)
+    const msPlenumY =
+      plenumLocation === 'attic'
+        ? round2(Math.min(levelH + 0.12, msMaxY ?? levelH + 0.12))
+        : plenumLocation === 'conditioned-soffit'
+          ? round2(Math.min(levelH - 0.18, msMaxY ?? levelH - 0.18))
+          : round2(Math.min(-0.18, msMaxY ?? -0.18))
     for (const { loadRow, room } of conditionedRooms) {
-      if (room.category === 'bathroom' || room.category === 'hallway' || room.category === 'utility') continue
+      if (
+        room.category === 'bathroom' ||
+        room.category === 'hallway' ||
+        room.category === 'utility' ||
+        room.category === 'closet'
+      ) {
+        continue
+      }
       const headId = nextTermId()
       const [headX, headZ] = findClearMechanicalSpot(room.centroid[0], room.centroid[1], obstacles, bounds, 0.42, true)
-      const headPos: Vec3 = [headX, round2(Math.min(levelH - 0.35, 2.15)), headZ]
+      const headPos: Vec3 = [
+        clampToSpan(headX, indoorBounds.minX, indoorBounds.maxX),
+        round2(Math.min(levelH - 0.35, 2.15)),
+        clampToSpan(headZ, indoorBounds.minZ, indoorBounds.maxZ),
+      ]
       terminals.push({
         id: headId,
         name: `${room.name} Mini-Split Head (${loadRow.designCfm} CFM)`,
@@ -1239,11 +1520,12 @@ export function planHvacAutoPopulate(
       const lineRoute = routeHvacDuctRun({
         from: [round2(outdoorPos[0] + (outdoorOnWest ? 0.25 : -0.25)), 0.45, outdoorPos[2]],
         to: headPos,
-        plenumY: round2(levelH + 0.12),
-        maxPlenumY,
+        plenumY: msPlenumY,
+        maxPlenumY: msMaxY,
         ductHalfSpanM: 0.03,
         allowDiagonalBranch: true,
         obstacles,
+        roofEnvelope: atticRoof,
       })
       ductRuns.push({
         id: nextDuctId(),
@@ -1267,34 +1549,76 @@ export function planHvacAutoPopulate(
   } else {
     // Ducted Supply & Return Plenums + ACCA Manual D Trunks + Branches
     const supplyPlenumId = nextPlId()
-    const supplyPlenumH = Math.max(0.2, supplyTrunkSize.heightIn * 0.0254)
-    // Seat split-system supply plenum flush on top of air handler/furnace cabinet (pan 0.05m + cabinet 1.38m = 1.43m);
+    const supplyPlenumW = Math.max(0.2, supplyTrunkSize.widthIn * 0.0254)
+    const retPlenumW = Math.max(0.2, returnTrunkSize.widthIn * 0.0254)
+    // Seat vertical split-system supply plenum flush on top of air handler/furnace cabinet (0.05m pan + 1.38m = 1.43m);
+    // for horizontal attic low-profile AHU, attach flush to horizontal discharge face along ridge axis;
     // for rooftop-package, anchor both supply and return curb drop plenums directly below the RTU curb.
     const supplyPlenumPos: Vec3 =
       systemType === 'rooftop-package' && rtuPos
-        ? [round2(rtuPos[0] + 0.32), round2(levelH - 0.15), rtuPos[2]]
-        : [indoorPos[0], Math.round((indoorPos[1] + 0.05 + 1.38 + supplyPlenumH / 2) * 10000) / 10000, indoorPos[2]]
+        ? [
+            clampToSpan(rtuPos[0] + 0.32, indoorBounds.minX, indoorBounds.maxX),
+            round2(levelH - Math.max(0.32, supplyPlenumH + 0.1)),
+            rtuPos[2],
+          ]
+        : isHorizontalAtticAhu
+          ? horizAlongX
+            ? [
+                clampToSpan(
+                  Math.round((indoorPos[0] + horizDischargeSign * (0.66 + supplyPlenumW / 2)) * 10000) / 10000,
+                  indoorBounds.minX,
+                  indoorBounds.maxX,
+                ),
+                Math.round((indoorPos[1] + 0.05 + supplyPlenumH / 2) * 10000) / 10000,
+                indoorPos[2],
+              ]
+            : [
+                indoorPos[0],
+                Math.round((indoorPos[1] + 0.05 + supplyPlenumH / 2) * 10000) / 10000,
+                clampToSpan(
+                  Math.round((indoorPos[2] + horizDischargeSign * (0.66 + supplyPlenumW / 2)) * 10000) / 10000,
+                  indoorBounds.minZ,
+                  indoorBounds.maxZ,
+                ),
+              ]
+          : [indoorPos[0], Math.round((indoorPos[1] + 0.05 + 1.38 + supplyPlenumH / 2) * 10000) / 10000, indoorPos[2]]
     plenums.push({
       id: supplyPlenumId,
       name: `Supply Plenum (${supplyTrunkSize.widthIn}"x${supplyTrunkSize.heightIn}")`,
       plenumKind: 'supply-plenum',
       position: supplyPlenumPos,
-      rotation: 0,
+      rotation: isHorizontalAtticAhu ? indoorRotation : 0,
       widthIn: supplyTrunkSize.widthIn,
       heightIn: supplyTrunkSize.heightIn,
       depthIn: 24,
       airflowCfm: load.designTotalCfm,
       staticPressureInWg: 0.25,
       insulationR: ductR,
+      heightM: round2(supplyPlenumH),
     })
 
     const returnPlenumId = nextPlId()
     let returnPlenumPos: Vec3
     if (systemType === 'rooftop-package' && rtuPos) {
-      returnPlenumPos = [round2(rtuPos[0] - 0.38), round2(levelH - 0.15), rtuPos[2]]
+      returnPlenumPos = [
+        clampToSpan(rtuPos[0] - 0.38, indoorBounds.minX, indoorBounds.maxX),
+        round2(levelH - Math.max(0.34, retPlenumH + 0.1)),
+        rtuPos[2],
+      ]
+    } else if (isHorizontalAtticAhu) {
+      const retY = Math.round((indoorPos[1] + 0.05 + retPlenumH / 2) * 10000) / 10000
+      const retOff = 0.66 + retPlenumW / 2
+      const rx = horizAlongX
+        ? clampToSpan(indoorPos[0] - horizDischargeSign * retOff, indoorBounds.minX, indoorBounds.maxX)
+        : indoorPos[0]
+      const rz = horizAlongX
+        ? indoorPos[2]
+        : clampToSpan(indoorPos[2] - horizDischargeSign * retOff, indoorBounds.minZ, indoorBounds.maxZ)
+      returnPlenumPos = [rx, retY, rz]
     } else {
       // Side-return drop offset beside the air handler/furnace cabinet & supply plenum so the vertical
       // return trunk never pierces the cabinet or blue supply plenum (VIS-01).
+      // Hard-reject out-of-bounds candidates so return plenums never protrude past exterior walls (HVA-BUG-05).
       const cabScale = load.recommendedTons >= 4 ? 1.12 : load.recommendedTons <= 2 ? 0.92 : 1.0
       const cabHalfX = Math.max((0.54 * cabScale) / 2, (supplyTrunkSize.widthIn * 0.0254) / 2)
       const cabHalfZ = Math.max((indoorKind === 'air-handler' ? 0.56 : 0.72) / 2, (24 * 0.0254) / 2)
@@ -1317,16 +1641,20 @@ export function planHvacAutoPopulate(
         [indoorPos[0], round2(indoorPos[2] - lateralOffsetZ - 0.45)],
       ]
       const retPlenumBaseY = isAtticMountedAhu ? round2(atticPlatformY + 0.25) : 0.25
-      let bestDrop: readonly [number, number] = sideCandidates[0]!
+      let bestDrop: readonly [number, number] | null = null
       let bestScore = -Infinity
       for (let si = 0; si < sideCandidates.length; si++) {
         const [cx, cz] = sideCandidates[si]!
-        const inRoom = pointInPolygon2D(cx, cz, mechRoom.polygon)
         const inBounds =
-          cx >= bounds.minX + 0.15 &&
-          cx <= bounds.maxX - 0.15 &&
-          cz >= bounds.minZ + 0.15 &&
-          cz <= bounds.maxZ - 0.15
+          cx >= indoorBounds.minX && cx <= indoorBounds.maxX && cz >= indoorBounds.minZ && cz <= indoorBounds.maxZ
+        if (!inBounds) continue
+        if (isAtticMountedAhu && atticRoof) {
+          if (retPlenumBaseY + Math.max(0.45, retPlenumH) > atticRoof.roofYAt(cx, cz) - 0.12) continue
+        }
+        const inRoom = pointInPolygon2D(cx, cz, mechRoom.polygon)
+        const inAnyIndoorRoom =
+          rawRooms.length === 0 ||
+          rooms.some((r) => r.category !== 'exterior' && pointInPolygon2D(cx, cz, r.polygon))
         const dropClashes = detectHvacClashes(
           [
             [cx, retPlenumY, cz],
@@ -1337,11 +1665,26 @@ export function planHvacAutoPopulate(
         ).length
         const clear = Math.min(2.0, minClearanceToObstaclesXZ(cx, cz, isAtticMountedAhu ? atticLevelObstacles : floorLevelObstacles))
         const primaryBonus = si < 4 ? 12 : 0
-        const score = (dropClashes === 0 ? 200 : -dropClashes * 80) + (inRoom ? 20 : 0) + (inBounds ? 10 : 0) + primaryBonus + clear
+        const score =
+          (inAnyIndoorRoom ? 0 : -1500) +
+          (dropClashes === 0 ? 200 : -dropClashes * 80) +
+          (inRoom ? 20 : 0) +
+          primaryBonus +
+          clear
         if (score > bestScore) {
           bestScore = score
           bestDrop = [cx, cz]
         }
+      }
+      if (!bestDrop) {
+        // Fallback strictly inside walled bounds toward building center
+        const fbX = clampToSpan(
+          indoorPos[0] + (indoorPos[0] <= bounds.cx ? lateralOffsetX : -lateralOffsetX),
+          indoorBounds.minX,
+          indoorBounds.maxX,
+        )
+        const fbZ = clampToSpan(indoorPos[2], indoorBounds.minZ, indoorBounds.maxZ)
+        bestDrop = [fbX, fbZ]
       }
       returnPlenumPos = [bestDrop[0], retPlenumBaseY, bestDrop[1]]
     }
@@ -1350,13 +1693,14 @@ export function planHvacAutoPopulate(
       name: `Return Plenum (${returnTrunkSize.widthIn}"x${returnTrunkSize.heightIn}")`,
       plenumKind: 'return-plenum',
       position: returnPlenumPos,
-      rotation: 0,
+      rotation: isHorizontalAtticAhu ? indoorRotation : 0,
       widthIn: returnTrunkSize.widthIn,
       heightIn: returnTrunkSize.heightIn,
       depthIn: 24,
       airflowCfm: load.designTotalCfm,
       staticPressureInWg: -0.2,
       insulationR: ductR,
+      heightM: round2(retPlenumH),
     })
 
     // Main Supply Trunk Spine from Supply Plenum to furthest conditioned room
@@ -1369,9 +1713,24 @@ export function planHvacAutoPopulate(
       conditionedRooms[0] ?? { room: rooms[0]!, loadRow: { designCfm: load.designTotalCfm } },
     )
 
+    const supplyMaxY = maxPlenumYFor(supplyHalfV)
+    let trunkBaseX = clampToSpan(furthestRoom.room.centroid[0], indoorBounds.minX, indoorBounds.maxX)
+    let trunkBaseZ = clampToSpan(furthestRoom.room.centroid[1], indoorBounds.minZ, indoorBounds.maxZ)
+    if (atticRoof && plenumY > levelH + 0.05) {
+      // Keep main attic supply trunk inside the safe inner ridge corridor so it never pokes through sloped rafters (VIS-01)
+      const corrHalf = Math.min(atticRoof.halfSpan * 0.55, safeRoofCorridorHalfWidth(atticRoof, plenumY, supplyHalfV, 0.1))
+      const corrLo = atticRoof.center - corrHalf
+      const corrHi = atticRoof.center + corrHalf
+      if (atticRoof.ridgeAlongX) {
+        trunkBaseZ = clampToSpan(trunkBaseZ, Math.max(indoorBounds.minZ, corrLo), Math.min(indoorBounds.maxZ, corrHi))
+      } else {
+        trunkBaseX = clampToSpan(trunkBaseX, Math.max(indoorBounds.minX, corrLo), Math.min(indoorBounds.maxX, corrHi))
+      }
+    }
+
     const trunkEndRes = findClearSpotForRiser({
-      baseX: furthestRoom.room.centroid[0],
-      baseZ: furthestRoom.room.centroid[1],
+      baseX: trunkBaseX,
+      baseZ: trunkBaseZ,
       y0: plenumY,
       y1: plenumY,
       clashSpan: supplyClashSpan,
@@ -1379,16 +1738,22 @@ export function planHvacAutoPopulate(
       bounds,
       minFloorClearanceM: Math.max(0.45, supplyHalfX + 0.12),
       floorObstacles: plenumLocation === 'attic' ? atticLevelObstacles : obstacles,
+      roofConstraint:
+        atticRoof && plenumY > levelH + 0.05
+          ? { roof: atticRoof, requiredTopY: plenumY + supplyHalfV + 0.1, preferRidgeWeight: 20 }
+          : undefined,
     })
     const [trunkEndX, trunkEndZ] = trunkEndRes.spot
     let trunkRoute = routeHvacDuctRun({
       from: supplyPlenumPos,
       to: [trunkEndX, plenumY, trunkEndZ],
       plenumY,
-      maxPlenumY,
+      maxPlenumY: supplyMaxY,
       ductHalfSpanM: supplyClashSpan,
       allowDiagonalBranch: false,
       obstacles,
+      xzBounds: indoorBounds,
+      roofEnvelope: atticRoof,
     })
     if (trunkRoute.clashes.length > 0 && plenumLocation === 'attic') {
       for (const [dy, dx, dz] of [
@@ -1399,14 +1764,22 @@ export function planHvacAutoPopulate(
         [0, 0, 0.55],
         [0, 0, -0.55],
       ] as const) {
+        const candY = supplyMaxY !== undefined ? Math.min(round2(plenumY + dy), supplyMaxY) : round2(plenumY + dy)
+        const candX = clampToSpan(trunkEndX + dx, indoorBounds.minX, indoorBounds.maxX)
+        const candZ = clampToSpan(trunkEndZ + dz, indoorBounds.minZ, indoorBounds.maxZ)
+        if (atticRoof && candY > levelH + 0.05 && candY + supplyHalfV > atticRoof.roofYAt(candX, candZ) - 0.1) {
+          continue
+        }
         const cand = routeHvacDuctRun({
           from: supplyPlenumPos,
-          to: [round2(trunkEndX + dx), round2(plenumY + dy), round2(trunkEndZ + dz)],
-          plenumY: round2(plenumY + dy),
-          maxPlenumY,
+          to: [candX, candY, candZ],
+          plenumY: candY,
+          maxPlenumY: supplyMaxY,
           ductHalfSpanM: supplyClashSpan,
           allowDiagonalBranch: false,
           obstacles,
+          xzBounds: indoorBounds,
+          roofEnvelope: atticRoof,
         })
         if (cand.clashes.length < trunkRoute.clashes.length) {
           trunkRoute = cand
@@ -1453,6 +1826,7 @@ export function planHvacAutoPopulate(
         occupancy,
       })
       const branchHalfSpan = Math.max(0.08, (branchSized.diameterIn * 0.0254) / 2)
+      const branchMaxY = maxPlenumYFor(branchHalfSpan)
 
       for (let i = 0; i < regCount; i++) {
         const offsetX = regCount === 1 ? 0 : (i - (regCount - 1) / 2) * 1.4
@@ -1483,14 +1857,18 @@ export function planHvacAutoPopulate(
         })
 
         const tapPt = nearestPointOnSpine(trunkRoute.path, regPos[0], regPos[2], plenumY)
+        const branchPlenumY =
+          branchMaxY !== undefined ? Math.min(plenumY, branchMaxY) : plenumY
         const branchRoute = routeHvacDuctRun({
           from: tapPt,
           to: regPos,
-          plenumY,
-          maxPlenumY,
+          plenumY: branchPlenumY,
+          maxPlenumY: branchMaxY,
           ductHalfSpanM: branchHalfSpan,
           allowDiagonalBranch: true,
           obstacles,
+          xzBounds: indoorBounds,
+          roofEnvelope: atticRoof,
         })
         ductRuns.push({
           id: nextDuctId(),
@@ -1518,7 +1896,11 @@ export function planHvacAutoPopulate(
           id: nextTermId(),
           name: `${room.name} Return Transfer Grille`,
           terminalKind: 'transfer-grille',
-          position: [round2(room.centroid[0] - 0.6), round2(Math.min(levelH - 0.3, 2.25)), round2(room.centroid[1])],
+          position: [
+            clampToSpan(room.centroid[0] - 0.6, indoorBounds.minX, indoorBounds.maxX),
+            round2(Math.min(levelH - 0.3, 2.25)),
+            clampToSpan(room.centroid[1], indoorBounds.minZ, indoorBounds.maxZ),
+          ],
           rotation: 0,
           roomName: room.name,
           designCfm: loadRow.designCfm,
@@ -1532,6 +1914,7 @@ export function planHvacAutoPopulate(
     // Prohibited return-air zones: bathrooms, garages, kitchens, utility/closets, attics, and exterior spaces.
     const prohibitedReturnCats = new Set(['bathroom', 'garage', 'kitchen', 'utility', 'closet', 'exterior', 'attic'])
     const prohibitedReturnRooms = rooms.filter((r) => prohibitedReturnCats.has(r.category) && r.category !== 'attic')
+    const prohibitedReturnPolygons = prohibitedReturnRooms.map((r) => r.polygon)
     const eligibleReturnRooms = rooms
       .filter((r) => !prohibitedReturnCats.has(r.category))
       .sort((a, b) => {
@@ -1542,15 +1925,20 @@ export function planHvacAutoPopulate(
       const retGrilleY =
         plenumLocation === 'attic' ? round2(levelH - 0.03) : round2(Math.min(levelH - 0.35, 2.2))
       const retMinClear = Math.max(0.42, retClashSpan.horizontal + 0.08)
+      const retMaxY = maxPlenumYFor(retHalfV)
       const retCeilingObstacles =
         plenumLocation === 'attic'
           ? obstacles.filter((o) => o.box.maxY >= retGrilleY - retClashSpan.vertical - 0.05)
           : obstacles
-      const isInsideProhibitedOverlap = (px: number, pz: number, roomAreaSqm: number): boolean =>
-        prohibitedReturnRooms.some((pr) => pr.areaSqm <= roomAreaSqm && pointInPolygon2D(px, pz, pr.polygon))
+      const isInsideProhibitedOverlap = (px: number, pz: number): boolean =>
+        prohibitedReturnRooms.some((pr) => pointInPolygon2D(px, pz, pr.polygon))
 
       let chosenRetRoom = eligibleReturnRooms[0]!
-      let chosenRetPos: Vec3 = [chosenRetRoom.centroid[0], retGrilleY, chosenRetRoom.centroid[1]]
+      let chosenRetPos: Vec3 = [
+        clampToSpan(chosenRetRoom.centroid[0], indoorBounds.minX, indoorBounds.maxX),
+        retGrilleY,
+        clampToSpan(chosenRetRoom.centroid[1], indoorBounds.minZ, indoorBounds.maxZ),
+      ]
       let chosenRetRoute: ReturnType<typeof routeHvacDuctRun> | null = null
       let chosenInProhibited = true
 
@@ -1569,18 +1957,21 @@ export function planHvacAutoPopulate(
           bounds,
           minFloorClearanceM: retMinClear,
           insidePolygon: candRoom.polygon,
+          excludePolygons: prohibitedReturnPolygons,
           floorObstacles: retCeilingObstacles,
         })
         const candPos: Vec3 = [spotRes.spot[0], retGrilleY, spotRes.spot[1]]
-        const inProhibited = isInsideProhibitedOverlap(candPos[0], candPos[2], candRoom.areaSqm)
+        const inProhibited = isInsideProhibitedOverlap(candPos[0], candPos[2])
         const candRoute = routeHvacDuctRun({
           from: candPos,
           to: returnPlenumPos,
-          plenumY: retPlenumY,
-          maxPlenumY,
+          plenumY: retMaxY !== undefined ? Math.min(retPlenumY, retMaxY) : retPlenumY,
+          maxPlenumY: retMaxY,
           ductHalfSpanM: retClashSpan,
           allowDiagonalBranch: false,
           obstacles,
+          xzBounds: indoorBounds,
+          roofEnvelope: atticRoof,
         })
         const better =
           !chosenRetRoute ||
@@ -1652,7 +2043,11 @@ export function planHvacAutoPopulate(
     id: nextTermId(),
     name: `Smart Thermostat (${equipmentSpec.thermostatCable})`,
     terminalKind: 'smart-thermostat',
-    position: statSnap.position,
+    position: [
+      clampToSpan(statSnap.position[0], indoorBounds.minX, indoorBounds.maxX),
+      statSnap.position[1],
+      clampToSpan(statSnap.position[2], indoorBounds.minZ, indoorBounds.maxZ),
+    ],
     rotation: statSnap.rotation,
     roomName: statRoom.name,
     designCfm: 0,
@@ -1660,9 +2055,32 @@ export function planHvacAutoPopulate(
     throwFt: 0,
   })
 
+  // Helper to clamp exterior wall penetration height strictly below roof rafters or upper-story floor slab (VIS-01 / HVA-BUG-03)
+  const clampExteriorExitY = (wx: number, wz: number, desiredY: number, halfSpan: number): number => {
+    const soffitExitY = round2(Math.min(levelH - Math.max(0.18, halfSpan + 0.08), desiredY))
+    if (!useTrueAtticPlenum && (plenumLocation === 'attic' || plenumLocation === 'conditioned-soffit')) {
+      return soffitExitY
+    }
+    if (!atticRoof) return desiredY
+    const wallX = clampToSpan(wx, bounds.minX, bounds.maxX)
+    const wallZ = clampToSpan(wz, bounds.minZ, bounds.maxZ)
+    const roofCap = atticRoof.roofYAt(wallX, wallZ) - halfSpan - 0.1
+    if (roofCap <= levelH + 0.05) return soffitExitY
+    return round2(Math.min(desiredY, roofCap))
+  }
+
   // 4. Optional ASHRAE 62.2 ERV Fresh-Air Ventilator & Duct
   if (includeErv) {
     const ervId = nextEqId()
+    // Size ERV duct BEFORE clash-routing & riser placement so margins match audited diameter (HVA-CON-01)
+    const ervDuct = sizeDuctForCfm({
+      cfm: ventilation.continuousFreshAirCfm,
+      shape: 'round',
+      material: 'galvanized-sheet',
+      occupancy,
+    })
+    const ervHalfSpan = Math.max(0.08, (ervDuct.diameterIn * 0.0254) / 2)
+    const ervMaxY = maxPlenumYFor(ervHalfSpan)
     const ervObstacles: HvacObstacle[] = [
       ...obstacles,
       {
@@ -1671,61 +2089,121 @@ export function planHvacAutoPopulate(
         category: 'structural',
         label: 'Primary Air Handler / Furnace Cabinet',
         box: {
-          minX: indoorPos[0] - 0.34,
-          maxX: indoorPos[0] + 0.34,
+          minX: indoorPos[0] - (isHorizontalAtticAhu && roofEnvelope.ridgeAlongX ? 0.72 : 0.34),
+          maxX: indoorPos[0] + (isHorizontalAtticAhu && roofEnvelope.ridgeAlongX ? 0.72 : 0.34),
           minY: indoorPos[1],
-          maxY: indoorPos[1] + 1.85,
-          minZ: indoorPos[2] - 0.38,
-          maxZ: indoorPos[2] + 0.38,
+          maxY: indoorPos[1] + (isHorizontalAtticAhu ? 0.56 : 1.85),
+          minZ: indoorPos[2] - (isHorizontalAtticAhu && !roofEnvelope.ridgeAlongX ? 0.72 : 0.38),
+          maxZ: indoorPos[2] + (isHorizontalAtticAhu && !roofEnvelope.ridgeAlongX ? 0.72 : 0.38),
         },
       },
     ]
-    const ervBaseOffsets: ReadonlyArray<readonly [number, number]> = [
-      [0.85, 0.45],
-      [-0.85, 0.45],
-      [0.85, -0.45],
-      [-0.85, -0.45],
-      [0, 0.85],
-      [0, -0.85],
-      [0.85, 0],
-      [-0.85, 0],
-    ]
+    const ervBaseOffsets: ReadonlyArray<readonly [number, number]> = isAtticMountedAhu
+      ? roofEnvelope.ridgeAlongX
+        ? [
+            [1.6, 0],
+            [-1.6, 0],
+            [1.1, 0],
+            [-1.1, 0],
+            [0.85, 0.45],
+            [-0.85, 0.45],
+            [0.85, -0.45],
+            [-0.85, -0.45],
+          ]
+        : [
+            [0, 1.6],
+            [0, -1.6],
+            [0, 1.1],
+            [0, -1.1],
+            [0.45, 0.85],
+            [-0.45, 0.85],
+            [0.45, -0.85],
+            [-0.45, -0.85],
+          ]
+      : [
+          [0.85, 0.45],
+          [-0.85, 0.45],
+          [0.85, -0.45],
+          [-0.85, -0.45],
+          [0, 0.85],
+          [0, -0.85],
+          [0.85, 0],
+          [-0.85, 0],
+        ]
+
+    let ervInAttic = isAtticMountedAhu
+    const atticErvMountY = round2(atticPlatformY + 0.04)
+    const indoorErvMountY = round2(Math.min(levelH - 0.55, 1.85))
+    const ervAtticReqRoofY = atticErvMountY + 0.6 + 0.12
+    if (ervInAttic && atticRoof && ridgePeakY < ervAtticReqRoofY) {
+      ervInAttic = false
+    }
+
     let ervBaseX = indoorPos[0]
     let ervBaseZ = indoorPos[2]
     for (const [ox, oz] of ervBaseOffsets) {
       const tx = round2(indoorPos[0] + ox)
       const tz = round2(indoorPos[2] + oz)
-      if (isAtticMountedAhu || isInsideWithMargin(tx, tz, mechRoom.polygon, 0.22)) {
+      if (ervInAttic || isInsideWithMargin(tx, tz, mechRoom.polygon, 0.22)) {
         if (tx >= bounds.minX + 0.4 && tx <= bounds.maxX - 0.4 && tz >= bounds.minZ + 0.4 && tz <= bounds.maxZ - 0.4) {
-          ervBaseX = tx
-          ervBaseZ = tz
-          break
+          if (!ervInAttic || !atticRoof || atticRoof.roofYAt(tx, tz) >= ervAtticReqRoofY) {
+            ervBaseX = tx
+            ervBaseZ = tz
+            break
+          }
         }
       }
     }
-    const ervMountY = isAtticMountedAhu ? round2(atticPlatformY + 0.12) : round2(Math.min(levelH - 0.55, 1.85))
-    const ervPlenumY = round2(plenumY + 0.14)
-    const ervSpotRes = findClearSpotForRiser({
+
+    let ervMountY = ervInAttic ? atticErvMountY : indoorErvMountY
+    let ervPlenumY = round2(plenumY + 0.14)
+    if (ervMaxY !== undefined) ervPlenumY = Math.min(ervPlenumY, ervMaxY)
+
+    let ervSpotRes = findClearSpotForRiser({
       baseX: ervBaseX,
       baseZ: ervBaseZ,
       y0: ervMountY,
       y1: ervPlenumY,
-      clashSpan: 0.08,
+      clashSpan: ervHalfSpan,
       obstacles: ervObstacles,
       bounds,
       minFloorClearanceM: 0.65,
-      insidePolygon: isAtticMountedAhu ? undefined : mechRoom.polygon,
-      floorObstacles: isAtticMountedAhu ? [...atticLevelObstacles, ervObstacles[ervObstacles.length - 1]!] : ervObstacles,
+      insidePolygon: ervInAttic ? undefined : mechRoom.polygon,
+      floorObstacles: ervInAttic ? [...atticLevelObstacles, ervObstacles[ervObstacles.length - 1]!] : ervObstacles,
+      roofConstraint:
+        ervInAttic && atticRoof
+          ? { roof: atticRoof, requiredTopY: ervAtticReqRoofY, preferRidgeWeight: 28 }
+          : undefined,
     })
+    if (ervInAttic && atticRoof && (!ervSpotRes.foundValid || atticRoof.roofYAt(ervSpotRes.spot[0], ervSpotRes.spot[1]) < ervAtticReqRoofY)) {
+      ervInAttic = false
+      ervMountY = indoorErvMountY
+      ervSpotRes = findClearSpotForRiser({
+        baseX: mechRoom.centroid[0],
+        baseZ: mechRoom.centroid[1],
+        y0: ervMountY,
+        y1: ervPlenumY,
+        clashSpan: ervHalfSpan,
+        obstacles: ervObstacles,
+        bounds,
+        minFloorClearanceM: 0.65,
+        insidePolygon: mechRoom.polygon,
+        floorObstacles: ervObstacles,
+      })
+    }
     const [ervX, ervZ] = ervSpotRes.spot
-    const ervPos: Vec3 = [ervX, ervMountY, ervZ]
+    const ervPos: Vec3 = [
+      clampToSpan(ervX, indoorBounds.minX, indoorBounds.maxX),
+      ervMountY,
+      clampToSpan(ervZ, indoorBounds.minZ, indoorBounds.maxZ),
+    ]
     equipment.push({
       id: ervId,
       name: `ASHRAE 62.2 ERV (${ventilation.recommendedErvCfm} CFM)`,
       equipmentKind: 'erv-ventilator',
       position: ervPos,
       rotation: 0,
-      roomName: indoorRoomLabel,
+      roomName: ervInAttic ? 'Attic Mechanical Platform' : mechRoom.name,
       coolingTons: 0,
       heatingBtuh: 0,
       gasBtuh: 0,
@@ -1736,6 +2214,7 @@ export function planHvacAutoPopulate(
       hasSecondaryDrainPan: false,
       hasFloatSwitch: false,
       hasDisconnectWithinSight: true,
+      heightM: 0.52,
       electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'erv-ventilator', occupancy }),
     })
 
@@ -1743,40 +2222,71 @@ export function planHvacAutoPopulate(
     const intakeOnWest = Math.abs(ervPos[0] - bounds.minX) <= Math.abs(bounds.maxX - ervPos[0])
     const primaryIntakeX = round2(intakeOnWest ? bounds.minX - 0.08 : bounds.maxX + 0.08)
     const oppIntakeX = round2(intakeOnWest ? bounds.maxX + 0.08 : bounds.minX - 0.08)
-    const baseIntakeY = isAtticMountedAhu ? round2(levelH + 0.25) : 2.1
-    const highIntakeY = round2(Math.max(baseIntakeY, levelH + 0.34))
-    const upperIntakeY = round2(levelH + 0.62)
-    const intakeCandidates: ReadonlyArray<Vec3> = [
-      [primaryIntakeX, baseIntakeY, round2(ervPos[2])],
-      [primaryIntakeX, highIntakeY, round2(ervPos[2])],
-      [primaryIntakeX, upperIntakeY, round2(ervPos[2])],
-      [primaryIntakeX, highIntakeY, round2(ervPos[2] + 1.4)],
-      [primaryIntakeX, highIntakeY, round2(ervPos[2] - 1.4)],
-      [primaryIntakeX, highIntakeY, round2(ervPos[2] + 2.8)],
-      [primaryIntakeX, highIntakeY, round2(ervPos[2] - 2.8)],
-      [round2(ervPos[0]), highIntakeY, round2(bounds.minZ - 0.08)],
-      [round2(ervPos[0]), highIntakeY, round2(bounds.maxZ + 0.08)],
-      [round2(ervPos[0]), upperIntakeY, round2(bounds.minZ - 0.08)],
-      [round2(ervPos[0]), upperIntakeY, round2(bounds.maxZ + 0.08)],
-      [oppIntakeX, highIntakeY, round2(ervPos[2])],
-      [oppIntakeX, upperIntakeY, round2(ervPos[2])],
-    ]
+    // Gate high/upper attic intake elevations strictly on useTrueAtticPlenum (HVA-BUG-03)
+    const baseIntakeY =
+      useTrueAtticPlenum && ervInAttic
+        ? round2(levelH + 0.25)
+        : round2(Math.min(levelH - 0.35, 2.1))
+    const highIntakeY = useTrueAtticPlenum
+      ? round2(Math.max(baseIntakeY, levelH + 0.34))
+      : round2(Math.min(levelH - 0.25, 2.25))
+    const upperIntakeY = useTrueAtticPlenum
+      ? round2(levelH + 0.62)
+      : round2(Math.min(levelH - 0.55, 1.85))
 
-    const ervDuct = sizeDuctForCfm({
-      cfm: ventilation.continuousFreshAirCfm,
-      shape: 'round',
-      material: 'galvanized-sheet',
-      occupancy,
-    })
-    const ervHalfSpan = Math.max(0.08, (ervDuct.diameterIn * 0.0254) / 2)
+    // Clamp & deduplicate all intake candidates strictly to walled building spans (HVA-BUG-02)
+    // and below pitched roof rafters at the wall line (VIS-01)
+    const intakeCandidates: Vec3[] = []
+    const pushIntake = (ix: number, rawY: number, iz: number) => {
+      const iy = clampExteriorExitY(ix, iz, rawY, ervHalfSpan)
+      const pt: Vec3 = [round2(ix), iy, round2(iz)]
+      if (
+        !intakeCandidates.some(
+          (e) => Math.abs(e[0] - pt[0]) < 0.05 && Math.abs(e[1] - pt[1]) < 0.05 && Math.abs(e[2] - pt[2]) < 0.05,
+        )
+      ) {
+        intakeCandidates.push(pt)
+      }
+    }
+    const clampedErvZ = clampToSpan(ervPos[2], wallMinZ, wallMaxZ)
+    const clampedErvX = clampToSpan(ervPos[0], wallMinX, wallMaxX)
+    const addSideWallIntakes = () => {
+      pushIntake(primaryIntakeX, baseIntakeY, clampedErvZ)
+      pushIntake(primaryIntakeX, highIntakeY, clampedErvZ)
+      pushIntake(primaryIntakeX, upperIntakeY, clampedErvZ)
+      for (const dz of [1.4, -1.4, 2.8, -2.8]) {
+        const cz = round2(ervPos[2] + dz)
+        if (cz >= wallMinZ && cz <= wallMaxZ) {
+          pushIntake(primaryIntakeX, highIntakeY, cz)
+        }
+      }
+      pushIntake(oppIntakeX, highIntakeY, clampedErvZ)
+      pushIntake(oppIntakeX, upperIntakeY, clampedErvZ)
+    }
+    const addNorthSouthIntakes = () => {
+      pushIntake(clampedErvX, highIntakeY, round2(bounds.minZ - 0.08))
+      pushIntake(clampedErvX, highIntakeY, round2(bounds.maxZ + 0.08))
+      pushIntake(clampedErvX, upperIntakeY, round2(bounds.minZ - 0.08))
+      pushIntake(clampedErvX, upperIntakeY, round2(bounds.maxZ + 0.08))
+    }
+    if (atticRoof && !atticRoof.ridgeAlongX) {
+      addNorthSouthIntakes()
+      addSideWallIntakes()
+    } else {
+      addSideWallIntakes()
+      addNorthSouthIntakes()
+    }
+
     let intakePos: Vec3 = intakeCandidates[0]!
     let ervRoute = routeHvacDuctRun({
       from: intakePos,
       to: ervPos,
       plenumY: ervPlenumY,
+      maxPlenumY: ervMaxY,
       ductHalfSpanM: ervHalfSpan,
       allowDiagonalBranch: false,
       obstacles,
+      roofEnvelope: atticRoof,
     })
     if (ervRoute.clashes.length > 0) {
       for (let ii = 1; ii < intakeCandidates.length; ii++) {
@@ -1785,9 +2295,11 @@ export function planHvacAutoPopulate(
           from: candIn,
           to: ervPos,
           plenumY: ervPlenumY,
+          maxPlenumY: ervMaxY,
           ductHalfSpanM: ervHalfSpan,
           allowDiagonalBranch: false,
           obstacles,
+          roofEnvelope: atticRoof,
         })
         if (candRoute.clashes.length < ervRoute.clashes.length) {
           intakePos = candIn
@@ -1820,7 +2332,7 @@ export function planHvacAutoPopulate(
       airflowCfm: ventilation.continuousFreshAirCfm,
       velocityFpm: ervDuct.velocityFpm,
       frictionRateInWgPer100Ft: ervDuct.frictionRateInWgPer100Ft,
-      insulationR: ductR,
+      insulationR: effectiveDuctR(ervRoute.path),
       sourceNodeId: intakeId,
       targetNodeId: ervId,
       showFramingClearances: true,
@@ -1832,14 +2344,22 @@ export function planHvacAutoPopulate(
     for (const room of rooms) {
       if (room.category === 'bathroom') {
         const fanId = nextEqId()
+        // Size bath exhaust duct BEFORE clash-routing & riser placement so margins match audited diameter (HVA-CON-01)
+        const exSized = sizeDuctForCfm({ cfm: 80, shape: 'round', material: 'galvanized-sheet', occupancy })
+        const exHalfSpan = Math.max(0.06, (exSized.diameterIn * 0.0254) / 2)
+        const exMaxY = maxPlenumYFor(exHalfSpan)
         const fanY = round2(levelH - 0.05)
-        const exPlenumY = round2(levelH + 0.3)
+        const rawExPlenumY =
+          plenumLocation === 'conditioned-soffit'
+            ? round2(levelH - Math.max(0.14, exHalfSpan + 0.06))
+            : round2(levelH + 0.3)
+        const exPlenumY = exMaxY !== undefined && plenumLocation === 'attic' ? Math.min(rawExPlenumY, exMaxY) : rawExPlenumY
         const fanRes = findClearSpotForRiser({
           baseX: room.centroid[0],
           baseZ: room.centroid[1],
           y0: fanY,
           y1: exPlenumY,
-          clashSpan: 0.06,
+          clashSpan: exHalfSpan,
           obstacles,
           bounds,
           minFloorClearanceM: 0.35,
@@ -1864,31 +2384,43 @@ export function planHvacAutoPopulate(
           hasSecondaryDrainPan: false,
           hasFloatSwitch: false,
           hasDisconnectWithinSight: true,
+          heightM: 0.18,
           electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'bath-exhaust-fan', occupancy }),
         })
-        const bathExTargets: ReadonlyArray<Vec3> = [
-          [fanX, exPlenumY, round2(bounds.minZ - 0.1)],
-          [fanX, exPlenumY, round2(bounds.maxZ + 0.1)],
-          [round2(bounds.minX - 0.1), exPlenumY, fanZ],
-          [round2(bounds.maxX + 0.1), exPlenumY, fanZ],
+        const cFanX = clampToSpan(fanX, wallMinX, wallMaxX)
+        const cFanZ = clampToSpan(fanZ, wallMinZ, wallMaxZ)
+        const rawBathTargets: Vec3[] = [
+          [cFanX, clampExteriorExitY(cFanX, bounds.minZ - 0.1, exPlenumY, exHalfSpan), round2(bounds.minZ - 0.1)],
+          [cFanX, clampExteriorExitY(cFanX, bounds.maxZ + 0.1, exPlenumY, exHalfSpan), round2(bounds.maxZ + 0.1)],
+          [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
+          [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
         ]
+        rawBathTargets.sort(
+          (a, b) =>
+            Math.hypot(a[0] - fanX, a[2] - fanZ) - Math.hypot(b[0] - fanX, b[2] - fanZ),
+        )
+        const exRouteMaxY = exMaxY !== undefined && exMaxY > 0 ? exMaxY : undefined
         let exRoute = routeHvacDuctRun({
           from: fanPos,
-          to: bathExTargets[0]!,
+          to: rawBathTargets[0]!,
           plenumY: exPlenumY,
-          ductHalfSpanM: 0.06,
+          maxPlenumY: exRouteMaxY,
+          ductHalfSpanM: exHalfSpan,
           allowDiagonalBranch: false,
           obstacles,
+          roofEnvelope: atticRoof,
         })
         if (exRoute.clashes.length > 0) {
-          for (let ei = 1; ei < bathExTargets.length; ei++) {
+          for (let ei = 1; ei < rawBathTargets.length; ei++) {
             const cand = routeHvacDuctRun({
               from: fanPos,
-              to: bathExTargets[ei]!,
+              to: rawBathTargets[ei]!,
               plenumY: exPlenumY,
-              ductHalfSpanM: 0.06,
+              maxPlenumY: exRouteMaxY,
+              ductHalfSpanM: exHalfSpan,
               allowDiagonalBranch: false,
               obstacles,
+              roofEnvelope: atticRoof,
             })
             if (cand.clashes.length < exRoute.clashes.length) {
               exRoute = cand
@@ -1896,7 +2428,6 @@ export function planHvacAutoPopulate(
             }
           }
         }
-        const exSized = sizeDuctForCfm({ cfm: 80, shape: 'round', material: 'galvanized-sheet', occupancy })
         ductRuns.push({
           id: nextDuctId(),
           name: `${exSized.diameterIn}" Bath Exhaust Duct (${room.name})`,
@@ -1910,7 +2441,7 @@ export function planHvacAutoPopulate(
           airflowCfm: 80,
           velocityFpm: exSized.velocityFpm,
           frictionRateInWgPer100Ft: exSized.frictionRateInWgPer100Ft,
-          insulationR: ductR,
+          insulationR: effectiveDuctR(exRoute.path),
           sourceNodeId: fanId,
           showFramingClearances: true,
         })
@@ -1925,8 +2456,13 @@ export function planHvacAutoPopulate(
         })
         const hoodDiam = Math.max(6, hoodSized.diameterIn)
         const hoodHalfSpan = Math.max(0.08, (hoodDiam * 0.0254) / 2)
+        const hoodMaxY = maxPlenumYFor(hoodHalfSpan)
         const hoodY = round2(Math.min(levelH - 0.5, 1.78))
-        const hoodPlenumY = round2(levelH + 0.34)
+        const rawHoodPlenumY =
+          plenumLocation === 'conditioned-soffit'
+            ? round2(levelH - Math.max(0.16, hoodHalfSpan + 0.06))
+            : round2(levelH + 0.34)
+        const hoodPlenumY = hoodMaxY !== undefined && plenumLocation === 'attic' ? Math.min(rawHoodPlenumY, hoodMaxY) : rawHoodPlenumY
         const hoodRes = findClearSpotForRiser({
           baseX: room.centroid[0],
           baseZ: room.centroid[1],
@@ -1960,19 +2496,28 @@ export function planHvacAutoPopulate(
           electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'range-hood', occupancy }),
         })
         const hoodFrom: Vec3 = [hoodPos[0], round2(hoodPos[1] + 0.25), hoodPos[2]]
-        const hoodTargets: ReadonlyArray<Vec3> = [
-          [round2(hoodX), hoodPlenumY, round2(bounds.minZ - 0.1)],
-          [round2(hoodX), hoodPlenumY, round2(bounds.maxZ + 0.1)],
-          [round2(bounds.minX - 0.1), hoodPlenumY, round2(hoodZ)],
-          [round2(bounds.maxX + 0.1), hoodPlenumY, round2(hoodZ)],
+        const cHoodX = clampToSpan(hoodX, wallMinX, wallMaxX)
+        const cHoodZ = clampToSpan(hoodZ, wallMinZ, wallMaxZ)
+        const hoodTargets: Vec3[] = [
+          [cHoodX, clampExteriorExitY(cHoodX, bounds.minZ - 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.minZ - 0.1)],
+          [cHoodX, clampExteriorExitY(cHoodX, bounds.maxZ + 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.maxZ + 0.1)],
+          [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
+          [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
         ]
+        hoodTargets.sort(
+          (a, b) =>
+            Math.hypot(a[0] - hoodX, a[2] - hoodZ) - Math.hypot(b[0] - hoodX, b[2] - hoodZ),
+        )
+        const hoodRouteMaxY = hoodMaxY !== undefined && hoodMaxY > 0 ? hoodMaxY : undefined
         let hoodRoute = routeHvacDuctRun({
           from: hoodFrom,
           to: hoodTargets[0]!,
           plenumY: hoodPlenumY,
+          maxPlenumY: hoodRouteMaxY,
           ductHalfSpanM: hoodHalfSpan,
           allowDiagonalBranch: false,
           obstacles,
+          roofEnvelope: atticRoof,
         })
         if (hoodRoute.clashes.length > 0) {
           for (let hi = 1; hi < hoodTargets.length; hi++) {
@@ -1980,9 +2525,11 @@ export function planHvacAutoPopulate(
               from: hoodFrom,
               to: hoodTargets[hi]!,
               plenumY: hoodPlenumY,
+              maxPlenumY: hoodRouteMaxY,
               ductHalfSpanM: hoodHalfSpan,
               allowDiagonalBranch: false,
               obstacles,
+              roofEnvelope: atticRoof,
             })
             if (cand.clashes.length < hoodRoute.clashes.length) {
               hoodRoute = cand
@@ -2003,7 +2550,7 @@ export function planHvacAutoPopulate(
           airflowCfm: hoodCfm,
           velocityFpm: hoodSized.velocityFpm,
           frictionRateInWgPer100Ft: hoodSized.frictionRateInWgPer100Ft,
-          insulationR: ductR,
+          insulationR: effectiveDuctR(hoodRoute.path),
           sourceNodeId: hoodId,
           showFramingClearances: true,
         })

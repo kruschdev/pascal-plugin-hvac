@@ -63,6 +63,7 @@ export type RoomPolygon2D = {
     | 'bathroom'
     | 'hallway'
     | 'utility'
+    | 'closet'
     | 'laundry'
     | 'office'
     | 'garage'
@@ -158,14 +159,21 @@ export function classifyHvacRoomName(name: string): RoomPolygon2D['category'] {
   }
   if (/attic|combles|grenier/.test(s)) return 'attic'
   if (/garage|carport/.test(s)) return 'garage'
-  if (/exterior|outdoor|patio|deck|porch|balcon|terrasse|terrace|lanai|v[eé]randa|yard|jardin/.test(s)) {
+  if (
+    /exterior|outdoor|pool|swimming|piscine|piscina|patio|deck|porch|balcon|terrasse|terrace|lanai|v[eé]randa|yard|garden|jardin|courtyard|driveway/.test(
+      s,
+    )
+  ) {
     return 'exterior'
   }
-  if (/utility|mech|furnace|closet|storage|local\s+tech|chaufferie|dressing|placard|rangement|d[eé]barras/.test(s)) {
+  if (/utility|mech|furnace|local\s+tech|chaufferie/.test(s)) {
     return 'utility'
   }
+  if (/closet|storage|dressing|placard|rangement|d[eé]barras|pantry|cellier/.test(s)) {
+    return 'closet'
+  }
   if (/laundry|mudroom|buanderie|lingerie|lavander[ií]a/.test(s)) return 'laundry'
-  if (/kitchen|kicthen|pantry|cuisine|cocina|k[uü]che|cellier/.test(s)) return 'kitchen'
+  if (/kitchen|kicthen|cuisine|cocina|k[uü]che/.test(s)) return 'kitchen'
   if (/hall|corridor|foyer|entry|entrance|entr[eé]e|couloir|d[eé]gagement/.test(s)) return 'hallway'
   if (/office|study|den|bureau/.test(s)) return 'office'
   if (/bed|master|primary|nursery|guest|chambre|dormitorio|schlafzimmer/.test(s)) return 'bedroom'
@@ -262,9 +270,257 @@ export function resolveLevelHeightM(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   levelId: string | null = null,
 ): number {
-  const walls = extractWallSegments(nodes, levelId)
-  if (walls.length === 0) return 2.6
-  return Math.max(2.2, walls.reduce((s, w) => s + w.heightM, 0) / walls.length)
+  const lvl = levelId ? nodes[levelId] : Object.values(nodes).find((n) => n.type === 'level')
+  const explicitLevelH =
+    typeof lvl?.height === 'number' && Number.isFinite(lvl.height) && lvl.height > 1.5
+      ? lvl.height
+      : null
+  let maxExplicitWallH = 0
+  for (const n of Object.values(nodes)) {
+    if (n.type !== 'wall' || !belongsToLevel(nodes, n, levelId)) continue
+    if (typeof n.height === 'number' && Number.isFinite(n.height) && n.height > 1.5) {
+      if (n.height > maxExplicitWallH) maxExplicitWallH = n.height
+    }
+  }
+  if (explicitLevelH !== null) {
+    // Use explicit level.height (or tallest perimeter wall if taller than a default level.height)
+    // and never average low interior partitions with tall outer commercial walls.
+    return Math.max(2.2, maxExplicitWallH > explicitLevelH ? maxExplicitWallH : explicitLevelH)
+  }
+  if (maxExplicitWallH > 0) return Math.max(2.2, maxExplicitWallH)
+  return 2.6
+}
+
+export type XzBounds2D = {
+  minX: number
+  maxX: number
+  minZ: number
+  maxZ: number
+}
+
+export type AtticRoofEnvelope = {
+  wallH: number
+  pitchRiseOver12: number
+  ridgeAlongX: boolean
+  center: number
+  halfSpan: number
+  bounds: XzBounds2D
+  hasRoofAbove: boolean
+  roofYAt: (x: number, z: number) => number
+}
+
+/**
+ * Compute the pitched attic roof plane `roofYAt(x, z)` matching structural gable geometry
+ * (and tightening to any explicit `roof-segment` nodes on the target level).
+ */
+export function buildAtticRoofEnvelope(
+  nodes: Readonly<Record<string, SceneNodeLike>>,
+  levelId: string | null,
+  bounds: XzBounds2D,
+  wallH: number,
+): AtticRoofEnvelope {
+  const all = Object.values(nodes)
+  const levels = all.filter((n) => n.type === 'level')
+  const curLvl = levelId ? nodes[levelId] : levels[0]
+  const curElev =
+    typeof curLvl?.baseElevation === 'number'
+      ? curLvl.baseElevation
+      : typeof curLvl?.elevation === 'number'
+        ? curLvl.elevation
+        : typeof curLvl?.level === 'number'
+          ? curLvl.level
+          : 0
+  const hasRoofAbove = !levels.some((o) => {
+    if (!curLvl || o.id === curLvl.id) return false
+    const oElev =
+      typeof o.baseElevation === 'number'
+        ? o.baseElevation
+        : typeof o.elevation === 'number'
+          ? o.elevation
+          : typeof o.level === 'number'
+            ? o.level
+            : 0
+    return oElev > curElev && all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
+  })
+
+  const assembly = all.find((n) => n.type === 'structural:assembly' && belongsToLevel(nodes, n, levelId))
+  const pitchRiseOver12 =
+    typeof assembly?.roofPitchRise === 'number' && Number.isFinite(assembly.roofPitchRise) && assembly.roofPitchRise > 0
+      ? assembly.roofPitchRise
+      : 6
+
+  const spanX = Math.max(0.5, bounds.maxX - bounds.minX)
+  const spanZ = Math.max(0.5, bounds.maxZ - bounds.minZ)
+  const ridgeAlongX = spanX >= spanZ
+  const halfSpan = (ridgeAlongX ? spanZ : spanX) / 2
+  const center = ridgeAlongX ? (bounds.minZ + bounds.maxZ) / 2 : (bounds.minX + bounds.maxX) / 2
+
+  type ExplicitRoofSeg = {
+    cx: number
+    cz: number
+    cosR: number
+    sinR: number
+    halfW: number
+    halfD: number
+    overhangM: number
+    eaveY: number
+    slopeTan: number
+    roofType: string
+  }
+  const curBuildingId = typeof curLvl?.parentId === 'string' ? curLvl.parentId : null
+  const unwalledUpperLevelIds = new Set<string>()
+  if (hasRoofAbove && curLvl) {
+    for (const o of levels) {
+      if (o.id === curLvl.id) continue
+      const oBldg = typeof o.parentId === 'string' ? o.parentId : null
+      if (curBuildingId && oBldg && curBuildingId !== oBldg) continue
+      const oElev =
+        typeof o.baseElevation === 'number'
+          ? o.baseElevation
+          : typeof o.elevation === 'number'
+            ? o.elevation
+            : typeof o.level === 'number'
+              ? o.level
+              : 0
+      const oHasWalls = all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
+      if (!oHasWalls && oElev >= curElev) {
+        unwalledUpperLevelIds.add(o.id)
+      }
+    }
+  }
+  const explicitSegs: ExplicitRoofSeg[] = []
+  for (const n of all) {
+    if (n.type !== 'roof-segment') continue
+    let inScope = belongsToLevel(nodes, n, levelId)
+    if (!inScope && unwalledUpperLevelIds.size > 0) {
+      for (const uid of unwalledUpperLevelIds) {
+        if (belongsToLevel(nodes, n, uid)) {
+          inScope = true
+          break
+        }
+      }
+    }
+    if (!inScope) continue
+    let wx = Array.isArray(n.position) ? Number(n.position[0] ?? 0) : 0
+    let wy = Array.isArray(n.position) ? Number(n.position[1] ?? 0) : 0
+    let wz = Array.isArray(n.position) ? Number(n.position[2] ?? 0) : 0
+    let rot = typeof n.rotation === 'number' ? n.rotation : 0
+    const parent = n.parentId ? nodes[n.parentId] : undefined
+    if (parent && parent.type === 'roof') {
+      const pRot = typeof parent.rotation === 'number' ? parent.rotation : 0
+      const pc = Math.cos(pRot)
+      const ps = Math.sin(pRot)
+      const px = Array.isArray(parent.position) ? Number(parent.position[0] ?? 0) : 0
+      const py = Array.isArray(parent.position) ? Number(parent.position[1] ?? 0) : 0
+      const pz = Array.isArray(parent.position) ? Number(parent.position[2] ?? 0) : 0
+      const rx = wx * pc + wz * ps
+      const rz = -wx * ps + wz * pc
+      wx = px + rx
+      wy = py + wy
+      wz = pz + rz
+      rot += pRot
+    }
+    const width = typeof n.width === 'number' && n.width > 0.2 ? n.width : 6
+    const depth = typeof n.depth === 'number' && n.depth > 0.2 ? n.depth : 6
+    const roofType = typeof n.roofType === 'string' ? n.roofType : 'gable'
+    const rawPitch = typeof n.pitch === 'number' && Number.isFinite(n.pitch) ? n.pitch : 26.57
+    const pitchRad =
+      rawPitch <= 0
+        ? 0
+        : rawPitch > 1.4
+          ? (Math.min(65, rawPitch) * Math.PI) / 180
+          : Math.min((65 * Math.PI) / 180, rawPitch)
+    const overhangM = typeof n.overhang === 'number' && n.overhang >= 0 ? n.overhang : 0.35
+    const segWallH = typeof n.wallHeight === 'number' && Number.isFinite(n.wallHeight) ? n.wallHeight : 0
+    const eaveY = wy > 0.05 ? wy + segWallH : wallH + segWallH
+    explicitSegs.push({
+      cx: wx,
+      cz: wz,
+      cosR: Math.cos(rot),
+      sinR: Math.sin(rot),
+      halfW: width / 2,
+      halfD: depth / 2,
+      overhangM,
+      eaveY,
+      slopeTan: roofType === 'flat' || pitchRad <= 0.008 ? 0 : Math.tan(pitchRad),
+      roofType,
+    })
+  }
+
+  const roofYAt = (x: number, z: number): number => {
+    const distFromRidge = Math.abs((ridgeAlongX ? z : x) - center)
+    const riseM = Math.max(0, halfSpan - distFromRidge) * (pitchRiseOver12 / 12)
+    const fallbackY = wallH + riseM
+    if (explicitSegs.length > 0) {
+      let bestSegY: number | null = null
+      for (const seg of explicitSegs) {
+        const dx = x - seg.cx
+        const dz = z - seg.cz
+        const lx = dx * seg.cosR - dz * seg.sinR
+        const lz = dx * seg.sinR + dz * seg.cosR
+        if (Math.abs(lx) <= seg.halfW + 0.15 && Math.abs(lz) <= seg.halfD + seg.overhangM + 0.15) {
+          const segY =
+            seg.roofType === 'shed'
+              ? seg.eaveY + Math.max(0, seg.halfD - lz) * seg.slopeTan
+              : seg.eaveY + Math.max(0, seg.halfD - Math.abs(lz)) * seg.slopeTan
+          if (bestSegY === null || segY > bestSegY) bestSegY = segY
+        }
+      }
+      if (bestSegY !== null) return Math.min(fallbackY, bestSegY)
+    }
+    return fallbackY
+  }
+
+  return {
+    wallH,
+    pitchRiseOver12,
+    ridgeAlongX,
+    center,
+    halfSpan,
+    bounds,
+    hasRoofAbove,
+    roofYAt,
+  }
+}
+
+export function safeRoofCorridorHalfWidth(
+  roof: AtticRoofEnvelope,
+  y: number,
+  halfH: number,
+  clearanceM = 0.08,
+): number {
+  const slope = roof.pitchRiseOver12 / 12
+  if (slope <= 1e-4) return 0
+  const neededRise = y + halfH + clearanceM - roof.wallH
+  if (neededRise <= 0) return roof.halfSpan
+  return Math.max(0, roof.halfSpan - neededRise / slope)
+}
+
+export function pathClearOfRoof(
+  path: ReadonlyArray<Vec3>,
+  roof: AtticRoofEnvelope,
+  halfH: number,
+  clearanceM = 0.08,
+): boolean {
+  if (!roof.hasRoofAbove) return true
+  const { bounds, wallH, roofYAt } = roof
+  for (let i = 0; i < path.length - 1; i++) {
+    const a = path[i]!
+    const b = path[i + 1]!
+    if (Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) < 0.02) continue
+    for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+      const px = a[0] + (b[0] - a[0]) * f
+      const py = a[1] + (b[1] - a[1]) * f
+      const pz = a[2] + (b[2] - a[2]) * f
+      if (px < bounds.minX - 0.1 || px > bounds.maxX + 0.1 || pz < bounds.minZ - 0.1 || pz > bounds.maxZ + 0.1) {
+        continue
+      }
+      if (py > wallH + 0.05 && py + halfH > roofYAt(px, pz) - clearanceM) {
+        return false
+      }
+    }
+  }
+  return true
 }
 
 function parseNominalIn(raw: unknown): number {
@@ -659,7 +915,8 @@ function cleanPath(pts: Vec3[]): Vec3[] {
 
 /**
  * Route an HVAC duct, exhaust run, or refrigerant lineset in the target plenum plane (`attic` / `crawlspace` / `basement`),
- * automatically detouring around Priority #1 Structural, Priority #2 Plumbing, and NEC 110.26(E) panel columns.
+ * automatically detouring around Priority #1 Structural, Priority #2 Plumbing, and NEC 110.26(E) panel columns,
+ * while staying within `xzBounds` (when provided) and strictly beneath `roofEnvelope` (when routing in an attic).
  */
 export function routeHvacDuctRun(params: {
   from: Vec3
@@ -669,6 +926,8 @@ export function routeHvacDuctRun(params: {
   ductHalfSpanM?: DuctClashMargin
   allowDiagonalBranch?: boolean
   obstacles?: ReadonlyArray<HvacObstacle>
+  xzBounds?: XzBounds2D
+  roofEnvelope?: AtticRoofEnvelope
 }): {
   path: Vec3[]
   lengthFt: number
@@ -683,37 +942,203 @@ export function routeHvacDuctRun(params: {
     ductHalfSpanM = 0.08,
     allowDiagonalBranch = false,
     obstacles = [],
+    xzBounds,
+    roofEnvelope,
   } = params
 
-  const hClear =
-    (typeof ductHalfSpanM === 'number' ? ductHalfSpanM : ductHalfSpanM.horizontal) + 0.06
-  const vClear =
-    (typeof ductHalfSpanM === 'number' ? ductHalfSpanM : ductHalfSpanM.vertical) + 0.06
+  const ductHalfH = typeof ductHalfSpanM === 'number' ? ductHalfSpanM : ductHalfSpanM.horizontal
+  const ductHalfV = typeof ductHalfSpanM === 'number' ? ductHalfSpanM : ductHalfSpanM.vertical
+  const hClear = ductHalfH + 0.06
+  const vClear = ductHalfV + 0.06
+
+  // Broad-phase XZ spatial filter to eliminate irrelevant obstacles on large buildings (HVA-OPT-01)
+  const padXZ = 4.5 + hClear
+  const broadMinX = Math.min(from[0], to[0]) - padXZ
+  const broadMaxX = Math.max(from[0], to[0]) + padXZ
+  const broadMinZ = Math.min(from[2], to[2]) - padXZ
+  const broadMaxZ = Math.max(from[2], to[2]) + padXZ
+  const localObstacles =
+    obstacles.length > 0
+      ? obstacles.filter(
+          (o) =>
+            o.box.maxX >= broadMinX &&
+            o.box.minX <= broadMaxX &&
+            o.box.maxZ >= broadMinZ &&
+            o.box.minZ <= broadMaxZ,
+        )
+      : obstacles
+
+  const checkClashes = (cand: ReadonlyArray<Vec3>): HvacObstacle[] => {
+    if (localObstacles.length === obstacles.length) {
+      return detectHvacClashes(cand, localObstacles, ductHalfSpanM)
+    }
+    let withinBroad = true
+    for (const p of cand) {
+      if (
+        p[0] < broadMinX + hClear ||
+        p[0] > broadMaxX - hClear ||
+        p[2] < broadMinZ + hClear ||
+        p[2] > broadMaxZ - hClear
+      ) {
+        withinBroad = false
+        break
+      }
+    }
+    return detectHvacClashes(cand, withinBroad ? localObstacles : obstacles, ductHalfSpanM)
+  }
+
+  // Irreducible lower bound: obstacles overlapping fixed `from` or `to` endpoints cannot be removed by any route.
+  const endpointHitKeys = new Set<string>()
+  if (localObstacles.length > 0) {
+    for (const hit of detectHvacClashes([from, from], localObstacles, ductHalfSpanM)) {
+      endpointHitKeys.add(hit.nodeId ?? hit.id)
+    }
+    for (const hit of detectHvacClashes([to, to], localObstacles, ductHalfSpanM)) {
+      endpointHitKeys.add(hit.nodeId ?? hit.id)
+    }
+  }
+  const irreducibleEndpointClashes = endpointHitKeys.size
 
   const clampY = (rawY: number): number =>
     maxPlenumY !== undefined ? Math.min(rawY, maxPlenumY) : rawY
 
-  const buildCand = (mode: 'x' | 'z' | 'diag' | 'ux' | 'uz', offsetM = 0, yOffset = 0): Vec3[] => {
-    const y = clampY(plenumY + yOffset)
+  const dedupYs = (rawYs: ReadonlyArray<number>): number[] => {
+    const out: number[] = []
+    const seen = new Set<number>()
+    for (const raw of rawYs) {
+      const cy = Math.round(clampY(raw) * 10000) / 10000
+      if (!seen.has(cy)) {
+        seen.add(cy)
+        out.push(cy)
+      }
+    }
+    return out
+  }
+
+  const fromInBounds =
+    !xzBounds ||
+    (from[0] >= xzBounds.minX && from[0] <= xzBounds.maxX && from[2] >= xzBounds.minZ && from[2] <= xzBounds.maxZ)
+  const toInBounds =
+    !xzBounds ||
+    (to[0] >= xzBounds.minX && to[0] <= xzBounds.maxX && to[2] >= xzBounds.minZ && to[2] <= xzBounds.maxZ)
+
+  const withinXzBounds = (cand: ReadonlyArray<Vec3>): boolean => {
+    if (!xzBounds) return true
+    for (let i = 0; i < cand.length; i++) {
+      if (i === 0 && !fromInBounds) continue
+      if (i === cand.length - 1 && !toInBounds) continue
+      const p = cand[i]!
+      if (p[0] < xzBounds.minX || p[0] > xzBounds.maxX || p[2] < xzBounds.minZ || p[2] > xzBounds.maxZ) {
+        return false
+      }
+    }
+    return true
+  }
+
+  const hasPitchedRoof = Boolean(roofEnvelope?.hasRoofAbove)
+  const roofSoffitY = roofEnvelope ? round2(roofEnvelope.wallH - Math.max(0.08, ductHalfV + 0.04)) : plenumY
+
+  const isRoofOk = (cand: ReadonlyArray<Vec3>): boolean =>
+    !hasPitchedRoof || !roofEnvelope ? true : pathClearOfRoof(cand, roofEnvelope, ductHalfV, 0.08)
+
+  const stepUnderRoof = (pts: Vec3[], y: number): Vec3[] => {
+    if (!hasPitchedRoof || !roofEnvelope || y <= roofEnvelope.wallH + 0.05) return pts
+    if (pathClearOfRoof(pts, roofEnvelope, ductHalfV, 0.08)) return pts
+
+    const safeHalf = safeRoofCorridorHalfWidth(roofEnvelope, y, ductHalfV, 0.1)
+    const lo = roofEnvelope.center - safeHalf
+    const hi = roofEnvelope.center + safeHalf
+    const alongX = roofEnvelope.ridgeAlongX
+    const fromPerp = alongX ? from[2] : from[0]
+    const toPerp = alongX ? to[2] : to[0]
+
+    const safeEndY = (pt: Vec3): number => {
+      const cap = roofEnvelope.roofYAt(pt[0], pt[2]) - ductHalfV - 0.09
+      if (cap <= roofEnvelope.wallH + 0.05) return Math.min(y, roofSoffitY)
+      return Math.min(y, round2(cap))
+    }
+
+    const fromSafeY = safeEndY(from)
+    const toSafeY = safeEndY(to)
+
+    // If corridor has no width at y, or both ends sit outside the same eave side, route cleanly at soffit/safe height
+    if (safeHalf < 0.15 || (fromPerp < lo && toPerp < lo) || (fromPerp > hi && toPerp > hi)) {
+      const lowY = Math.min(fromSafeY, toSafeY, roofSoffitY)
+      return cleanPath(
+        pts.map((p, idx) =>
+          idx === 0 || idx === pts.length - 1 ? p : ([p[0], Math.min(p[1], lowY), p[2]] as Vec3),
+        ),
+      )
+    }
+
+    const clampPerp = (v: number): number => {
+      let c = Math.max(lo, Math.min(hi, v))
+      if (xzBounds) {
+        c = alongX
+          ? Math.max(xzBounds.minZ, Math.min(xzBounds.maxZ, c))
+          : Math.max(xzBounds.minX, Math.min(xzBounds.maxX, c))
+      }
+      return round2(c)
+    }
+
+    const fCorr = clampPerp(fromPerp)
+    const tCorr = clampPerp(toPerp)
+    const out: Vec3[] = [from]
+    if (Math.abs(fromPerp - fCorr) > 0.02) {
+      out.push([from[0], fromSafeY, from[2]])
+      out.push(alongX ? [from[0], fromSafeY, fCorr] : [fCorr, fromSafeY, from[2]])
+      out.push(alongX ? [from[0], y, fCorr] : [fCorr, y, from[2]])
+    } else {
+      out.push([from[0], y, from[2]])
+    }
+
+    // Clamp ONLY attic-elevation intermediate waypoints into the safe ridge corridor;
+    // skip low-elevation dogleg/riser intermediate points so paths never plunge back down into room height.
+    for (let i = 1; i < pts.length - 1; i++) {
+      const p = pts[i]!
+      if (p[1] <= roofEnvelope.wallH + 0.05) continue
+      const px = alongX ? p[0] : clampPerp(p[0])
+      const pz = alongX ? clampPerp(p[2]) : p[2]
+      out.push([px, y, pz])
+    }
+
+    if (Math.abs(toPerp - tCorr) > 0.02) {
+      out.push(alongX ? [to[0], y, tCorr] : [tCorr, y, to[2]])
+      out.push(alongX ? [to[0], toSafeY, tCorr] : [tCorr, toSafeY, to[2]])
+      out.push([to[0], toSafeY, to[2]])
+    } else {
+      out.push([to[0], y, to[2]])
+    }
+    out.push(to)
+    return cleanPath(out)
+  }
+
+  const buildCandAtY = (mode: 'x' | 'z' | 'diag' | 'ux' | 'uz', offsetM: number, rawY: number): Vec3[] => {
+    const y = clampY(rawY)
     const sP: Vec3 = [from[0], y, from[2]]
     const eP: Vec3 = [to[0], y, to[2]]
+    let raw: Vec3[]
     if (mode === 'ux') {
-      return cleanPath([from, sP, [from[0] + offsetM, y, from[2]], [from[0] + offsetM, y, to[2]], eP, to])
+      raw = cleanPath([from, sP, [from[0] + offsetM, y, from[2]], [from[0] + offsetM, y, to[2]], eP, to])
+    } else if (mode === 'uz') {
+      raw = cleanPath([from, sP, [from[0], y, from[2] + offsetM], [to[0], y, from[2] + offsetM], eP, to])
+    } else if (mode === 'diag') {
+      if (Math.abs(offsetM) < 1e-4) raw = cleanPath([from, sP, eP, to])
+      else {
+        const mx = (from[0] + to[0]) / 2 + offsetM
+        const mz = (from[2] + to[2]) / 2 - offsetM
+        raw = cleanPath([from, sP, [mx, y, mz], eP, to])
+      }
+    } else if (mode === 'x') {
+      raw = cleanPath([from, sP, [to[0] + offsetM, y, from[2] + offsetM], eP, to])
+    } else {
+      raw = cleanPath([from, sP, [from[0] + offsetM, y, to[2] + offsetM], eP, to])
     }
-    if (mode === 'uz') {
-      return cleanPath([from, sP, [from[0], y, from[2] + offsetM], [to[0], y, from[2] + offsetM], eP, to])
-    }
-    if (mode === 'diag') {
-      if (Math.abs(offsetM) < 1e-4) return cleanPath([from, sP, eP, to])
-      const mx = (from[0] + to[0]) / 2 + offsetM
-      const mz = (from[2] + to[2]) / 2 - offsetM
-      return cleanPath([from, sP, [mx, y, mz], eP, to])
-    }
-    if (mode === 'x') {
-      return cleanPath([from, sP, [to[0] + offsetM, y, from[2] + offsetM], eP, to])
-    }
-    return cleanPath([from, sP, [from[0] + offsetM, y, to[2] + offsetM], eP, to])
+    return stepUnderRoof(raw, y)
   }
+
+  const buildCand = (mode: 'x' | 'z' | 'diag' | 'ux' | 'uz', offsetM = 0, yOffset = 0): Vec3[] =>
+    buildCandAtY(mode, offsetM, plenumY + yOffset)
 
   const buildDogleg = (
     sx: number,
@@ -738,31 +1163,54 @@ export function routeHvacDuctRun(params: {
       pts.push([ex, to[1], ez])
     }
     pts.push(to)
-    return cleanPath(pts)
+    return stepUnderRoof(cleanPath(pts), y)
   }
 
+  const seenPaths = new Set<string>()
+  const pathKey = (cand: ReadonlyArray<Vec3>): string =>
+    cand.map((p) => `${Math.round(p[0] * 100)},${Math.round(p[1] * 100)},${Math.round(p[2] * 100)}`).join(';')
+
   const primary = buildCand(allowDiagonalBranch ? 'diag' : 'x', 0, 0)
+  seenPaths.add(pathKey(primary))
   let bestPath = primary
-  let bestClashes = detectHvacClashes(primary, obstacles, ductHalfSpanM)
+  let bestClashes = checkClashes(primary)
+  let bestRoofOk = isRoofOk(primary)
+  let bestInBounds = withinXzBounds(primary)
   let detoured = false
 
+  const isDone = (): boolean =>
+    bestRoofOk && bestInBounds && bestClashes.length <= irreducibleEndpointClashes
+
   const tryCandidate = (cand: Vec3[]): boolean => {
-    const c = detectHvacClashes(cand, obstacles, ductHalfSpanM)
-    if (c.length < bestClashes.length) {
+    if (xzBounds && !withinXzBounds(cand)) return false
+    const key = pathKey(cand)
+    if (seenPaths.has(key)) return false
+    seenPaths.add(key)
+
+    const candRoofOk = isRoofOk(cand)
+    if (bestRoofOk && !candRoofOk) return false
+    const c = checkClashes(cand)
+    const better =
+      (!bestInBounds && withinXzBounds(cand)) ||
+      (!bestRoofOk && candRoofOk) ||
+      (candRoofOk === bestRoofOk && c.length < bestClashes.length)
+    if (better) {
       bestPath = cand
       bestClashes = c
+      bestRoofOk = candRoofOk
+      bestInBounds = withinXzBounds(cand)
       detoured = true
-      if (c.length === 0) return true
+      if (isDone()) return true
     }
     return false
   }
 
-  if (bestClashes.length > 0) {
+  if (!isDone()) {
     const candidates: Vec3[][] = [
       buildCand('z', 0, 0),
       buildCand('x', 0, 0),
       // Elevation hops first so attic trunks & branches step cleanly over Priority #2 DWV vents
-      // and structural headers (conditioned-soffit runs clamp to maxPlenumY and also try downward soffit clearances)
+      // and structural headers (conditioned-soffit & crawlspace runs clamp to maxPlenumY and also try downward clearances)
       buildCand('diag', 0, 0.35),
       buildCand('x', 0, 0.35),
       buildCand('z', 0, 0.35),
@@ -779,6 +1227,15 @@ export function routeHvacDuctRun(params: {
       buildCand('z', 0, -0.18),
       buildCand('x', 0, -0.32),
       buildCand('z', 0, -0.32),
+      ...(hasPitchedRoof
+        ? [
+            buildCandAtY(allowDiagonalBranch ? 'diag' : 'x', 0, roofSoffitY),
+            buildCandAtY('z', 0, roofSoffitY),
+            buildCandAtY('x', 0, roofSoffitY),
+            buildCandAtY('x', 0, roofSoffitY - 0.16),
+            buildCandAtY('z', 0, roofSoffitY - 0.16),
+          ]
+        : []),
       buildCand('ux', 0.65, 0),
       buildCand('ux', -0.65, 0),
       buildCand('uz', 0.65, 0),
@@ -837,58 +1294,74 @@ export function routeHvacDuctRun(params: {
     }
 
     // Obstacle-hugging plenum bypasses (clear exact AABB bounds of blocking headers, vents, or equipment)
-    if (bestClashes.length > 0) {
+    if (!isDone()) {
+      const basePlenumY = Math.round(clampY(plenumY) * 10000) / 10000
       const initialBlockers = bestClashes.slice(0, 6)
       for (const obs of initialBlockers) {
-        const yAbove = clampY(Math.max(plenumY, obs.box.maxY + vClear))
-        const yVals = [clampY(plenumY), yAbove, clampY(plenumY + 0.55)]
+        const yAbove = Math.max(plenumY, obs.box.maxY + vClear)
+        const yBelow = maxPlenumY !== undefined ? obs.box.minY - vClear : undefined
+        const yVals = dedupYs([
+          plenumY,
+          yAbove,
+          ...(yBelow !== undefined ? [yBelow] : []),
+          ...(hasPitchedRoof ? [roofSoffitY] : []),
+          plenumY + 0.55,
+        ])
         const bypassXs = [obs.box.minX - hClear, obs.box.maxX + hClear]
         const bypassZs = [obs.box.minZ - hClear, obs.box.maxZ + hClear]
         for (const y of yVals) {
-          if (tryCandidate(cleanPath([from, [from[0], y, from[2]], [to[0], y, from[2]], [to[0], y, to[2]], to]))) break
-          if (tryCandidate(cleanPath([from, [from[0], y, from[2]], [from[0], y, to[2]], [to[0], y, to[2]], to]))) break
+          if (y !== basePlenumY) {
+            if (tryCandidate(stepUnderRoof(cleanPath([from, [from[0], y, from[2]], [to[0], y, from[2]], [to[0], y, to[2]], to]), y))) break
+            if (tryCandidate(stepUnderRoof(cleanPath([from, [from[0], y, from[2]], [from[0], y, to[2]], [to[0], y, to[2]], to]), y))) break
+          }
           for (const bx of bypassXs) {
             if (
               tryCandidate(
-                cleanPath([
-                  from,
-                  [from[0], y, from[2]],
-                  [bx, y, from[2]],
-                  [bx, y, to[2]],
-                  [to[0], y, to[2]],
-                  to,
-                ]),
+                stepUnderRoof(
+                  cleanPath([
+                    from,
+                    [from[0], y, from[2]],
+                    [bx, y, from[2]],
+                    [bx, y, to[2]],
+                    [to[0], y, to[2]],
+                    to,
+                  ]),
+                  y,
+                ),
               )
             ) {
               break
             }
           }
-          if (bestClashes.length === 0) break
+          if (isDone()) break
           for (const bz of bypassZs) {
             if (
               tryCandidate(
-                cleanPath([
-                  from,
-                  [from[0], y, from[2]],
-                  [from[0], y, bz],
-                  [to[0], y, bz],
-                  [to[0], y, to[2]],
-                  to,
-                ]),
+                stepUnderRoof(
+                  cleanPath([
+                    from,
+                    [from[0], y, from[2]],
+                    [from[0], y, bz],
+                    [to[0], y, bz],
+                    [to[0], y, to[2]],
+                    to,
+                  ]),
+                  y,
+                ),
               )
             ) {
               break
             }
           }
-          if (bestClashes.length === 0) break
+          if (isDone()) break
         }
-        if (bestClashes.length === 0) break
+        if (isDone()) break
       }
     }
 
     // Start/End vertical riser dogleg bypasses: step laterally at takeoff/landing elevation
     // before rising or dropping vertically to dodge overhead door headers, DWV vents, or adjacent water heaters.
-    if (bestClashes.length > 0) {
+    if (!isDone()) {
       const riserOffsets: ReadonlyArray<readonly [number, number]> = [
         [0.55, 0],
         [-0.55, 0],
@@ -907,27 +1380,31 @@ export function routeHvacDuctRun(params: {
         [0, 1.4],
         [0, -1.4],
       ]
-      const riserYs = [clampY(plenumY), clampY(plenumY + 0.45), clampY(plenumY + 0.85)]
+      const riserYs = dedupYs([plenumY, plenumY + 0.45, plenumY + 0.85, ...(hasPitchedRoof ? [roofSoffitY] : [])])
+      const beforeDoglegClashes = bestClashes.length
+      const beforeDoglegRoofOk = bestRoofOk
       // 1. Offset start riser
       for (const y of riserYs) {
         for (const [dx, dz] of riserOffsets) {
           if (tryCandidate(buildDogleg(from[0] + dx, from[2] + dz, to[0], to[2], y, 'x'))) break
           if (tryCandidate(buildDogleg(from[0] + dx, from[2] + dz, to[0], to[2], y, 'z'))) break
         }
-        if (bestClashes.length === 0) break
+        if (isDone()) break
       }
       // 2. Offset end riser
-      if (bestClashes.length > 0) {
+      if (!isDone()) {
         for (const y of riserYs) {
           for (const [dx, dz] of riserOffsets) {
             if (tryCandidate(buildDogleg(from[0], from[2], to[0] + dx, to[2] + dz, y, 'x'))) break
             if (tryCandidate(buildDogleg(from[0], from[2], to[0] + dx, to[2] + dz, y, 'z'))) break
           }
-          if (bestClashes.length === 0) break
+          if (isDone()) break
         }
       }
-      // 3. Offset both start and end risers (e.g., headers above both takeoff & landing)
-      if (bestClashes.length > 0) {
+      // 3. Offset both start and end risers only if pass 1 or pass 2 made progress (HVA-OPT-01)
+      const doglegMadeProgress =
+        bestClashes.length < beforeDoglegClashes || (!beforeDoglegRoofOk && bestRoofOk)
+      if (!isDone() && doglegMadeProgress) {
         const compactRiser: ReadonlyArray<readonly [number, number]> = [
           [0.65, 0],
           [-0.65, 0],
@@ -938,15 +1415,16 @@ export function routeHvacDuctRun(params: {
           [0, 1.1],
           [0, -1.1],
         ]
-        for (const y of [clampY(plenumY), clampY(plenumY + 0.55)]) {
+        const compactYs = dedupYs([plenumY, plenumY + 0.55])
+        for (const y of compactYs) {
           for (const [sdx, sdz] of compactRiser) {
             for (const [edx, edz] of compactRiser) {
               if (tryCandidate(buildDogleg(from[0] + sdx, from[2] + sdz, to[0] + edx, to[2] + edz, y, 'x'))) break
               if (tryCandidate(buildDogleg(from[0] + sdx, from[2] + sdz, to[0] + edx, to[2] + edz, y, 'z'))) break
             }
-            if (bestClashes.length === 0) break
+            if (isDone()) break
           }
-          if (bestClashes.length === 0) break
+          if (isDone()) break
         }
       }
     }
@@ -996,6 +1474,8 @@ export function routeCondensateDrain(params: {
   from: Vec3
   to: Vec3
   obstacles?: ReadonlyArray<HvacObstacle>
+  xzBounds?: XzBounds2D
+  roofEnvelope?: AtticRoofEnvelope
 }): {
   path: Vec3[]
   slopeInPerFt: number
@@ -1003,7 +1483,7 @@ export function routeCondensateDrain(params: {
   detoured: boolean
   clashes: HvacObstacle[]
 } {
-  const { from, to, obstacles = [] } = params
+  const { from, to, obstacles = [], xzBounds, roofEnvelope } = params
   const slopeInPerFt = 0.25
   const slopeRatio = slopeInPerFt / 12
   const isAtticStart = from[1] >= 2.2
@@ -1015,10 +1495,79 @@ export function routeCondensateDrain(params: {
       ? Math.min(from[1], Math.max(0.25, minRunStartY))
       : from[1]
 
+  // Broad-phase spatial filter (HVA-OPT-01)
+  const padXZ = 4.5 + 0.16
+  const broadMinX = Math.min(from[0], to[0]) - padXZ
+  const broadMaxX = Math.max(from[0], to[0]) + padXZ
+  const broadMinZ = Math.min(from[2], to[2]) - padXZ
+  const broadMaxZ = Math.max(from[2], to[2]) + padXZ
+  const localObstacles =
+    obstacles.length > 0
+      ? obstacles.filter(
+          (o) =>
+            o.box.maxX >= broadMinX &&
+            o.box.minX <= broadMaxX &&
+            o.box.maxZ >= broadMinZ &&
+            o.box.minZ <= broadMaxZ,
+        )
+      : obstacles
+
+  const checkClashes = (cand: ReadonlyArray<Vec3>): HvacObstacle[] => {
+    if (localObstacles.length === obstacles.length) return detectHvacClashes(cand, localObstacles, 0.02)
+    let withinBroad = true
+    for (const p of cand) {
+      if (
+        p[0] < broadMinX + 0.16 ||
+        p[0] > broadMaxX - 0.16 ||
+        p[2] < broadMinZ + 0.16 ||
+        p[2] > broadMaxZ - 0.16
+      ) {
+        withinBroad = false
+        break
+      }
+    }
+    return detectHvacClashes(cand, withinBroad ? localObstacles : obstacles, 0.02)
+  }
+
+  const endpointHitKeys = new Set<string>()
+  if (localObstacles.length > 0) {
+    for (const hit of detectHvacClashes([from, from], localObstacles, 0.02)) {
+      endpointHitKeys.add(hit.nodeId ?? hit.id)
+    }
+    for (const hit of detectHvacClashes([to, to], localObstacles, 0.02)) {
+      endpointHitKeys.add(hit.nodeId ?? hit.id)
+    }
+  }
+  const irreducibleEndpointClashes = endpointHitKeys.size
+
+  const fromInBounds =
+    !xzBounds ||
+    (from[0] >= xzBounds.minX && from[0] <= xzBounds.maxX && from[2] >= xzBounds.minZ && from[2] <= xzBounds.maxZ)
+  const toInBounds =
+    !xzBounds ||
+    (to[0] >= xzBounds.minX && to[0] <= xzBounds.maxX && to[2] >= xzBounds.minZ && to[2] <= xzBounds.maxZ)
+
+  const withinXzBounds = (cand: ReadonlyArray<Vec3>): boolean => {
+    if (!xzBounds) return true
+    for (let i = 0; i < cand.length; i++) {
+      if (i === 0 && !fromInBounds) continue
+      if (i === cand.length - 1 && !toInBounds) continue
+      const p = cand[i]!
+      if (p[0] < xzBounds.minX || p[0] > xzBounds.maxX || p[2] < xzBounds.minZ || p[2] > xzBounds.maxZ) {
+        return false
+      }
+    }
+    return true
+  }
+
+  const isRoofOk = (cand: ReadonlyArray<Vec3>): boolean =>
+    !roofEnvelope?.hasRoofAbove ? true : pathClearOfRoof(cand, roofEnvelope, 0.015, 0.06)
+
   const buildSlopedWithProfile = (
     waypoints: ReadonlyArray<readonly [number, number]>,
     runStartY: number,
     dropAtEnd: boolean,
+    customSlopeRatio = slopeRatio,
   ): Vec3[] => {
     const pts: Vec3[] = [from]
     if (from[1] > runStartY + 0.02) pts.push([from[0], runStartY, from[2]])
@@ -1030,7 +1579,7 @@ export function routeCondensateDrain(params: {
       const leg = Math.hypot(wx - cx, wz - cz)
       const isLast = i === waypoints.length - 1
       if (!isLast && leg < 0.12) continue
-      cy -= leg * slopeRatio
+      cy -= leg * customSlopeRatio
       if (isLast) {
         if (dropAtEnd && cy > to[1] + 0.05) {
           // Run sloped overhead/elevated to exterior termination X/Z, then drop vertically down exterior wall
@@ -1057,10 +1606,15 @@ export function routeCondensateDrain(params: {
     [to[0], to[2]],
   ])
   let best = primary
-  let clashes = detectHvacClashes(primary, obstacles, 0.02)
+  let clashes = checkClashes(primary)
+  let bestRoofOk = isRoofOk(primary)
+  let bestInBounds = withinXzBounds(primary)
   let detoured = false
 
-  if (clashes.length > 0) {
+  const isDone = (): boolean =>
+    bestRoofOk && bestInBounds && clashes.length <= irreducibleEndpointClashes
+
+  if (!isDone()) {
     const waypointSets: Array<ReadonlyArray<readonly [number, number]>> = [
       [
         [from[0], to[2]],
@@ -1126,7 +1680,20 @@ export function routeCondensateDrain(params: {
       )
     }
 
-    const profiles: Array<{ runY: number; dropAtEnd: boolean }> = [{ runY: startY, dropAtEnd: isAtticStart }]
+    const profiles: Array<{ runY: number; dropAtEnd: boolean; slopeRatio?: number }> = [
+      { runY: startY, dropAtEnd: isAtticStart },
+    ]
+    if (roofEnvelope?.hasRoofAbove && isAtticStart && from[1] > roofEnvelope.wallH - 0.04) {
+      // Roof-safe attic drop profile: pitch down below eave ceiling height before approaching exterior eaves
+      const soffitRunY = round2(Math.min(from[1], roofEnvelope.wallH - 0.06))
+      if (soffitRunY > to[1] + 0.08) {
+        profiles.push({ runY: soffitRunY, dropAtEnd: true })
+      }
+      const steeperRatio = Math.max(slopeRatio, (from[1] - (roofEnvelope.wallH - 0.06)) / Math.max(0.8, horizEstimateM * 0.75))
+      if (steeperRatio > slopeRatio + 0.005) {
+        profiles.push({ runY: from[1], dropAtEnd: true, slopeRatio: steeperRatio })
+      }
+    }
     if (!isAtticStart && from[1] > startY + 0.12) {
       // High-start gravity profile: slope gently from coil pan height over low obstacles (e.g., dryer vents,
       // floor pipes, valves) and drop vertically at the exterior discharge wall.
@@ -1139,19 +1706,28 @@ export function routeCondensateDrain(params: {
 
     for (const prof of profiles) {
       for (const wp of waypointSets) {
-        const cand = buildSlopedWithProfile(wp, prof.runY, prof.dropAtEnd)
-        const c = detectHvacClashes(cand, obstacles, 0.02)
-        if (c.length < clashes.length) {
+        const cand = buildSlopedWithProfile(wp, prof.runY, prof.dropAtEnd, prof.slopeRatio ?? slopeRatio)
+        if (xzBounds && !withinXzBounds(cand)) continue
+        const candRoofOk = isRoofOk(cand)
+        if (bestRoofOk && !candRoofOk) continue
+        const c = checkClashes(cand)
+        const better =
+          (!bestInBounds && withinXzBounds(cand)) ||
+          (!bestRoofOk && candRoofOk) ||
+          (candRoofOk === bestRoofOk && c.length < clashes.length)
+        if (better) {
           const slopeCheck = measureCondensateSlope(cand)
           if (!slopeCheck.hasUphillSegment && (slopeCheck.horizontalDistFt < 1.0 || slopeCheck.overallSlopeInPerFt >= 0.125)) {
             best = cand
             clashes = c
+            bestRoofOk = candRoofOk
+            bestInBounds = withinXzBounds(cand)
             detoured = true
-            if (c.length === 0) break
+            if (isDone()) break
           }
         }
       }
-      if (clashes.length === 0) break
+      if (isDone()) break
     }
   }
 
