@@ -12,6 +12,7 @@ import {
   type HvacObstacle,
   detectHvacClashes,
   extractHvacObstacles,
+  measureCondensateSlope,
   polylineLengthM,
   resolveLevelHeightM,
 } from './routing'
@@ -87,7 +88,12 @@ export function auditSceneHvac(
   const ductRuns = all.filter((n) => n.type === 'hvac:duct-run')
   const terminals = all.filter((n) => n.type === 'hvac:terminal')
   const hasElectricalPanel = all.some((n) => n.type === 'electrical:panel')
-  const hasGasPipe = all.some((n) => n.type === 'plumbing:pipe-run' && n.system === 'fuel-gas')
+  const gasPipeLevels = new Set<string>()
+  for (const n of all) {
+    if (n.type === 'plumbing:pipe-run' && n.system === 'fuel-gas') {
+      gasPipeLevels.add(resolveNodeLevelId(nodes, n) ?? '__root__')
+    }
+  }
   const zoneSpec = CLIMATE_ZONES[climateZone] ?? CLIMATE_ZONES['4A']
 
   const obstaclesByLevel = new Map<string, HvacObstacle[]>()
@@ -148,12 +154,13 @@ export function auditSceneHvac(
         nodeIds: [eq.id],
       })
     }
-    if (spec?.usesFuelGas && typeof eq.gasBtuh === 'number' && eq.gasBtuh > 0 && !hasGasPipe) {
+    const eqLevelKey = resolveNodeLevelId(nodes, eq) ?? '__root__'
+    if (spec?.usesFuelGas && typeof eq.gasBtuh === 'number' && eq.gasBtuh > 0 && !gasPipeLevels.has(eqLevelKey)) {
       push({
         severity: 'info',
         codeRef: 'IFGC 402 / Plumbing Coordination',
         title: `Gas furnace (${Math.round(eq.gasBtuh / 1000)} kBTU/h) needs fuel-gas line from Plumbing`,
-        detail: `${eq.name ?? eq.id} specifies ${eq.gasBtuh} BTU/h natural gas input with no plumbing fuel-gas pipe run present yet.`,
+        detail: `${eq.name ?? eq.id} specifies ${eq.gasBtuh} BTU/h natural gas input with no plumbing fuel-gas pipe run on this level yet.`,
         suggestedFix: 'Enable Fuel Gas in Plumbing Auto-Populate or route a sized black-iron/CSST gas line with drip leg.',
         nodeIds: [eq.id],
       })
@@ -233,11 +240,16 @@ export function auditSceneHvac(
       }
     }
 
-    // ACCA Manual D Airflow Velocity check
+    // ACCA Manual D / IMC Airflow Velocity check (supply, return, exhaust, and fresh-air ERV)
     const cfm = typeof run.airflowCfm === 'number' ? run.airflowCfm : 0
     if (
       cfm > 0 &&
-      (system === 'supply-trunk' || system === 'supply-branch' || system === 'return-trunk' || system === 'return-branch')
+      (system === 'supply-trunk' ||
+        system === 'supply-branch' ||
+        system === 'return-trunk' ||
+        system === 'return-branch' ||
+        system === 'exhaust-duct' ||
+        system === 'fresh-air-erv')
     ) {
       const hyd = calculateDuctHydraulics({
         cfm,
@@ -246,6 +258,7 @@ export function auditSceneHvac(
         widthIn,
         heightIn,
         material,
+        system,
         isTrunk: system === 'supply-trunk' || system === 'return-trunk',
         isReturn: system === 'return-trunk' || system === 'return-branch',
         occupancy,
@@ -257,6 +270,48 @@ export function auditSceneHvac(
           title: `Duct velocity (${hyd.velocityFpm} FPM) exceeds ${hyd.maxVelocityFpm} FPM quiet limit`,
           detail: `${run.name ?? run.id} carries ${cfm} CFM at ${hyd.velocityFpm} FPM (${hyd.frictionRateInWgPer100Ft}" wc/100ft), risking noise and static pressure loss.`,
           suggestedFix: 'Upsize duct diameter/width one trade step per ACCA Manual D.',
+          nodeIds: [run.id],
+        })
+      }
+    }
+
+    // IMC 505.4 Domestic kitchen range hood exhaust must use smooth rigid metallic duct (never flex or ductboard)
+    if (system === 'exhaust-duct' && (material === 'flex-r8' || material === 'flex-r6' || material === 'ductboard')) {
+      const srcNode = typeof run.sourceNodeId === 'string' ? nodes[run.sourceNodeId] : undefined
+      const isRangeHood =
+        srcNode?.equipmentKind === 'range-hood' ||
+        (typeof run.name === 'string' && /range\s*hood|kitchen/i.test(run.name))
+      if (isRangeHood) {
+        push({
+          severity: 'error',
+          codeRef: 'IMC 505.4',
+          title: 'Kitchen range hood exhaust uses non-metallic / flexible duct',
+          detail: `${run.name ?? run.id} specifies ${material}; domestic kitchen exhaust ducts must have smooth interior surfaces constructed of galvanized steel, stainless steel, or copper.`,
+          suggestedFix: 'Change kitchen exhaust duct material to galvanized-sheet (smooth rigid metal).',
+          nodeIds: [run.id],
+        })
+      }
+    }
+
+    // IMC 307.2.1 Condensate drain continuous gravity slope (>= 1/8"/ft downward, no uphill segments)
+    if (system === 'condensate-drain' && path.length >= 2) {
+      const slope = measureCondensateSlope(path)
+      if (slope.hasUphillSegment) {
+        push({
+          severity: 'error',
+          codeRef: 'IMC 307.2.1',
+          title: 'Condensate drain pitches uphill (back-pitched)',
+          detail: `${run.name ?? run.id} contains an upward-sloping segment; gravity condensate drains must slope continuously downward (>= 1/8"/ft).`,
+          suggestedFix: 'Re-route condensate line with continuous downward pitch or install a dedicated condensate pump.',
+          nodeIds: [run.id],
+        })
+      } else if (slope.horizontalDistFt >= 1.0 && slope.overallSlopeInPerFt < 0.12) {
+        push({
+          severity: 'error',
+          codeRef: 'IMC 307.2.1',
+          title: `Condensate drain slope (${slope.overallSlopeInPerFt}"/ft) below 1/8"/ft minimum`,
+          detail: `${run.name ?? run.id} slopes ${slope.overallSlopeInPerFt}"/ft across ${slope.horizontalDistFt} ft, below the 0.125"/ft (1%) IMC minimum.`,
+          suggestedFix: 'Increase downward pitch to at least 1/8" to 1/4" per foot along the horizontal run.',
           nodeIds: [run.id],
         })
       }

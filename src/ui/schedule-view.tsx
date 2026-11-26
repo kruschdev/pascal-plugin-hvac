@@ -4,21 +4,13 @@
  */
 
 import { useScene, useViewer } from '@pascal-app/editor'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { DuctBranchAssignment } from '../cad/plenum-cutaway'
 import { auditSceneHvac } from '../imc/audit'
-import {
-  type DuctFramingClearance,
-  type SceneNodeLike,
-  type Vec3,
-  computeDuctFramingClearances,
-  extractHvacFramingContext,
-  resolveNodeLevelId,
-} from '../imc/framing-interop'
+import type { DuctFramingClearance, SceneNodeLike } from '../imc/framing-interop'
 import { buildHvacBom, formatHvacBomCsv } from '../imc/pricing'
-import { extractWallSegments } from '../imc/routing'
+import { collectSceneFramingClearances } from '../imc/routing'
 import { buildHvacSchedule, formatHvacScheduleCsv } from '../imc/schedule'
-import type { DuctShape } from '../imc/tables'
 import AirHandlerCutawayView from './air-handler-cutaway-view'
 import { type HvacScheduleTab, useHvacUi } from './store'
 
@@ -70,26 +62,7 @@ export default function HvacScheduleView() {
 
   const clearances = useMemo<DuctFramingClearance[]>(() => {
     if (activeTab !== 'framing') return []
-    const out: DuctFramingClearance[] = []
-    for (const n of Object.values(record)) {
-      if (n.type !== 'hvac:duct-run' || !Array.isArray(n.path)) continue
-      const lvlId = resolveNodeLevelId(record, n)
-      const walls = extractWallSegments(record, lvlId)
-      const framingContext = extractHvacFramingContext(record, lvlId)
-      out.push(
-        ...computeDuctFramingClearances({
-          ductRunId: n.id,
-          path: n.path as ReadonlyArray<Vec3>,
-          shape: (n.shape as DuctShape) || 'round',
-          widthIn: typeof n.width === 'number' ? n.width : 14,
-          heightIn: typeof n.height === 'number' ? n.height : 8,
-          diameterIn: typeof n.diameter === 'number' ? n.diameter : 6,
-          walls,
-          framingContext,
-        }),
-      )
-    }
-    return out
+    return collectSceneFramingClearances(record)
   }, [record, activeTab])
 
   const indoorUnits = useMemo(
@@ -127,10 +100,21 @@ export default function HvacScheduleView() {
     return out
   }, [record, activeTab])
 
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    }
+  }, [])
+
   const copyCsv = (label: string, csv: string) => {
     navigator.clipboard?.writeText(csv).catch(() => {})
     setCopiedMsg(`Copied ${label} CSV`)
-    setTimeout(() => setCopiedMsg(null), 2000)
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = setTimeout(() => {
+      setCopiedMsg(null)
+      copyTimerRef.current = null
+    }, 2000)
   }
 
   const tabs: ReadonlyArray<[HvacScheduleTab, string]> = [

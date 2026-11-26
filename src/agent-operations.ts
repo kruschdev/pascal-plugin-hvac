@@ -10,16 +10,16 @@ import { refuse } from '@pascal-app/core/agent-tools'
 import { auditSceneHvac } from './imc/audit'
 import { planHvacAutoPopulate } from './imc/autopopulate'
 import {
-  type DuctFramingClearance,
   type SceneNodeLike,
   type Vec3,
+  belongsToLevel,
   computeDuctFramingClearances,
   extractHvacFramingContext,
   getHvacEquipmentElectricalDemand,
-  resolveNodeLevelId,
 } from './imc/framing-interop'
 import { buildHvacBom, formatHvacBomCsv } from './imc/pricing'
 import {
+  collectSceneFramingClearances,
   extractHvacObstacles,
   extractWallSegments,
   resolveLevelHeightM,
@@ -42,6 +42,7 @@ import {
   type HvacSystemType,
   type HvacTerminalKind,
   type OccupancyType,
+  type RefrigerantType,
 } from './imc/tables'
 
 function asRecord(nodes: SceneNodes): Readonly<Record<string, SceneNodeLike>> {
@@ -63,29 +64,6 @@ function deterministicId(prefix: string, nodes: SceneNodes): string {
   return `${prefix}_${idx}`
 }
 
-function collectAllSceneClearances(nodes: Readonly<Record<string, SceneNodeLike>>): DuctFramingClearance[] {
-  const out: DuctFramingClearance[] = []
-  for (const n of Object.values(nodes)) {
-    if (n.type !== 'hvac:duct-run' || !Array.isArray(n.path)) continue
-    const lvlId = resolveNodeLevelId(nodes, n)
-    const walls = extractWallSegments(nodes, lvlId)
-    const framingContext = extractHvacFramingContext(nodes, lvlId)
-    out.push(
-      ...computeDuctFramingClearances({
-        ductRunId: n.id,
-        path: n.path as ReadonlyArray<Vec3>,
-        shape: (n.shape as DuctShape) || 'round',
-        widthIn: typeof n.width === 'number' ? n.width : 14,
-        heightIn: typeof n.height === 'number' ? n.height : 8,
-        diameterIn: typeof n.diameter === 'number' ? n.diameter : 6,
-        walls,
-        framingContext,
-      }),
-    )
-  }
-  return out
-}
-
 export const hvacAgentOperations = {
   hvac_place_equipment: (
     nodes: SceneNodes,
@@ -99,6 +77,7 @@ export const hvacAgentOperations = {
       coolingTons?: number
       gasBtuh?: number
       heatStripKw?: number
+      refrigerant?: RefrigerantType
       occupancy?: OccupancyType
     },
     ctx: AgentContext,
@@ -110,10 +89,11 @@ export const hvacAgentOperations = {
     const id = deterministicId('hvaceq', nodes)
     const tons = input.coolingTons ?? (kind === 'erv-ventilator' || kind === 'bath-exhaust-fan' || kind === 'range-hood' || kind === 'dehumidifier-whole-house' ? 0 : 3)
     const gasBtuh = input.gasBtuh ?? (spec.usesFuelGas ? 60000 : 0)
+    const heatStripKw = input.heatStripKw ?? 10
     const electricalDemand = getHvacEquipmentElectricalDemand({
       kind,
-      coolingTons: tons || 3,
-      heatStripKw: input.heatStripKw ?? 10,
+      coolingTons: tons > 0 ? tons : 3,
+      heatStripKw,
       occupancy: input.occupancy ?? 'residential',
     })
     const pos: [number, number, number] = [
@@ -121,6 +101,14 @@ export const hvacAgentOperations = {
       input.position[1] === 0 && spec.defaultMountY > 0 ? spec.defaultMountY : input.position[1],
       input.position[2],
     ]
+    const heatingBtuh =
+      tons > 0
+        ? Math.round(tons * 12000)
+        : gasBtuh > 0
+          ? Math.round(gasBtuh * 0.95)
+          : kind === 'air-handler'
+            ? Math.round(heatStripKw * 3412)
+            : 0
     const node = {
       object: 'node',
       id,
@@ -134,12 +122,12 @@ export const hvacAgentOperations = {
       equipmentKind: kind,
       roomName: input.roomName ?? 'Mechanical',
       coolingTons: tons,
-      heatingBtuh: tons > 0 ? Math.round(tons * 12000) : Math.round(gasBtuh * 0.95),
+      heatingBtuh,
       gasBtuh,
       airflowCfm: tons > 0 ? Math.round(tons * 400) : kind === 'bath-exhaust-fan' ? 80 : kind === 'range-hood' ? 250 : 120,
       seer2: tons > 0 ? 15.2 : 0,
       hspf2: tons > 0 ? 7.5 : 0,
-      refrigerant: 'R-454B',
+      refrigerant: input.refrigerant ?? 'R-454B',
       hasSecondaryDrainPan: spec.needsCondensate,
       hasFloatSwitch: spec.needsCondensate,
       hasDisconnectWithinSight: true,
@@ -392,6 +380,7 @@ export const hvacAgentOperations = {
       climateZone?: ClimateZone
       systemType?: HvacSystemType
       plenumLocation?: DuctPlenumLocation
+      refrigerant?: RefrigerantType
       includeErv?: boolean
       includeExhaustFans?: boolean
       clearExisting?: boolean
@@ -405,7 +394,7 @@ export const hvacAgentOperations = {
     const baseNodes: Record<string, SceneNodeLike> = { ...asRecord(nodes) }
     if (input.clearExisting !== false) {
       for (const [id, n] of Object.entries(baseNodes)) {
-        if (n.type.startsWith('hvac:') && (!n.parentId || n.parentId === levelId)) {
+        if (n.type.startsWith('hvac:') && belongsToLevel(baseNodes, n, levelId)) {
           deleteIds.push(id)
           delete baseNodes[id]
         }
@@ -419,6 +408,7 @@ export const hvacAgentOperations = {
       climateZone: input.climateZone,
       systemType: input.systemType,
       plenumLocation: input.plenumLocation,
+      refrigerant: input.refrigerant,
       includeErv: input.includeErv,
       includeExhaustFans: input.includeExhaustFans,
     })
@@ -527,7 +517,7 @@ export const hvacAgentOperations = {
       includeInsulation: input.includeInsulation ?? false,
       schedule,
     })
-    const clearances = collectAllSceneClearances(record)
+    const clearances = collectSceneFramingClearances(record)
     return {
       result: {
         schedule,

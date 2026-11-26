@@ -106,6 +106,8 @@ export const hvacChatExtension: PluginChatExtension = {
     hvac_audit_imc: () => import('./ui/chat-card'),
     hvac_generate_schedule: () => import('./ui/chat-card'),
     hvac_route_duct: () => import('./ui/chat-card'),
+    hvac_autopopulate: () => import('./ui/chat-card'),
+    hvac_calculate_loads: () => import('./ui/chat-card'),
   },
   actions: [
     {

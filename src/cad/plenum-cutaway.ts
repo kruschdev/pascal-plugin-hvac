@@ -131,14 +131,16 @@ export function buildWiredAirHandlerCutawayCad(params: {
   supplyTrunk.position.set(0.7, 0.72, 0)
   g.add(supplyTrunk)
 
-  // Supply Branch Collars & Manual Balancing Dampers
+  // Supply Branch Collars & Manual Balancing Dampers (hoisted shared geometries)
   const branchCount = Math.max(3, Math.min(6, branches.filter((b) => b.side === 'supply').length || 4))
+  const branchCollarGeo = new CylinderGeometry(0.06, 0.06, 0.26, 12)
+  const damperHandleGeo = new BoxGeometry(0.06, 0.012, 0.015)
   for (let i = 0; i < branchCount; i++) {
     const x = 0.38 + i * 0.22
-    const collar = new Mesh(new CylinderGeometry(0.06, 0.06, 0.26, 12), pool.supplyBranchCyan)
+    const collar = new Mesh(branchCollarGeo, pool.supplyBranchCyan)
     collar.rotation.x = Math.PI / 2
     collar.position.set(x, 0.72, 0.24)
-    const damperHandle = new Mesh(new BoxGeometry(0.06, 0.012, 0.015), pool.dangerRed)
+    const damperHandle = new Mesh(damperHandleGeo, pool.dangerRed)
     damperHandle.position.set(x, 0.79, 0.2)
     g.add(collar, damperHandle)
   }
@@ -152,8 +154,9 @@ export function buildWiredAirHandlerCutawayCad(params: {
 
   // Joist-bay wooden framing cutaway overhead when in `joist-bay-cutaway` mode
   if (viewMode === 'joist-bay-cutaway') {
+    const joistGeo = new BoxGeometry(0.045, 0.24, 0.85)
     for (let j = -1; j <= 3; j++) {
-      const joist = new Mesh(new BoxGeometry(0.045, 0.24, 0.85), pool.woodJoist)
+      const joist = new Mesh(joistGeo, pool.woodJoist)
       joist.position.set(-0.45 + j * 0.4064, 0.96, 0)
       g.add(joist)
     }

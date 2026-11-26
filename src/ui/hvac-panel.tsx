@@ -20,6 +20,7 @@ import {
   HVAC_TERMINAL_SPECS,
   type HvacDuctSystem,
   type HvacEquipmentKind,
+  type HvacPlenumKind,
   type HvacSystemType,
   type HvacTerminalKind,
   type OccupancyType,
@@ -43,6 +44,7 @@ const QUICK_EQUIPMENT: ReadonlyArray<{ kind: HvacEquipmentKind; label: string }>
   { kind: 'gas-furnace-80', label: '80% Standard Gas Furnace' },
   { kind: 'ac-condenser', label: 'Split AC Condenser (SEER2)' },
   { kind: 'mini-split-outdoor', label: 'Multi-Zone Mini-Split Outdoor' },
+  { kind: 'mini-split-indoor', label: 'Mini-Split Indoor Wall Head' },
   { kind: 'rooftop-package-unit', label: 'Packaged Rooftop Unit (RTU)' },
   { kind: 'erv-ventilator', label: 'ASHRAE 62.2 ERV Ventilator' },
   { kind: 'dehumidifier-whole-house', label: 'Whole-House Ducted Dehumidifier' },
@@ -61,6 +63,13 @@ const QUICK_TERMINALS: ReadonlyArray<{ kind: HvacTerminalKind; label: string }> 
   { kind: 'zone-sensor', label: 'Remote Room Temp / RH Sensor' },
   { kind: 'exhaust-grille', label: 'Exhaust Air Grille' },
   { kind: 'fresh-air-intake', label: 'Exterior Fresh-Air Intake Hood' },
+]
+
+const QUICK_PLENUMS: ReadonlyArray<{ kind: HvacPlenumKind; label: string }> = [
+  { kind: 'supply-plenum', label: 'Insulated Supply Plenum (18"x10")' },
+  { kind: 'return-plenum', label: 'Return Air Plenum + Filter Rack' },
+  { kind: 'mixing-box', label: 'Outdoor Air Mixing Box' },
+  { kind: 'zone-damper-manifold', label: 'Motorized Multi-Zone Damper Manifold' },
 ]
 
 export default function HvacHostPanel() {
@@ -92,6 +101,7 @@ export default function HvacHostPanel() {
   } = useHvacUi()
 
   const [selectedEq, setSelectedEq] = useState<HvacEquipmentKind>('air-handler')
+  const [selectedPlenum, setSelectedPlenum] = useState<HvacPlenumKind>('supply-plenum')
   const [selectedTerm, setSelectedTerm] = useState<HvacTerminalKind>('supply-ceiling-diffuser')
   const [statusMsg, setStatusMsg] = useState<string | null>(null)
 
@@ -178,6 +188,40 @@ export default function HvacHostPanel() {
       createNode(created.node, created.parentId as never)
       setStatusMsg(`Placed ${String(outcome.result.name)}.`)
     }
+  }
+
+  const placePlenum = () => {
+    if (!levelId) {
+      setStatusMsg('Create a building level first before placing plenums.')
+      return
+    }
+    const outcome = hvacAgentOperations.hvac_place_plenum(
+      nodes,
+      { levelId, plenumKind: selectedPlenum, position: [1.0, 1.75, 1.0] },
+      { activeLevelId: levelId },
+    )
+    const created = outcome.changes?.create?.[0]
+    if (created) {
+      createNode(created.node, created.parentId as never)
+      setStatusMsg(`Placed ${String(outcome.result.name)}.`)
+    }
+  }
+
+  const syncFramingCollars = () => {
+    const updates = Object.values(record)
+      .filter((n) => n.type === 'hvac:duct-run' && belongsToLevel(record, n, levelId))
+      .map((n) => ({
+        id: n.id,
+        data: { framingRevision: (typeof n.framingRevision === 'number' ? n.framingRevision : 0) + 1 },
+      }))
+    if (updates.length === 0) {
+      setStatusMsg('No ducts on active level to sync.')
+      return
+    }
+    runAsSingleSceneHistoryStep(useScene, () => {
+      updateNodes(updates as never)
+    })
+    setStatusMsg(`Synced 3D framing collars on ${updates.length} duct run(s).`)
   }
 
   const placeTerminal = () => {
@@ -363,6 +407,22 @@ export default function HvacHostPanel() {
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           <select
+            value={selectedPlenum}
+            onChange={(e) => setSelectedPlenum(e.target.value as HvacPlenumKind)}
+            style={{ ...selectStyle, flex: 1 }}
+          >
+            {QUICK_PLENUMS.map((item) => (
+              <option key={item.kind} value={item.kind}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+          <button type="button" onClick={placePlenum} style={ghostBtnStyle}>
+            + Pln
+          </button>
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <select
             value={selectedTerm}
             onChange={(e) => setSelectedTerm(e.target.value as HvacTerminalKind)}
             style={{ ...selectStyle, flex: 1 }}
@@ -377,16 +437,21 @@ export default function HvacHostPanel() {
             + Term
           </button>
         </div>
-        <button
-          type="button"
-          onClick={() => {
-            setActiveTab('cutaway')
-            openEditorView(HVAC_SCHEDULE_VIEW_ID, { beside: true })
-          }}
-          style={{ ...ghostBtnStyle, width: '100%' }}
-        >
-          Inspect 3D Air Handler &amp; Joist-Bay Cutaway
-        </button>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('cutaway')
+              openEditorView(HVAC_SCHEDULE_VIEW_ID, { beside: true })
+            }}
+            style={{ ...ghostBtnStyle, flex: 1 }}
+          >
+            3D Air Handler Cutaway
+          </button>
+          <button type="button" onClick={syncFramingCollars} style={ghostBtnStyle}>
+            Sync Collars
+          </button>
+        </div>
       </div>
 
       {statusMsg && <div style={{ fontSize: 11, opacity: 0.8 }}>{statusMsg}</div>}

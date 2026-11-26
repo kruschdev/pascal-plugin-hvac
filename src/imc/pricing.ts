@@ -9,6 +9,7 @@ import {
   type ClimateZone,
   type CodeEdition,
   type DuctMaterial,
+  HVAC_EQUIPMENT_SPECS,
   type HvacEquipmentKind,
   type HvacPlenumKind,
   type HvacTerminalKind,
@@ -198,23 +199,41 @@ export function buildHvacBom(
     addLine('Terminals & Controls', p.label, 'ea', qty, p.mat, qty * p.hrs)
   }
 
-  // 5. Fittings, Takeoffs, Mastic, Hangers, Pad, Secondary Pan & Float Switch
+  // 5. Fittings, Takeoffs, Mastic, Hangers, Pads/Disconnects & Secondary Pans scaled to actual equipment counts
   if (totalDuctFt > 0 || eqCounts.size > 0) {
-    const takeoffs = Math.max(branchCount, 2)
+    const takeoffs = Math.max(branchCount, totalDuctFt > 0 ? 2 : 0)
     const hangers = Math.ceil(totalDuctFt / 4)
-    const masticGal = Math.max(1, Math.ceil(totalDuctFt / 50))
-    const hasOutdoor =
+    const masticGal = totalDuctFt > 0 ? Math.max(1, Math.ceil(totalDuctFt / 50)) : 0
+    const outdoorCount =
       (eqCounts.get('heat-pump-condenser') ?? 0) +
-        (eqCounts.get('ac-condenser') ?? 0) +
-        (eqCounts.get('mini-split-outdoor') ?? 0) >
-      0
-    addLine('Fittings & Accessories', 'Start Collars & Manual Balancing Dampers', 'ea', takeoffs, 14, takeoffs * 0.15)
-    addLine('Fittings & Accessories', 'UL-181 Mastic Sealant & Foil Tape', 'gal', masticGal, 28, masticGal * 0.35)
-    addLine('Fittings & Accessories', 'Duct Straps, Saddle Hangers & Screws', 'ea', hangers, 2.2, hangers * 0.04)
-    if (hasOutdoor) {
-      addLine('Fittings & Accessories', 'Composite Condenser Pad, Whip & 60A Disconnect', 'ea', 1, 145, 1.5)
+      (eqCounts.get('ac-condenser') ?? 0) +
+      (eqCounts.get('mini-split-outdoor') ?? 0)
+    let condensateUnitCount = 0
+    for (const [k, qty] of eqCounts) {
+      if (HVAC_EQUIPMENT_SPECS[k]?.needsCondensate) condensateUnitCount += qty
     }
-    addLine('Fittings & Accessories', 'Secondary Condensate Pan, P-Trap & SS2 Float Switch', 'ea', 1, 95, 1.0)
+    if (takeoffs > 0) {
+      addLine('Fittings & Accessories', 'Start Collars & Manual Balancing Dampers', 'ea', takeoffs, 14, takeoffs * 0.15)
+    }
+    if (masticGal > 0) {
+      addLine('Fittings & Accessories', 'UL-181 Mastic Sealant & Foil Tape', 'gal', masticGal, 28, masticGal * 0.35)
+    }
+    if (hangers > 0) {
+      addLine('Fittings & Accessories', 'Duct Straps, Saddle Hangers & Screws', 'ea', hangers, 2.2, hangers * 0.04)
+    }
+    if (outdoorCount > 0) {
+      addLine('Fittings & Accessories', 'Composite Condenser Pad, Whip & 60A Disconnect', 'ea', outdoorCount, 145, outdoorCount * 1.5)
+    }
+    if (condensateUnitCount > 0) {
+      addLine(
+        'Fittings & Accessories',
+        'Secondary Condensate Pan, P-Trap & SS2 Float Switch',
+        'ea',
+        condensateUnitCount,
+        95,
+        condensateUnitCount * 1.0,
+      )
+    }
   }
 
   // 6. Optional IECC Building Envelope & Insulation Takeoff (from ClimaCore)

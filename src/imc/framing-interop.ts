@@ -466,6 +466,7 @@ export function computeDuctFramingClearances(params: {
       const maxJoistHoleIn = floorSystem === 'open-web-truss' ? joistDepthIn - 4.0 : joistDepthIn / 3
       const fitsInJoistWeb = ductHIn <= maxJoistHoleIn
       if (!fitsInJoistWeb && ductHIn >= 6) {
+        const horizLen = Math.hypot(dx, dz) || 1
         out.push({
           id: `${ductRunId}_clr_${seq++}`,
           ductRunId,
@@ -473,7 +474,7 @@ export function computeDuctFramingClearances(params: {
           memberLabel: `Under-Joist Chase / Dropped Soffit (${floorSystem})`,
           position: [(a[0] + b[0]) / 2, midY, (a[2] + b[2]) / 2],
           ductDirection: dir,
-          wallNormal: [0, 1],
+          wallNormal: [dx / horizLen, dz / horizLen],
           openingWidthIn: Math.ceil(ductWIn + 2),
           openingHeightIn: Math.ceil(ductHIn + 2),
           codeCompliant: true,

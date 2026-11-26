@@ -1,7 +1,7 @@
 /**
  * Interactive 3D Air Handler, Supply/Return Plenum & Joist-Bay Ductwork Cutaway (`src/ui/air-handler-cutaway-view.tsx`).
- * HVAC's signature interactive 3D cutaway view inside the split-pane HVAC Schedule.
- * Disposes every BufferGeometry, Material, and WebGLRenderer cleanly on unmount/re-render.
+ * Persists a single WebGLRenderer, Scene, Camera, and orbit angle across scene edits, swapping only
+ * the cutaway model Group when primitive props change, with ResizeObserver and full GPU disposal on unmount.
  */
 
 import { useEffect, useRef } from 'react'
@@ -10,6 +10,7 @@ import {
   type BufferGeometry,
   Color,
   DirectionalLight,
+  type Group,
   type Material,
   Mesh,
   PerspectiveCamera,
@@ -21,6 +22,23 @@ import {
   type HvacCutawayViewMode,
   buildWiredAirHandlerCutawayCad,
 } from '../cad/plenum-cutaway'
+
+function disposeGroup(group: Group): void {
+  const geometries = new Set<BufferGeometry>()
+  const materials = new Set<Material>()
+  group.traverse((obj) => {
+    if (obj instanceof Mesh) {
+      if (obj.geometry) geometries.add(obj.geometry as BufferGeometry)
+      if (Array.isArray(obj.material)) {
+        for (const m of obj.material) materials.add(m as Material)
+      } else if (obj.material) {
+        materials.add(obj.material as Material)
+      }
+    }
+  })
+  for (const geo of geometries) geo.dispose()
+  for (const mat of materials) mat.dispose()
+}
 
 export default function AirHandlerCutawayView({
   coolingTons,
@@ -34,7 +52,16 @@ export default function AirHandlerCutawayView({
   onChangeViewMode: (m: HvacCutawayViewMode) => void
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const sceneRef = useRef<Scene | null>(null)
+  const cameraRef = useRef<PerspectiveCamera | null>(null)
+  const rendererRef = useRef<WebGLRenderer | null>(null)
+  const modelRef = useRef<Group | null>(null)
+  const rotYRef = useRef(-0.22)
 
+  // Primitive supply branch count avoids recreating the cutaway model on unrelated scene edits
+  const supplyBranchCount = branches.filter((b) => b.side === 'supply').length
+
+  // Mount-only WebGLRenderer + ResizeObserver + Orbit Controls
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -60,17 +87,12 @@ export default function AirHandlerCutawayView({
     key.position.set(2.5, 3.5, 4)
     scene.add(key)
 
-    const model = buildWiredAirHandlerCutawayCad({
-      coolingTons,
-      viewMode,
-      branches,
-    })
-    scene.add(model)
+    sceneRef.current = scene
+    cameraRef.current = camera
+    rendererRef.current = renderer
 
     let dragging = false
     let prevX = 0
-    let rotY = -0.22
-    model.rotation.y = rotY
 
     const onDown = (e: PointerEvent) => {
       dragging = true
@@ -78,9 +100,9 @@ export default function AirHandlerCutawayView({
     }
     const onMove = (e: PointerEvent) => {
       if (!dragging) return
-      rotY += (e.clientX - prevX) * 0.01
+      rotYRef.current += (e.clientX - prevX) * 0.01
       prevX = e.clientX
-      model.rotation.y = rotY
+      if (modelRef.current) modelRef.current.rotation.y = rotYRef.current
       renderer.render(scene, camera)
     }
     const onUp = () => {
@@ -90,31 +112,71 @@ export default function AirHandlerCutawayView({
     renderer.domElement.addEventListener('pointerdown', onDown)
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
-    renderer.render(scene, camera)
+
+    const resizeObs =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            const w = Math.max(320, el.clientWidth || 520)
+            camera.aspect = w / height
+            camera.updateProjectionMatrix()
+            renderer.setSize(w, height)
+            renderer.render(scene, camera)
+          })
+        : null
+    resizeObs?.observe(el)
 
     return () => {
+      resizeObs?.disconnect()
       renderer.domElement.removeEventListener('pointerdown', onDown)
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
-      const geometries = new Set<BufferGeometry>()
-      const materials = new Set<Material>()
-      model.traverse((obj) => {
-        if (obj instanceof Mesh) {
-          if (obj.geometry) geometries.add(obj.geometry as BufferGeometry)
-          if (Array.isArray(obj.material)) {
-            for (const m of obj.material) materials.add(m as Material)
-          } else if (obj.material) {
-            materials.add(obj.material as Material)
-          }
-        }
-      })
-      for (const geo of geometries) geo.dispose()
-      for (const mat of materials) mat.dispose()
+      if (modelRef.current) {
+        scene.remove(modelRef.current)
+        disposeGroup(modelRef.current)
+        modelRef.current = null
+      }
       scene.clear()
       renderer.dispose()
+      if (typeof renderer.forceContextLoss === 'function') {
+        renderer.forceContextLoss()
+      }
+      sceneRef.current = null
+      cameraRef.current = null
+      rendererRef.current = null
       el.innerHTML = ''
     }
-  }, [coolingTons, viewMode, branches])
+  }, [])
+
+  // Swap only the cutaway model Group when primitive tonnage, viewMode, or supply branch count changes
+  useEffect(() => {
+    const scene = sceneRef.current
+    const camera = cameraRef.current
+    const renderer = rendererRef.current
+    if (!scene || !camera || !renderer) return
+
+    if (modelRef.current) {
+      scene.remove(modelRef.current)
+      disposeGroup(modelRef.current)
+      modelRef.current = null
+    }
+
+    const syntheticBranches: DuctBranchAssignment[] = Array.from({ length: supplyBranchCount }, (_, i) => ({
+      index: i,
+      label: `Branch ${i + 1}`,
+      cfm: 120,
+      diameterIn: 6,
+      side: 'supply',
+    }))
+    const model = buildWiredAirHandlerCutawayCad({
+      coolingTons,
+      viewMode,
+      branches: syntheticBranches,
+    })
+    model.rotation.y = rotYRef.current
+    scene.add(model)
+    modelRef.current = model
+    renderer.render(scene, camera)
+  }, [coolingTons, viewMode, supplyBranchCount])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>

@@ -9,6 +9,7 @@ import {
   type ClimateZone,
   type DuctMaterial,
   type DuctShape,
+  type HvacDuctSystem,
   type HvacSystemType,
   MAX_DUCT_VELOCITY_FPM,
   type OccupancyType,
@@ -183,6 +184,7 @@ export function calculateDuctHydraulics(params: {
   widthIn?: number
   heightIn?: number
   material?: DuctMaterial
+  system?: HvacDuctSystem
   isTrunk?: boolean
   isReturn?: boolean
   occupancy?: OccupancyType
@@ -202,6 +204,7 @@ export function calculateDuctHydraulics(params: {
     widthIn = 14,
     heightIn = 8,
     material = 'galvanized-sheet',
+    system,
     isTrunk = false,
     isReturn = false,
     occupancy = 'residential',
@@ -214,13 +217,18 @@ export function calculateDuctHydraulics(params: {
   const eqDiamIn = shape === 'round' ? Math.max(2, diameterIn) : rectangularEquivalentDiameterIn(widthIn, heightIn)
 
   const limits = MAX_DUCT_VELOCITY_FPM[occupancy]
-  const maxVelocityFpm = isReturn
-    ? isTrunk
-      ? limits.returnTrunk
-      : limits.returnBranch
-    : isTrunk
-      ? limits.supplyTrunk
-      : limits.supplyBranch
+  const maxVelocityFpm =
+    system === 'exhaust-duct'
+      ? limits.exhaust
+      : system === 'fresh-air-erv'
+        ? limits.freshAir
+        : isReturn || system === 'return-trunk' || system === 'return-branch'
+          ? isTrunk || system === 'return-trunk'
+            ? limits.returnTrunk
+            : limits.returnBranch
+          : isTrunk || system === 'supply-trunk'
+            ? limits.supplyTrunk
+            : limits.supplyBranch
 
   // Roughness multiplier: galvanized sheet = 1.0, ductboard = 1.35, flex duct = 1.65 (ACCA Manual D)
   const roughMult =

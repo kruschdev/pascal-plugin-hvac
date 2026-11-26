@@ -85,15 +85,57 @@ function rot2d(cx: number, cz: number, lx: number, lz: number, rot: number): [nu
 export function getHvacEquipmentPorts(node: HvacEquipmentNode): NodePort[] {
   const [x, y, zPos] = node.position
   const rot = node.rotation ?? 0
-  const spec = HVAC_EQUIPMENT_SPECS[node.equipmentKind as HvacEquipmentKind]
+  const kind = node.equipmentKind as HvacEquipmentKind
+  const spec = HVAC_EQUIPMENT_SPECS[kind]
+  const [wM, hM, dM] = spec?.dimensionsM ?? [0.6, 1.35, 0.6]
+
   if (spec?.isOutdoor) {
-    const [lx, lz] = rot2d(x, zPos, -0.35, 0, rot)
-    return [{ id: 'lineset', position: [lx, y + 0.3, lz], direction: [-Math.cos(rot), 0, Math.sin(rot)], diameter: 1, system: 'refrigerant' }]
+    const [lx, lz] = rot2d(x, zPos, -wM / 2, 0, rot)
+    return [
+      {
+        id: 'lineset',
+        position: [lx, y + Math.min(0.35, hM * 0.35), lz],
+        direction: [-Math.cos(rot), 0, Math.sin(rot)],
+        diameter: 1,
+        system: 'refrigerant',
+      },
+    ]
   }
-  const [rx, rz] = rot2d(x, zPos, -0.3, 0, rot)
+  if (kind === 'mini-split-indoor') {
+    const [bx, bz] = rot2d(x, zPos, 0, -dM / 2, rot)
+    return [
+      {
+        id: 'lineset',
+        position: [bx, y, bz],
+        direction: [-Math.sin(rot), 0, -Math.cos(rot)],
+        diameter: 1,
+        system: 'refrigerant',
+      },
+    ]
+  }
+  if (kind === 'erv-ventilator' || kind === 'dehumidifier-whole-house') {
+    const [lx, lz] = rot2d(x, zPos, -wM / 2, 0, rot)
+    const [rx, rz] = rot2d(x, zPos, wM / 2, 0, rot)
+    return [
+      { id: 'fresh-in', position: [lx, y + hM * 0.5, lz], direction: [-Math.cos(rot), 0, Math.sin(rot)], diameter: 6, system: 'hvac' },
+      { id: 'supply-out', position: [rx, y + hM * 0.5, rz], direction: [Math.cos(rot), 0, -Math.sin(rot)], diameter: 6, system: 'hvac' },
+    ]
+  }
+  if (kind === 'bath-exhaust-fan' || kind === 'range-hood') {
+    return [
+      {
+        id: 'exhaust-out',
+        position: [x, y + hM * 0.5, zPos],
+        direction: [0, 1, 0],
+        diameter: kind === 'range-hood' ? 6 : 4,
+        system: 'hvac',
+      },
+    ]
+  }
+  const [rx, rz] = rot2d(x, zPos, -wM / 2, 0, rot)
   return [
-    { id: 'supply-out', position: [x, y + 1.45, zPos], direction: [0, 1, 0], diameter: 14, system: 'hvac' },
-    { id: 'return-in', position: [rx, y + 0.3, rz], direction: [-Math.cos(rot), 0, Math.sin(rot)], diameter: 14, system: 'hvac' },
+    { id: 'supply-out', position: [x, y + hM, zPos], direction: [0, 1, 0], diameter: 14, system: 'hvac' },
+    { id: 'return-in', position: [rx, y + Math.min(0.35, hM * 0.25), rz], direction: [-Math.cos(rot), 0, Math.sin(rot)], diameter: 14, system: 'hvac' },
   ]
 }
 

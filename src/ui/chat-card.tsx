@@ -15,6 +15,13 @@ export default function HvacChatCard({ toolName, output, state, actions }: ChatT
         manualJ?: { recommendedTons?: number; designTotalCfm?: number; totalCoolingBtuh?: number; totalHeatingBtuh?: number }
       }
     | undefined
+  const directManualJ = data?.manualJ as
+    | { recommendedTons?: number; designTotalCfm?: number; totalCoolingBtuh?: number; totalHeatingBtuh?: number }
+    | undefined
+  const manualJ = scheduleObj?.manualJ ?? directManualJ
+  const autoTons = typeof data?.recommendedTons === 'number' ? data.recommendedTons : null
+  const autoCfm = typeof data?.designTotalCfm === 'number' ? data.designTotalCfm : null
+  const autoSummary = typeof data?.summary === 'string' ? data.summary : null
   const bomObj = data?.bom as { grandTotalUsd?: number; totalLaborHours?: number } | undefined
   const clearances = Array.isArray(data?.clearances) ? data.clearances : null
   const routedNodeId = typeof data?.nodeId === 'string' ? data.nodeId : null
@@ -39,14 +46,29 @@ export default function HvacChatCard({ toolName, output, state, actions }: ChatT
       </div>
       {output?.text && <div style={{ opacity: 0.85 }}>{output.text}</div>}
 
-      {/* Summary for hvac_generate_schedule */}
-      {(scheduleObj || bomObj) && (
+      {/* Summary for hvac_autopopulate */}
+      {(autoSummary || autoTons !== null) && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11 }}>
-          {scheduleObj?.manualJ && (
+          {autoSummary && <div>{autoSummary}</div>}
+          {autoTons !== null && (
             <div>
-              <strong>Manual J:</strong> {scheduleObj.manualJ.recommendedTons ?? 0} Ton ·{' '}
-              {scheduleObj.manualJ.designTotalCfm ?? 0} CFM · Cool{' '}
-              {(scheduleObj.manualJ.totalCoolingBtuh ?? 0).toLocaleString()} BTU/h
+              <strong>Sized System:</strong> {autoTons} Ton{autoCfm !== null ? ` · ${autoCfm} CFM` : ''}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Summary for hvac_generate_schedule & hvac_calculate_loads */}
+      {(manualJ || bomObj) && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11 }}>
+          {manualJ && (
+            <div>
+              <strong>Manual J:</strong> {manualJ.recommendedTons ?? 0} Ton ·{' '}
+              {manualJ.designTotalCfm ?? 0} CFM · Cool{' '}
+              {(manualJ.totalCoolingBtuh ?? 0).toLocaleString()} BTU/h
+              {typeof manualJ.totalHeatingBtuh === 'number'
+                ? ` · Heat ${manualJ.totalHeatingBtuh.toLocaleString()} BTU/h`
+                : ''}
             </div>
           )}
           {bomObj && typeof bomObj.grandTotalUsd === 'number' && (

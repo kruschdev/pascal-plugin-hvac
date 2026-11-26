@@ -38,6 +38,8 @@ describe('Pascal Plugin API v1 Contract, Zod Round-Trip & E-016 Agent Operations
       'hvac_audit_imc',
       'hvac_generate_schedule',
       'hvac_route_duct',
+      'hvac_autopopulate',
+      'hvac_calculate_loads',
     ])
   })
 

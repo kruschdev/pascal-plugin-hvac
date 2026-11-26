@@ -4,7 +4,7 @@
  * Editor-free and React-free: zero React or `@pascal-app/*` imports.
  */
 
-import { BoxGeometry, CylinderGeometry, Group, Mesh, Quaternion, SphereGeometry, Vector3 } from 'three'
+import { BoxGeometry, CylinderGeometry, Group, Matrix4, Mesh, Quaternion, SphereGeometry, Vector3 } from 'three'
 import type { Vec3 } from '../imc/framing-interop'
 import { type DuctMaterial, type DuctShape, type HvacDuctSystem, INCHES_TO_METERS } from '../imc/tables'
 import { createHvacMaterialPool, ductMaterialForSystem } from './materials'
@@ -173,12 +173,13 @@ export function buildDuctRunCad(params: {
   const hM = Math.max(0.04, heightIn * INCHES_TO_METERS)
   const rM = Math.max(0.018, (diameterIn * INCHES_TO_METERS) / 2)
 
-  // Shared unit geometries reused across all segments
+  // Shared unit geometries reused across all segments and collars
   const unitSegGeo =
     shape === 'rectangular'
       ? new BoxGeometry(wM, 1, hM)
       : new CylinderGeometry(rM, rM, 1, 14)
   let jointGeo: SphereGeometry | BoxGeometry | null = null
+  const rotMat = new Matrix4()
 
   for (let i = 1; i < path.length; i++) {
     const a = new Vector3(path[i - 1]![0], path[i - 1]![1], path[i - 1]![2])
@@ -188,7 +189,18 @@ export function buildDuctRunCad(params: {
     if (len < 0.01) continue
 
     const dir = delta.clone().normalize()
-    const quat = new Quaternion().setFromUnitVectors(UP, dir)
+    const quat = new Quaternion()
+    if (shape === 'rectangular' && Math.abs(dir.y) < 0.99) {
+      // Right-handed orthonormal basis (det = +1): local X (wM) horizontal, local Y along dir, local Z (hM) upright
+      const basisX = new Vector3().crossVectors(UP, dir).normalize()
+      const basisZ = new Vector3().crossVectors(basisX, dir).normalize()
+      rotMat.makeBasis(basisX, dir, basisZ)
+      quat.setFromRotationMatrix(rotMat)
+    } else if (dir.y <= -0.99) {
+      quat.setFromAxisAngle(new Vector3(1, 0, 0), Math.PI)
+    } else {
+      quat.setFromUnitVectors(UP, dir)
+    }
     const mid = new Vector3().addVectors(a, b).multiplyScalar(0.5)
 
     const seg = new Mesh(unitSegGeo, mat)
@@ -202,7 +214,7 @@ export function buildDuctRunCad(params: {
     if (i < path.length - 1) {
       jointGeo ??=
         shape === 'rectangular'
-          ? new BoxGeometry(wM * 1.06, Math.max(wM, hM) * 1.04, hM * 1.06)
+          ? new BoxGeometry(wM * 1.04, hM * 1.04, wM * 1.04)
           : new SphereGeometry(rM * 1.08, 12, 10)
       const joint = new Mesh(jointGeo, mat)
       joint.position.copy(b)
@@ -210,18 +222,22 @@ export function buildDuctRunCad(params: {
     }
   }
 
-  // Framing penetration / firestop collars oriented to wallNormal
-  for (const clr of clearances) {
-    const frameW = Math.max(0.08, clr.openingWidthIn * INCHES_TO_METERS)
-    const frameH = Math.max(0.08, clr.openingHeightIn * INCHES_TO_METERS)
-    const collar = new Mesh(
-      new BoxGeometry(frameW, frameH, 0.03),
-      clr.codeCompliant ? pool.galvanizedSheet : pool.dangerRed,
-    )
-    collar.position.set(clr.position[0], clr.position[1], clr.position[2])
-    const [nx, nz] = clr.wallNormal
-    collar.rotation.y = Math.atan2(nx, nz)
-    g.add(collar)
+  // Framing penetration / firestop collars oriented to wallNormal (reusing shared unit box geometry)
+  if (clearances.length > 0) {
+    const unitCollarGeo = new BoxGeometry(1, 1, 1)
+    for (const clr of clearances) {
+      const frameW = Math.max(0.08, clr.openingWidthIn * INCHES_TO_METERS)
+      const frameH = Math.max(0.08, clr.openingHeightIn * INCHES_TO_METERS)
+      const collar = new Mesh(
+        unitCollarGeo,
+        clr.codeCompliant ? pool.galvanizedSheet : pool.dangerRed,
+      )
+      collar.scale.set(frameW, frameH, 0.03)
+      collar.position.set(clr.position[0], clr.position[1], clr.position[2])
+      const [nx, nz] = clr.wallNormal
+      collar.rotation.y = Math.atan2(nx, nz)
+      g.add(collar)
+    }
   }
 
   return g

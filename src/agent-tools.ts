@@ -90,6 +90,7 @@ export const hvacAgentTools: PluginAgentTools = {
         coolingTons: z.number().min(0).max(30).optional(),
         gasBtuh: z.number().min(0).max(500000).optional(),
         heatStripKw: z.number().min(0).max(30).optional(),
+        refrigerant: z.enum(['R-454B', 'R-32', 'R-410A']).optional(),
         occupancy: z.enum(['residential', 'commercial']).default('residential'),
       },
       annotations: { destructiveHint: false, idempotentHint: false },
@@ -167,6 +168,7 @@ export const hvacAgentTools: PluginAgentTools = {
           .enum(['split-heat-pump', 'split-gas-furnace', 'mini-split-multizone', 'rooftop-package'])
           .default('split-heat-pump'),
         plenumLocation: z.enum(['attic', 'crawlspace', 'basement', 'conditioned-soffit']).default('attic'),
+        refrigerant: z.enum(['R-454B', 'R-32', 'R-410A']).optional(),
         includeErv: z.boolean().default(true),
         includeExhaustFans: z.boolean().default(true),
         clearExisting: z.boolean().default(true),

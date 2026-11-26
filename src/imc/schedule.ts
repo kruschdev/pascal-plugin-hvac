@@ -106,8 +106,9 @@ function readHvacElectricalDemand(n: SceneNodeLike): ElectricalPowerDemand | nul
 }
 
 /**
- * Match powered `hvac:equipment` units against same-level `electrical:device` nodes in the scene
- * (exact `mepSourceNodeId` link OR same-level dedicated circuit proximity match).
+ * Match powered `hvac:equipment` units against same-level `electrical:device` nodes in the scene.
+ * Uses two passes (explicit `mepSourceNodeId` link first, then same-level proximity with exact
+ * pole & voltage compatibility) and tracks `claimedDeviceIds` so one device never wires two units.
  */
 export function buildHvacElectricalCoordination(
   nodes: Readonly<Record<string, SceneNodeLike>>,
@@ -123,29 +124,47 @@ export function buildHvacElectricalCoordination(
     }
   }
 
-  const rows: HvacElectricalCoordinationRow[] = []
+  const poweredUnits: Array<{ node: SceneNodeLike; demand: ElectricalPowerDemand }> = []
   for (const n of all) {
     if (n.type !== 'hvac:equipment') continue
     const demand = readHvacElectricalDemand(n)
     if (!demand || !demand.required) continue
+    poweredUnits.push({ node: n, demand })
+  }
 
-    const nodeLevelId = resolveNodeLevelId(nodes, n)
-    const pos = Array.isArray(n.position) && n.position.length >= 3 ? n.position : null
-    let matched: SceneNodeLike | undefined
+  const claimedDeviceIds = new Set<string>()
+  const matchedByUnit = new Map<string, SceneNodeLike>()
 
+  // Pass 1: Explicit `mepSourceNodeId` matches always claim their device first
+  for (const { node: n } of poweredUnits) {
     for (const d of elecDevices) {
+      if (claimedDeviceIds.has(d.id)) continue
       const meta = d.metadata as { mepSourceNodeId?: string } | undefined
       if (d.mepSourceNodeId === n.id || meta?.mepSourceNodeId === n.id) {
-        matched = d
+        matchedByUnit.set(n.id, d)
+        claimedDeviceIds.add(d.id)
         break
       }
+    }
+  }
+
+  // Pass 2: Same-level proximity fallback requiring exact pole count, voltage match, and unclaimed device
+  for (const { node: n, demand } of poweredUnits) {
+    if (matchedByUnit.has(n.id)) continue
+    const nodeLevelId = resolveNodeLevelId(nodes, n)
+    const pos = Array.isArray(n.position) && n.position.length >= 3 ? n.position : null
+    if (!pos) continue
+
+    for (const d of elecDevices) {
+      if (claimedDeviceIds.has(d.id)) continue
       if (resolveNodeLevelId(nodes, d) !== nodeLevelId) continue
       const dPos = Array.isArray(d.position) && d.position.length >= 3 ? d.position : null
-      if (!pos || !dPos) continue
+      if (!dPos) continue
       const dist = Math.hypot(pos[0] - dPos[0], pos[2] - dPos[2])
       const dPoles = typeof d.poles === 'number' ? d.poles : 1
       const dAmps = typeof d.breakerAmps === 'number' ? d.breakerAmps : 15
-      if (dist > 1.8 || dPoles < demand.poles || dAmps < demand.breakerAmps) continue
+      const dVoltage = typeof d.voltage === 'number' ? d.voltage : dPoles >= 2 ? 240 : 120
+      if (dist > 1.8 || dPoles !== demand.poles || dVoltage !== demand.voltage || dAmps < demand.breakerAmps) continue
 
       if (demand.dedicatedCircuit) {
         const isDedicatedKind = d.deviceKind === 'dedicated-240v' || dPoles >= 2
@@ -153,14 +172,19 @@ export function buildHvacElectricalCoordination(
           typeof d.circuitNumber === 'number' && d.circuitNumber > 0
             ? `${String(d.panelId ?? '')}:${d.circuitNumber}`
             : null
-        const isSingleLoad = cktKey !== null && (circuitDeviceCounts.get(cktKey) ?? 0) === 1
-        if (!isDedicatedKind && !isSingleLoad) continue
+        const isSingleLoadCircuit = cktKey !== null && (circuitDeviceCounts.get(cktKey) ?? 0) === 1
+        if (!isDedicatedKind && !isSingleLoadCircuit) continue
       }
-      matched = d
+
+      matchedByUnit.set(n.id, d)
+      claimedDeviceIds.add(d.id)
       break
     }
+  }
 
-    rows.push({
+  return poweredUnits.map(({ node: n, demand }) => {
+    const matched = matchedByUnit.get(n.id)
+    return {
       sourceNodeId: n.id,
       label: demand.label,
       voltage: demand.voltage,
@@ -172,9 +196,8 @@ export function buildHvacElectricalCoordination(
       wired: Boolean(matched),
       matchedElectricalDeviceId: matched?.id,
       matchedCircuitNumber: typeof matched?.circuitNumber === 'number' ? matched.circuitNumber : undefined,
-    })
-  }
-  return rows
+    }
+  })
 }
 
 const scheduleCache = new WeakMap<
@@ -240,10 +263,51 @@ export function buildHvacSchedule(
     hasKitchen,
   })
 
-  const perimeterLf = round2(walls.reduce((s, w) => s + w.lengthM * METERS_TO_FEET, 0))
+  // Estimate true exterior envelope footprint per level (avoid summing interior partition walls or double-counting attic across stories)
+  const levelIds = [...new Set(all.filter((n) => n.type === 'level').map((n) => n.id))]
+  const activeLevelIds = levelIds.length > 0 ? levelIds : [null]
+  let exteriorPerimeterLf = 0
+  let topLevelFootprintSqft = 0
+  let levelsWithGeometry = 0
+
+  for (const lvlId of activeLevelIds) {
+    const lvlRooms = extractRoomPolygons(nodes, lvlId)
+    const lvlWalls = extractWallSegments(nodes, lvlId)
+    if (lvlRooms.length === 0 && lvlWalls.length === 0) continue
+    levelsWithGeometry += 1
+    let minX = Infinity
+    let maxX = -Infinity
+    let minZ = Infinity
+    let maxZ = -Infinity
+    for (const w of lvlWalls) {
+      minX = Math.min(minX, w.start[0], w.end[0])
+      maxX = Math.max(maxX, w.start[0], w.end[0])
+      minZ = Math.min(minZ, w.start[1], w.end[1])
+      maxZ = Math.max(maxZ, w.start[1], w.end[1])
+    }
+    for (const r of lvlRooms) {
+      for (const [x, z] of r.polygon) {
+        minX = Math.min(minX, x)
+        maxX = Math.max(maxX, x)
+        minZ = Math.min(minZ, z)
+        maxZ = Math.max(maxZ, z)
+      }
+    }
+    if (Number.isFinite(minX)) {
+      const perimM = 2 * ((maxX - minX) + (maxZ - minZ))
+      exteriorPerimeterLf += perimM * METERS_TO_FEET
+      const lvlSqft = lvlRooms.reduce((s, r) => s + r.areaSqft, 0)
+      topLevelFootprintSqft = lvlSqft > 0 ? lvlSqft : round2((maxX - minX) * (maxZ - minZ) * 10.763910417)
+    }
+  }
+  const perimeterLf = round2(exteriorPerimeterLf)
   const exteriorWallSqft = round2(perimeterLf * (levelH * METERS_TO_FEET))
+  const atticFootprintSqft =
+    topLevelFootprintSqft > 0
+      ? round2(topLevelFootprintSqft)
+      : round2(manualJ.conditionedSqft / Math.max(1, levelsWithGeometry))
   const insulation = calculateIeccInsulationTakeoff({
-    conditionedSqft: manualJ.conditionedSqft,
+    conditionedSqft: atticFootprintSqft,
     exteriorWallSqft,
     perimeterLf,
     climateZone,
@@ -335,6 +399,23 @@ export function formatHvacScheduleCsv(schedule: HvacSchedule): string {
   const header = ['Room', 'Area (sq ft)', 'Heating (BTU/h)', 'Cooling Sensible', 'Cooling Latent', 'Cooling Total', 'Design CFM', 'Registers']
   const rows = schedule.manualJ.rooms.map((r) =>
     [r.roomName, r.areaSqft, r.heatingBtuh, r.coolingSensibleBtuh, r.coolingLatentBtuh, r.coolingTotalBtuh, r.designCfm, r.recommendedRegisters]
+      .map(csvEscape)
+      .join(','),
+  )
+  const totalSensible = schedule.manualJ.rooms.reduce((s, r) => s + r.coolingSensibleBtuh, 0)
+  const totalLatent = schedule.manualJ.rooms.reduce((s, r) => s + r.coolingLatentBtuh, 0)
+  const totalRegisters = schedule.manualJ.rooms.reduce((s, r) => s + r.recommendedRegisters, 0)
+  rows.push(
+    [
+      `TOTAL (${schedule.manualJ.recommendedTons}-Ton System)`,
+      schedule.manualJ.conditionedSqft,
+      schedule.manualJ.totalHeatingBtuh,
+      totalSensible,
+      totalLatent,
+      schedule.manualJ.totalCoolingBtuh,
+      schedule.manualJ.designTotalCfm,
+      totalRegisters,
+    ]
       .map(csvEscape)
       .join(','),
   )

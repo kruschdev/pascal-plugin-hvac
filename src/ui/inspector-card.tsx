@@ -18,7 +18,7 @@ import {
 } from '../imc/framing-interop'
 import { extractWallSegments, polylineLengthM } from '../imc/routing'
 import { calculateDuctHydraulics } from '../imc/sizing'
-import { type DuctMaterial, type DuctShape, METERS_TO_FEET, round2 } from '../imc/tables'
+import { type DuctMaterial, type DuctShape, type HvacDuctSystem, METERS_TO_FEET, round2 } from '../imc/tables'
 import { HVAC_SCHEDULE_VIEW_ID } from './hvac-panel'
 import { useHvacUi } from './store'
 
@@ -60,6 +60,7 @@ export default function HvacInspectorCard({ node }: { node?: AnyNode }) {
             widthIn,
             heightIn,
             material,
+            system: sys as HvacDuctSystem,
             isTrunk: sys === 'supply-trunk' || sys === 'return-trunk',
             isReturn: sys === 'return-trunk' || sys === 'return-branch',
             occupancy,

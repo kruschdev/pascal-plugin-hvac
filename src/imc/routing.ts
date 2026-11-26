@@ -10,8 +10,16 @@
  * Framework-free: zero React, Three.js, or `@pascal-app/*` imports.
  */
 
-import { type SceneNodeLike, type Vec3, belongsToLevel } from './framing-interop'
-import { INCHES_TO_METERS, METERS_TO_FEET, SQM_TO_SQFT, round2 } from './tables'
+import {
+  type DuctFramingClearance,
+  type SceneNodeLike,
+  type Vec3,
+  belongsToLevel,
+  computeDuctFramingClearances,
+  extractHvacFramingContext,
+  resolveNodeLevelId,
+} from './framing-interop'
+import { type DuctShape, INCHES_TO_METERS, METERS_TO_FEET, SQM_TO_SQFT, round2 } from './tables'
 
 export type Aabb3 = {
   minX: number
@@ -176,10 +184,24 @@ export function polygonAreaAndCentroid(
   return { areaSqm: area, centroid: [cx / (3 * signed), cz / (3 * signed)] }
 }
 
+const roomPolyCache = new WeakMap<
+  Readonly<Record<string, SceneNodeLike>>,
+  Map<string, RoomPolygon2D[]>
+>()
+
 export function extractRoomPolygons(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   levelId: string | null = null,
 ): RoomPolygon2D[] {
+  const key = levelId ?? '__all__'
+  let byLevel = roomPolyCache.get(nodes)
+  if (!byLevel) {
+    byLevel = new Map()
+    roomPolyCache.set(nodes, byLevel)
+  }
+  const cached = byLevel.get(key)
+  if (cached) return cached
+
   const rooms: RoomPolygon2D[] = []
   for (const n of Object.values(nodes)) {
     if ((n.type !== 'zone' && n.type !== 'room') || !belongsToLevel(nodes, n, levelId)) continue
@@ -198,6 +220,7 @@ export function extractRoomPolygons(
       areaSqft: round2(areaSqm * SQM_TO_SQFT),
     })
   }
+  byLevel.set(key, rooms)
   return rooms
 }
 
@@ -227,16 +250,69 @@ function parseNominalIn(raw: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 2
 }
 
+const obstacleCache = new WeakMap<
+  Readonly<Record<string, SceneNodeLike>>,
+  Map<string, HvacObstacle[]>
+>()
+
 /**
  * Extract Priority #1 Structural obstacles, Priority #2 Plumbing obstacles (`plumbing:pipe-run`,
  * `plumbing:equipment`, `plumbing:manifold`), AND NEC 110.26(E) Dedicated Electrical Space columns.
+ * WeakMap-memoized per scene nodes object reference.
  */
 export function extractHvacObstacles(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   levelId: string | null = null,
 ): HvacObstacle[] {
+  const key = levelId ?? '__all__'
+  let byLevel = obstacleCache.get(nodes)
+  if (!byLevel) {
+    byLevel = new Map()
+    obstacleCache.set(nodes, byLevel)
+  }
+  const cached = byLevel.get(key)
+  if (cached) return cached
+
   const obstacles: HvacObstacle[] = []
   const levelH = resolveLevelHeightM(nodes, levelId)
+
+  const pushBeamSubBoxes = (
+    id: string,
+    label: string,
+    sx: number,
+    sz: number,
+    ex: number,
+    ez: number,
+    w: number,
+    y: number,
+    h: number,
+  ) => {
+    const dx = Math.abs(ex - sx)
+    const dz = Math.abs(ez - sz)
+    const isDiagonal = dx > 0.2 && dz > 0.2
+    const steps = isDiagonal ? Math.min(8, Math.max(3, Math.ceil(Math.hypot(dx, dz) / 0.5))) : 1
+    for (let s = 0; s < steps; s++) {
+      const t0 = s / steps
+      const t1 = (s + 1) / steps
+      const x0 = sx + (ex - sx) * t0
+      const z0 = sz + (ez - sz) * t0
+      const x1 = sx + (ex - sx) * t1
+      const z1 = sz + (ez - sz) * t1
+      obstacles.push({
+        id: steps === 1 ? id : `${id}:seg${s}`,
+        category: 'structural',
+        label,
+        box: {
+          minX: Math.min(x0, x1) - w / 2,
+          maxX: Math.max(x0, x1) + w / 2,
+          minY: y - h / 2,
+          maxY: y + h / 2,
+          minZ: Math.min(z0, z1) - w / 2,
+          maxZ: Math.max(z0, z1) + w / 2,
+        },
+      })
+    }
+  }
 
   for (const n of Object.values(nodes)) {
     if (!belongsToLevel(nodes, n, levelId)) continue
@@ -264,19 +340,7 @@ export function extractHvacObstacles(
       const w = (typeof n.widthIn === 'number' ? n.widthIn : 3.5) * INCHES_TO_METERS
       const h = (typeof n.depthIn === 'number' ? n.depthIn : 11.875) * INCHES_TO_METERS
       const y = typeof n.elevationY === 'number' ? Number(n.elevationY) : levelH - h / 2
-      obstacles.push({
-        id: n.id,
-        category: 'structural',
-        label: `Structural beam (${n.name ?? n.id})`,
-        box: {
-          minX: Math.min(sx, ex) - w / 2,
-          maxX: Math.max(sx, ex) + w / 2,
-          minY: y - h / 2,
-          maxY: y + h / 2,
-          minZ: Math.min(sz, ez) - w / 2,
-          maxZ: Math.max(sz, ez) + w / 2,
-        },
-      })
+      pushBeamSubBoxes(n.id, `Structural beam (${n.name ?? n.id})`, sx, sz, ex, ez, w, y, h)
     } else if (n.type === 'column' && pos) {
       const w = typeof n.width === 'number' ? n.width : 0.25
       const d = typeof n.depth === 'number' ? n.depth : 0.25
@@ -295,19 +359,7 @@ export function extractHvacObstacles(
       const w = typeof n.width === 'number' ? n.width : 0.2
       const h = typeof n.height === 'number' ? n.height : 0.3
       const y = typeof n.elevation === 'number' ? Number(n.elevation) : levelH - h / 2
-      obstacles.push({
-        id: n.id,
-        category: 'structural',
-        label: `Beam (${n.name ?? n.id})`,
-        box: {
-          minX: Math.min(sx, ex) - w / 2,
-          maxX: Math.max(sx, ex) + w / 2,
-          minY: y - h / 2,
-          maxY: y + h / 2,
-          minZ: Math.min(sz, ez) - w / 2,
-          maxZ: Math.max(sz, ez) + w / 2,
-        },
-      })
+      pushBeamSubBoxes(n.id, `Beam (${n.name ?? n.id})`, sx, sz, ex, ez, w, y, h)
     } else if (n.type === 'plumbing:pipe-run' && Array.isArray(n.path) && n.path.length >= 2) {
       // 2. Plumbing (Priority #2 — gravity DWV & supply right-of-way)
       // Subdivide diagonal segments into tighter sub-AABBs so angled runs never cast phantom boxes.
@@ -381,6 +433,7 @@ export function extractHvacObstacles(
       })
     }
   }
+  byLevel.set(key, obstacles)
   return obstacles
 }
 
@@ -536,7 +589,36 @@ export function routeHvacDuctRun(params: {
 }
 
 /**
+ * Measure gravity slope on a condensate drain polyline (IMC 307.2.1 requires >= 1/8"/ft downward fall).
+ */
+export function measureCondensateSlope(path: ReadonlyArray<Vec3>): {
+  hasUphillSegment: boolean
+  horizontalDistFt: number
+  overallSlopeInPerFt: number
+} {
+  let hasUphillSegment = false
+  let horizM = 0
+  let totalDropM = 0
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1]!
+    const b = path[i]!
+    const dy = b[1] - a[1]
+    const dh = Math.hypot(b[0] - a[0], b[2] - a[2])
+    if (dy > 0.002) hasUphillSegment = true
+    if (dh >= 0.05) {
+      horizM += dh
+      totalDropM += a[1] - b[1]
+    }
+  }
+  const horizontalDistFt = round2(horizM * METERS_TO_FEET)
+  const overallSlopeInPerFt = horizM > 0.05 ? round2((totalDropM / horizM) * 12) : 0
+  return { hasUphillSegment, horizontalDistFt, overallSlopeInPerFt }
+}
+
+/**
  * Route a gravity-sloped 3/4" PVC condensate drain (IMC 307.2.1 >= 1/8"/ft slope) from evaporator coil to exterior/drain.
+ * Attic units (`from[1] >= 2.2m`) run sloped across the attic plenum to the exterior wall before dropping vertically
+ * so pipes never drop through the middle of living spaces.
  */
 export function routeCondensateDrain(params: {
   from: Vec3
@@ -552,11 +634,18 @@ export function routeCondensateDrain(params: {
   const { from, to, obstacles = [] } = params
   const slopeInPerFt = 0.25
   const slopeRatio = slopeInPerFt / 12
-  const startY = Math.min(from[1], 0.25)
+  const isAtticStart = from[1] >= 2.2
+  const horizEstimateM = Math.abs(to[0] - from[0]) + Math.abs(to[2] - from[2])
+  const minRunStartY = to[1] + horizEstimateM * slopeRatio + 0.02
+  const startY = isAtticStart
+    ? from[1]
+    : from[1] > to[1] + 0.05
+      ? Math.min(from[1], Math.max(0.25, minRunStartY))
+      : from[1]
 
   const buildSloped = (waypoints: ReadonlyArray<readonly [number, number]>): Vec3[] => {
     const pts: Vec3[] = [from]
-    if (from[1] > startY + 0.02) pts.push([from[0], startY, from[2]])
+    if (!isAtticStart && from[1] > startY + 0.02) pts.push([from[0], startY, from[2]])
     let cx = from[0]
     let cz = from[2]
     let cy = startY
@@ -566,11 +655,20 @@ export function routeCondensateDrain(params: {
       const isLast = i === waypoints.length - 1
       if (!isLast && leg < 0.15) continue
       cy -= leg * slopeRatio
-      const y = isLast ? Math.min(to[1], cy) : cy
-      pts.push([wx, y, wz])
+      if (isLast) {
+        if (isAtticStart && cy > to[1] + 0.05) {
+          // Run sloped in attic to exterior termination X/Z, then drop vertically down exterior wall
+          pts.push([wx, cy, wz])
+          pts.push([wx, to[1], wz])
+        } else {
+          const finalY = to[1] <= cy ? to[1] : cy
+          pts.push([wx, finalY, wz])
+        }
+      } else {
+        pts.push([wx, cy, wz])
+      }
       cx = wx
       cz = wz
-      cy = y
     }
     return cleanPath(pts)
   }
@@ -607,4 +705,42 @@ export function routeCondensateDrain(params: {
     detoured,
     clashes,
   }
+}
+
+const sceneClearancesCache = new WeakMap<
+  Readonly<Record<string, SceneNodeLike>>,
+  DuctFramingClearance[]
+>()
+
+/**
+ * Shared WeakMap-memoized helper collecting all framing penetrations & dropped-soffit chases
+ * across every `hvac:duct-run` in the scene.
+ */
+export function collectSceneFramingClearances(
+  nodes: Readonly<Record<string, SceneNodeLike>>,
+): DuctFramingClearance[] {
+  const cached = sceneClearancesCache.get(nodes)
+  if (cached) return cached
+
+  const out: DuctFramingClearance[] = []
+  for (const n of Object.values(nodes)) {
+    if (n.type !== 'hvac:duct-run' || !Array.isArray(n.path)) continue
+    const lvlId = resolveNodeLevelId(nodes, n)
+    const walls = extractWallSegments(nodes, lvlId)
+    const framingContext = extractHvacFramingContext(nodes, lvlId)
+    out.push(
+      ...computeDuctFramingClearances({
+        ductRunId: n.id,
+        path: n.path as ReadonlyArray<Vec3>,
+        shape: (n.shape as DuctShape) || 'round',
+        widthIn: typeof n.width === 'number' ? n.width : 14,
+        heightIn: typeof n.height === 'number' ? n.height : 8,
+        diameterIn: typeof n.diameter === 'number' ? n.diameter : 6,
+        walls,
+        framingContext,
+      }),
+    )
+  }
+  sceneClearancesCache.set(nodes, out)
+  return out
 }

@@ -284,15 +284,16 @@ export function planHvacAutoPopulate(
   const terminals: PlannedHvacTerminalSpec[] = []
   const ductRuns: PlannedHvacDuctRunSpec[] = []
 
-  let eqSeq = 1
-  let plSeq = 1
-  let termSeq = 1
-  let ductSeq = 1
+  const seq = { eq: 1, pl: 1, term: 1, duct: 1 }
+  const allocId = (prefix: string, key: keyof typeof seq) => {
+    while (nodes[`${prefix}_${seq[key]}`]) seq[key] += 1
+    return `${prefix}_${seq[key]++}`
+  }
 
-  const nextEqId = () => `hvaceq_auto_${eqSeq++}`
-  const nextPlId = () => `hvacpl_auto_${plSeq++}`
-  const nextTermId = () => `hvacterm_auto_${termSeq++}`
-  const nextDuctId = () => `hvacduct_auto_${ductSeq++}`
+  const nextEqId = () => allocId('hvaceq_auto', 'eq')
+  const nextPlId = () => allocId('hvacpl_auto', 'pl')
+  const nextTermId = () => allocId('hvacterm_auto', 'term')
+  const nextDuctId = () => allocId('hvacduct_auto', 'duct')
 
   // 1. Place Primary Mechanical Equipment (Indoor Air Handler/Furnace + Outdoor Condenser)
   const mechRoom =
@@ -889,6 +890,61 @@ export function planHvacAutoPopulate(
           frictionRateInWgPer100Ft: exSized.frictionRateInWgPer100Ft,
           insulationR: ductR,
           sourceNodeId: fanId,
+          showFramingClearances: true,
+        })
+      } else if (room.category === 'kitchen') {
+        const hoodId = nextEqId()
+        const hoodPos: Vec3 = [round2(room.centroid[0]), round2(Math.min(levelH - 0.5, 1.78)), round2(room.centroid[1])]
+        const hoodCfm = Math.max(250, ventilation.kitchenExhaustCfm)
+        equipment.push({
+          id: hoodId,
+          name: `${room.name} Range Exhaust Hood (${hoodCfm} CFM)`,
+          equipmentKind: 'range-hood',
+          position: hoodPos,
+          rotation: 0,
+          roomName: room.name,
+          coolingTons: 0,
+          heatingBtuh: 0,
+          gasBtuh: 0,
+          airflowCfm: hoodCfm,
+          seer2: 0,
+          hspf2: 0,
+          refrigerant,
+          hasSecondaryDrainPan: false,
+          hasFloatSwitch: false,
+          hasDisconnectWithinSight: true,
+          electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'range-hood', occupancy }),
+        })
+        const hoodSized = sizeDuctForCfm({
+          cfm: hoodCfm,
+          shape: 'round',
+          material: 'galvanized-sheet',
+          occupancy,
+        })
+        const hoodDiam = Math.max(6, hoodSized.diameterIn)
+        const hoodRoute = routeHvacDuctRun({
+          from: [hoodPos[0], round2(hoodPos[1] + 0.25), hoodPos[2]],
+          to: [round2(room.centroid[0]), round2(levelH + 0.34), round2(bounds.minZ - 0.1)],
+          plenumY: round2(levelH + 0.34),
+          ductHalfSpanM: Math.max(0.08, (hoodDiam * 0.0254) / 2),
+          allowDiagonalBranch: false,
+          obstacles,
+        })
+        ductRuns.push({
+          id: nextDuctId(),
+          name: `${hoodDiam}" Rigid Kitchen Range Hood Exhaust (IMC 505.4)`,
+          system: 'exhaust-duct',
+          shape: 'round',
+          material: 'galvanized-sheet',
+          width: hoodDiam,
+          height: hoodDiam,
+          diameter: hoodDiam,
+          path: hoodRoute.path,
+          airflowCfm: hoodCfm,
+          velocityFpm: hoodSized.velocityFpm,
+          frictionRateInWgPer100Ft: hoodSized.frictionRateInWgPer100Ft,
+          insulationR: ductR,
+          sourceNodeId: hoodId,
           showFramingClearances: true,
         })
       }

@@ -42,9 +42,10 @@ export function buildHvacTerminalCad(params: {
     const frame = new Mesh(new BoxGeometry(w, h, 0.03), pool.enamelWhite)
     g.add(frame)
     const bladeCount = terminalKind === 'return-grille' ? 7 : 3
+    const bladeGeo = new BoxGeometry(w - 0.06, 0.014, 0.024)
     for (let i = 0; i < bladeCount; i++) {
       const y = -h * 0.35 + (i / Math.max(1, bladeCount - 1)) * (h * 0.7)
-      const blade = new Mesh(new BoxGeometry(w - 0.06, 0.014, 0.024), pool.returnViolet)
+      const blade = new Mesh(bladeGeo, pool.returnViolet)
       blade.position.set(0, y, 0.01)
       g.add(blade)
     }
