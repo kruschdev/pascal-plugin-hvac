@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { auditSceneHvac } from '../imc/audit'
 import { planHvacAutoPopulate } from '../imc/autopopulate'
 import { routeHvacDuctRun, type HvacObstacle } from '../imc/routing'
+import { sizeDuctForCfm } from '../imc/sizing'
 import type { SceneNodeLike } from '../imc/framing-interop'
 
 describe('Cross-Trade 4-MEP Coordination Regression Suite (XTRADE-04)', () => {
@@ -195,5 +196,26 @@ describe('Cross-Trade 4-MEP Coordination Regression Suite (XTRADE-04)', () => {
     const audit = auditSceneHvac(fullScene, { climateZone: '4A' })
     expect(audit.errorCount).toBe(0)
     expect(audit.warningCount).toBe(0)
+  })
+
+  test('Large commercial RTU trunks (11,600 CFM supermarket) size up to 72"x36" within commercial velocity caps (XTRADE-25)', () => {
+    const sup = sizeDuctForCfm({
+      cfm: 11600,
+      shape: 'rectangular',
+      isTrunk: true,
+      isReturn: false,
+      occupancy: 'commercial',
+      maxHeightIn: 12,
+    })
+    const ret = sizeDuctForCfm({
+      cfm: 11600,
+      shape: 'rectangular',
+      isTrunk: true,
+      isReturn: true,
+      occupancy: 'commercial',
+      maxHeightIn: 14,
+    })
+    expect(sup.velocityFpm).toBeLessThanOrEqual(1400)
+    expect(ret.velocityFpm).toBeLessThanOrEqual(1100)
   })
 })

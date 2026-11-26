@@ -337,9 +337,12 @@ export function sizeDuctForCfm(params: {
 
   // Rectangular trunk sizing (prefer height <= maxHeightIn, step width in 2" increments, aspect ratio <= 4:1 per Manual D;
   // step height up in 2" increments if airflow exceeds what maxHeightIn can carry quietly).
+  // Large commercial RTU trunks (>4,000 CFM, e.g. supermarkets) allow up to 72"x36".
   const baseHeight = Math.max(6, Math.min(14, Math.floor(maxHeightIn / 2) * 2))
-  for (let height = baseHeight; height <= 24; height += 2) {
-    const maxW = Math.min(48, height * 4)
+  const maxHeightLimit = occupancy === 'commercial' ? 36 : 24
+  const maxWidthCap = occupancy === 'commercial' ? 72 : 48
+  for (let height = baseHeight; height <= maxHeightLimit; height += 2) {
+    const maxW = Math.min(maxWidthCap, height * 4)
     for (let width = Math.max(8, height); width <= maxW; width += 2) {
       const hyd = calculateDuctHydraulics({
         cfm: safeCfm,
@@ -365,8 +368,8 @@ export function sizeDuctForCfm(params: {
     }
   }
 
-  const fallbackW = 48
-  const fallbackH = 24
+  const fallbackW = occupancy === 'commercial' ? 72 : 48
+  const fallbackH = occupancy === 'commercial' ? 36 : 24
   const hyd = calculateDuctHydraulics({
     cfm: safeCfm,
     shape: 'rectangular',
