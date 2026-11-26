@@ -1,0 +1,913 @@
+/**
+ * One-Click IMC / ACCA Manual J-D-S HVAC Auto-Population Planner (`src/imc/autopopulate.ts`).
+ *
+ * Scans live Pascal rooms, walls, and Priority #1/#2 obstacles (Structural, Plumbing, NEC 110.26(E))
+ * to generate a complete, code-compliant 3D HVAC network:
+ *   - Room-by-room ACCA Manual J heating/cooling load & tonnage sizing
+ *   - Air handler / condensing gas furnace + outdoor heat pump / AC condenser (or multi-zone mini-split / RTU)
+ *   - Supply & Return Plenums + sized rectangular main trunks + ACCA Manual D round branches
+ *   - Supply registers/diffusers, central return grille, bedroom transfer grilles, smart thermostat
+ *   - Insulated refrigerant lineset + gravity-sloped 3/4" PVC condensate drain (IMC 307.2)
+ *   - Optional ASHRAE 62.2 ERV + bath/kitchen exhaust fans & ducts
+ *   - Standardized `electricalDemand` metadata for automatic `@kruschdev/pascal-plugin-electrical` breaker allocation
+ *
+ * Framework-free: zero React, Three.js, or `@pascal-app/*` imports.
+ */
+
+import {
+  type ElectricalPowerDemand,
+  type SceneNodeLike,
+  type Vec3,
+  getHvacEquipmentElectricalDemand,
+} from './framing-interop'
+import {
+  extractHvacObstacles,
+  extractRoomPolygons,
+  extractWallSegments,
+  resolveLevelHeightM,
+  routeCondensateDrain,
+  routeHvacDuctRun,
+} from './routing'
+import {
+  calculateAshrae622Ventilation,
+  calculateManualJLoad,
+  sizeDuctForCfm,
+  sizeHvacEquipment,
+} from './sizing'
+import {
+  CLIMATE_ZONES,
+  type ClimateZone,
+  type CodeEdition,
+  type DuctMaterial,
+  type DuctPlenumLocation,
+  type DuctShape,
+  HVAC_EQUIPMENT_SPECS,
+  HVAC_TERMINAL_SPECS,
+  type HvacDuctSystem,
+  type HvacEquipmentKind,
+  type HvacPlenumKind,
+  type HvacSystemType,
+  type HvacTerminalKind,
+  type OccupancyType,
+  type RefrigerantType,
+  round2,
+} from './tables'
+
+export type HvacAutoPopulateOptions = {
+  levelId?: string | null
+  codeEdition?: CodeEdition
+  occupancy?: OccupancyType
+  climateZone?: ClimateZone
+  systemType?: HvacSystemType
+  plenumLocation?: DuctPlenumLocation
+  refrigerant?: RefrigerantType
+  wallR?: number
+  atticR?: number
+  includeErv?: boolean
+  includeExhaustFans?: boolean
+}
+
+export type PlannedHvacEquipmentSpec = {
+  id: string
+  name: string
+  equipmentKind: HvacEquipmentKind
+  position: Vec3
+  rotation: number
+  roomName: string
+  coolingTons: number
+  heatingBtuh: number
+  gasBtuh: number
+  airflowCfm: number
+  seer2: number
+  hspf2: number
+  refrigerant: RefrigerantType
+  hasSecondaryDrainPan: boolean
+  hasFloatSwitch: boolean
+  hasDisconnectWithinSight: boolean
+  electricalDemand: ElectricalPowerDemand
+}
+
+export type PlannedHvacPlenumSpec = {
+  id: string
+  name: string
+  plenumKind: HvacPlenumKind
+  position: Vec3
+  rotation: number
+  widthIn: number
+  heightIn: number
+  depthIn: number
+  airflowCfm: number
+  staticPressureInWg: number
+  insulationR: number
+}
+
+export type PlannedHvacTerminalSpec = {
+  id: string
+  name: string
+  terminalKind: HvacTerminalKind
+  position: Vec3
+  rotation: number
+  roomName: string
+  designCfm: number
+  neckSizeIn: number
+  throwFt: number
+}
+
+export type PlannedHvacDuctRunSpec = {
+  id: string
+  name: string
+  system: HvacDuctSystem
+  shape: DuctShape
+  material: DuctMaterial
+  width: number
+  height: number
+  diameter: number
+  path: Vec3[]
+  airflowCfm: number
+  velocityFpm: number
+  frictionRateInWgPer100Ft: number
+  insulationR: number
+  sourceNodeId?: string
+  targetNodeId?: string
+  showFramingClearances: boolean
+}
+
+export type HvacAutoPopulatePlan = {
+  levelId: string | null
+  codeEdition: CodeEdition
+  climateZone: ClimateZone
+  systemType: HvacSystemType
+  plenumLocation: DuctPlenumLocation
+  load: ReturnType<typeof calculateManualJLoad>
+  equipmentSpec: ReturnType<typeof sizeHvacEquipment>
+  ventilation: ReturnType<typeof calculateAshrae622Ventilation>
+  equipment: PlannedHvacEquipmentSpec[]
+  plenums: PlannedHvacPlenumSpec[]
+  terminals: PlannedHvacTerminalSpec[]
+  ductRuns: PlannedHvacDuctRunSpec[]
+  summary: string
+}
+
+function nearestPointOnSpine(spine: ReadonlyArray<Vec3>, x: number, z: number, fallbackY: number): Vec3 {
+  let bestPt: Vec3 = spine[0] ?? [x, fallbackY, z]
+  let bestDist = Infinity
+  for (let i = 1; i < spine.length; i++) {
+    const a = spine[i - 1]!
+    const b = spine[i]!
+    const dx = b[0] - a[0]
+    const dz = b[2] - a[2]
+    const lenSq = dx * dx + dz * dz
+    if (lenSq < 1e-4) continue
+    const t = Math.max(0, Math.min(1, ((x - a[0]) * dx + (z - a[2]) * dz) / lenSq))
+    const px = a[0] + dx * t
+    const py = a[1] + (b[1] - a[1]) * t
+    const pz = a[2] + dz * t
+    const d = Math.hypot(x - px, z - pz)
+    if (d < bestDist) {
+      bestDist = d
+      bestPt = [round2(px), round2(py), round2(pz)]
+    }
+  }
+  return bestPt
+}
+
+function sceneBounds(
+  walls: ReadonlyArray<{ start: readonly [number, number]; end: readonly [number, number] }>,
+  rooms: ReadonlyArray<{ polygon: ReadonlyArray<readonly [number, number]> }>,
+) {
+  let minX = Infinity
+  let maxX = -Infinity
+  let minZ = Infinity
+  let maxZ = -Infinity
+  for (const w of walls) {
+    minX = Math.min(minX, w.start[0], w.end[0])
+    maxX = Math.max(maxX, w.start[0], w.end[0])
+    minZ = Math.min(minZ, w.start[1], w.end[1])
+    maxZ = Math.max(maxZ, w.start[1], w.end[1])
+  }
+  for (const r of rooms) {
+    for (const [x, z] of r.polygon) {
+      minX = Math.min(minX, x)
+      maxX = Math.max(maxX, x)
+      minZ = Math.min(minZ, z)
+      maxZ = Math.max(maxZ, z)
+    }
+  }
+  if (!Number.isFinite(minX)) return { minX: 0, maxX: 10, minZ: 0, maxZ: 8, cx: 5, cz: 4 }
+  return { minX, maxX, minZ, maxZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2 }
+}
+
+/**
+ * Generate a complete IMC / ACCA Manual J-D-S HVAC layout plan from live Pascal geometry.
+ */
+export function planHvacAutoPopulate(
+  nodes: Readonly<Record<string, SceneNodeLike>>,
+  options: HvacAutoPopulateOptions = {},
+): HvacAutoPopulatePlan {
+  const all = Object.values(nodes)
+  const levelId = options.levelId ?? all.find((n) => n.type === 'level')?.id ?? null
+  const codeEdition: CodeEdition = options.codeEdition ?? 'IMC-2021'
+  const occupancy: OccupancyType = options.occupancy ?? 'residential'
+  const climateZone: ClimateZone = options.climateZone ?? '4A'
+  const systemType: HvacSystemType = options.systemType ?? 'split-heat-pump'
+  const plenumLocation: DuctPlenumLocation = options.plenumLocation ?? 'attic'
+  const refrigerant: RefrigerantType = options.refrigerant ?? 'R-454B'
+  const includeErv = options.includeErv ?? true
+  const includeExhaustFans = options.includeExhaustFans ?? true
+
+  const zoneMeta = CLIMATE_ZONES[climateZone] ?? CLIMATE_ZONES['4A']
+  const wallR = options.wallR ?? zoneMeta.ieccWallR
+  const atticR = options.atticR ?? zoneMeta.ieccAtticR
+  const ductR = plenumLocation === 'attic' ? zoneMeta.ieccAtticDuctR : zoneMeta.ieccCrawlDuctR
+
+  const walls = extractWallSegments(nodes, levelId)
+  const rawRooms = extractRoomPolygons(nodes, levelId)
+  const levelH = resolveLevelHeightM(nodes, levelId)
+  const obstacles = extractHvacObstacles(nodes, levelId)
+  const bounds = sceneBounds(walls, rawRooms)
+
+  // Synthesize a fallback room if scene has walls/bounds without explicit room polygons
+  const rooms =
+    rawRooms.length > 0
+      ? rawRooms
+      : [
+          {
+            id: 'room_default',
+            name: 'Main Conditioned Zone',
+            category: 'living' as const,
+            polygon: [
+              [bounds.minX, bounds.minZ],
+              [bounds.maxX, bounds.minZ],
+              [bounds.maxX, bounds.maxZ],
+              [bounds.minX, bounds.maxZ],
+            ],
+            centroid: [bounds.cx, bounds.cz] as const,
+            areaSqm: Math.max(40, (bounds.maxX - bounds.minX) * (bounds.maxZ - bounds.minZ)),
+            areaSqft: round2(Math.max(40, (bounds.maxX - bounds.minX) * (bounds.maxZ - bounds.minZ)) * 10.7639),
+          },
+        ]
+
+  const load = calculateManualJLoad({
+    rooms: rooms.map((r) => ({
+      id: r.id,
+      name: r.name,
+      category: r.category,
+      areaSqft: r.areaSqft,
+      ceilingHeightFt: round2(levelH * 3.28084),
+    })),
+    climateZone,
+    occupancy,
+    wallR,
+    atticR,
+  })
+
+  const equipmentSpec = sizeHvacEquipment({
+    coolingTons: load.recommendedTons,
+    heatingBtuh: load.totalHeatingBtuh,
+    systemType,
+    refrigerant,
+    climateZone,
+  })
+
+  const bedrooms = Math.max(1, rooms.filter((r) => r.category === 'bedroom').length)
+  const bathrooms = rooms.filter((r) => r.category === 'bathroom').length
+  const hasKitchen = rooms.some((r) => r.category === 'kitchen')
+  const ventilation = calculateAshrae622Ventilation({
+    conditionedSqft: Math.max(400, load.conditionedSqft),
+    bedrooms,
+    bathrooms,
+    hasKitchen,
+  })
+
+  const equipment: PlannedHvacEquipmentSpec[] = []
+  const plenums: PlannedHvacPlenumSpec[] = []
+  const terminals: PlannedHvacTerminalSpec[] = []
+  const ductRuns: PlannedHvacDuctRunSpec[] = []
+
+  let eqSeq = 1
+  let plSeq = 1
+  let termSeq = 1
+  let ductSeq = 1
+
+  const nextEqId = () => `hvaceq_auto_${eqSeq++}`
+  const nextPlId = () => `hvacpl_auto_${plSeq++}`
+  const nextTermId = () => `hvacterm_auto_${termSeq++}`
+  const nextDuctId = () => `hvacduct_auto_${ductSeq++}`
+
+  // 1. Place Primary Mechanical Equipment (Indoor Air Handler/Furnace + Outdoor Condenser)
+  const mechRoom =
+    rooms.find((r) => r.category === 'utility' || r.category === 'laundry' || r.category === 'garage') ??
+    rooms.find((r) => r.category === 'hallway') ??
+    rooms[0]!
+
+  const indoorPos: Vec3 = [round2(mechRoom.centroid[0]), 0, round2(mechRoom.centroid[1])]
+  const outdoorPos: Vec3 = [round2(bounds.maxX + 0.95), 0, round2(indoorPos[2])]
+  const plenumY =
+    plenumLocation === 'attic'
+      ? round2(levelH + 0.28)
+      : plenumLocation === 'conditioned-soffit'
+        ? round2(levelH - 0.22)
+        : -0.26
+
+  const indoorKind: HvacEquipmentKind =
+    systemType === 'split-gas-furnace'
+      ? 'gas-furnace-96'
+      : systemType === 'mini-split-multizone'
+        ? 'mini-split-outdoor'
+        : systemType === 'rooftop-package'
+          ? 'rooftop-package-unit'
+          : 'air-handler'
+
+  const indoorId = nextEqId()
+  let outdoorId = indoorId
+
+  if (systemType === 'split-heat-pump' || systemType === 'split-gas-furnace') {
+    const heatStripKw = systemType === 'split-heat-pump' ? (load.recommendedTons <= 2.5 ? 5 : 10) : 0
+    equipment.push({
+      id: indoorId,
+      name: `${HVAC_EQUIPMENT_SPECS[indoorKind].label} (${load.recommendedTons}-Ton)`,
+      equipmentKind: indoorKind,
+      position: indoorPos,
+      rotation: 0,
+      roomName: mechRoom.name,
+      coolingTons: load.recommendedTons,
+      heatingBtuh: equipmentSpec.heatingOutputBtuh,
+      gasBtuh: equipmentSpec.furnaceInputBtuh,
+      airflowCfm: load.designTotalCfm,
+      seer2: equipmentSpec.minSeer2,
+      hspf2: equipmentSpec.minHspf2,
+      refrigerant,
+      hasSecondaryDrainPan: true,
+      hasFloatSwitch: true,
+      hasDisconnectWithinSight: true,
+      electricalDemand: getHvacEquipmentElectricalDemand({
+        kind: indoorKind,
+        coolingTons: load.recommendedTons,
+        heatStripKw,
+        occupancy,
+      }),
+    })
+
+    const outdoorKind: HvacEquipmentKind =
+      systemType === 'split-gas-furnace' ? 'ac-condenser' : 'heat-pump-condenser'
+    outdoorId = nextEqId()
+    equipment.push({
+      id: outdoorId,
+      name: `${HVAC_EQUIPMENT_SPECS[outdoorKind].label} (${load.recommendedTons}-Ton, ${equipmentSpec.minSeer2} SEER2)`,
+      equipmentKind: outdoorKind,
+      position: outdoorPos,
+      rotation: 0,
+      roomName: 'Exterior Pad',
+      coolingTons: load.recommendedTons,
+      heatingBtuh: systemType === 'split-heat-pump' ? equipmentSpec.heatingOutputBtuh : 0,
+      gasBtuh: 0,
+      airflowCfm: 0,
+      seer2: equipmentSpec.minSeer2,
+      hspf2: equipmentSpec.minHspf2,
+      refrigerant,
+      hasSecondaryDrainPan: false,
+      hasFloatSwitch: false,
+      hasDisconnectWithinSight: true,
+      electricalDemand: getHvacEquipmentElectricalDemand({
+        kind: outdoorKind,
+        coolingTons: load.recommendedTons,
+        occupancy,
+      }),
+    })
+
+    // Insulated Copper Refrigerant Lineset (Indoor Coil -> Outdoor Condenser)
+    const linesetRoute = routeHvacDuctRun({
+      from: [indoorPos[0] + 0.22, 1.15, indoorPos[2]],
+      to: [outdoorPos[0] - 0.35, 0.35, outdoorPos[2]],
+      plenumY: plenumLocation === 'attic' ? round2(levelH + 0.12) : -0.18,
+      ductHalfSpanM: 0.03,
+      allowDiagonalBranch: false,
+      obstacles,
+    })
+    ductRuns.push({
+      id: nextDuctId(),
+      name: `Refrigerant Lineset (${equipmentSpec.liquidLineIn} / ${equipmentSpec.suctionLineIn} ${refrigerant})`,
+      system: 'refrigerant-lineset',
+      shape: 'round',
+      material: 'insulated-copper',
+      width: 2,
+      height: 2,
+      diameter: 2,
+      path: linesetRoute.path,
+      airflowCfm: 0,
+      velocityFpm: 0,
+      frictionRateInWgPer100Ft: 0,
+      insulationR: 4,
+      sourceNodeId: indoorId,
+      targetNodeId: outdoorId,
+      showFramingClearances: true,
+    })
+
+    // Sloped 3/4" PVC Condensate Drain (IMC 307.2)
+    const condExitPos: Vec3 = [round2(bounds.maxX + 0.15), 0.05, round2(indoorPos[2] + 0.4)]
+    const condRoute = routeCondensateDrain({
+      from: [indoorPos[0] + 0.25, 0.95, indoorPos[2] + 0.1],
+      to: condExitPos,
+      obstacles,
+    })
+    ductRuns.push({
+      id: nextDuctId(),
+      name: '3/4" PVC Condensate Drain (IMC 307.2)',
+      system: 'condensate-drain',
+      shape: 'round',
+      material: 'pvc-condensate',
+      width: 1,
+      height: 1,
+      diameter: 1,
+      path: condRoute.path,
+      airflowCfm: 0,
+      velocityFpm: 0,
+      frictionRateInWgPer100Ft: 0,
+      insulationR: 0,
+      sourceNodeId: indoorId,
+      showFramingClearances: true,
+    })
+  } else if (systemType === 'rooftop-package') {
+    const rtuPos: Vec3 = [round2(bounds.cx), round2(levelH + 0.15), round2(bounds.cz)]
+    equipment.push({
+      id: indoorId,
+      name: `Packaged RTU (${load.recommendedTons}-Ton)`,
+      equipmentKind: 'rooftop-package-unit',
+      position: rtuPos,
+      rotation: 0,
+      roomName: 'Roof Curb',
+      coolingTons: load.recommendedTons,
+      heatingBtuh: equipmentSpec.heatingOutputBtuh,
+      gasBtuh: 0,
+      airflowCfm: load.designTotalCfm,
+      seer2: equipmentSpec.minSeer2,
+      hspf2: equipmentSpec.minHspf2,
+      refrigerant,
+      hasSecondaryDrainPan: true,
+      hasFloatSwitch: true,
+      hasDisconnectWithinSight: true,
+      electricalDemand: getHvacEquipmentElectricalDemand({
+        kind: 'rooftop-package-unit',
+        coolingTons: load.recommendedTons,
+        occupancy,
+      }),
+    })
+  } else {
+    // Ductless multi-zone mini-split outdoor unit
+    equipment.push({
+      id: indoorId,
+      name: `Multi-Zone Mini-Split Outdoor (${load.recommendedTons}-Ton)`,
+      equipmentKind: 'mini-split-outdoor',
+      position: outdoorPos,
+      rotation: 0,
+      roomName: 'Exterior Pad',
+      coolingTons: load.recommendedTons,
+      heatingBtuh: equipmentSpec.heatingOutputBtuh,
+      gasBtuh: 0,
+      airflowCfm: 0,
+      seer2: Math.max(18, equipmentSpec.minSeer2),
+      hspf2: Math.max(9.5, equipmentSpec.minHspf2),
+      refrigerant,
+      hasSecondaryDrainPan: false,
+      hasFloatSwitch: false,
+      hasDisconnectWithinSight: true,
+      electricalDemand: getHvacEquipmentElectricalDemand({
+        kind: 'mini-split-outdoor',
+        coolingTons: load.recommendedTons,
+        occupancy,
+      }),
+    })
+  }
+
+  // 2. Ducted Supply/Return Plenums, Main Trunks, Branches, & Terminals (or Mini-Split Wall Heads)
+  const conditionedRooms = load.rooms
+    .map((rr) => ({
+      loadRow: rr,
+      room: rooms.find((r) => r.id === rr.roomId)!,
+    }))
+    .filter((entry) => Boolean(entry.room))
+
+  if (systemType === 'mini-split-multizone') {
+    for (const { loadRow, room } of conditionedRooms) {
+      if (room.category === 'bathroom' || room.category === 'hallway' || room.category === 'utility') continue
+      const headId = nextTermId()
+      const headPos: Vec3 = [round2(room.centroid[0]), round2(Math.min(levelH - 0.35, 2.15)), round2(room.centroid[1])]
+      terminals.push({
+        id: headId,
+        name: `${room.name} Mini-Split Head (${loadRow.designCfm} CFM)`,
+        terminalKind: 'mini-split-wall-head',
+        position: headPos,
+        rotation: 0,
+        roomName: room.name,
+        designCfm: loadRow.designCfm,
+        neckSizeIn: 0,
+        throwFt: 18,
+      })
+      const lineRoute = routeHvacDuctRun({
+        from: [outdoorPos[0] - 0.25, 0.45, outdoorPos[2]],
+        to: headPos,
+        plenumY: round2(levelH + 0.12),
+        ductHalfSpanM: 0.03,
+        allowDiagonalBranch: true,
+        obstacles,
+      })
+      ductRuns.push({
+        id: nextDuctId(),
+        name: `Mini-Split Lineset (${room.name})`,
+        system: 'refrigerant-lineset',
+        shape: 'round',
+        material: 'insulated-copper',
+        width: 2,
+        height: 2,
+        diameter: 2,
+        path: lineRoute.path,
+        airflowCfm: 0,
+        velocityFpm: 0,
+        frictionRateInWgPer100Ft: 0,
+        insulationR: 4,
+        sourceNodeId: indoorId,
+        targetNodeId: headId,
+        showFramingClearances: true,
+      })
+    }
+  } else {
+    // Ducted Supply & Return Plenums + ACCA Manual D Trunks + Branches
+    const supplyTrunkSize = sizeDuctForCfm({
+      cfm: load.designTotalCfm,
+      shape: 'rectangular',
+      material: 'galvanized-sheet',
+      isTrunk: true,
+      isReturn: false,
+      occupancy,
+      maxHeightIn: 8,
+    })
+    const returnTrunkSize = sizeDuctForCfm({
+      cfm: load.designTotalCfm,
+      shape: 'rectangular',
+      material: 'galvanized-sheet',
+      isTrunk: true,
+      isReturn: true,
+      occupancy,
+      maxHeightIn: 10,
+    })
+
+    const supplyPlenumId = nextPlId()
+    const supplyPlenumPos: Vec3 = [indoorPos[0], round2(Math.min(levelH - 0.1, 1.72)), indoorPos[2]]
+    plenums.push({
+      id: supplyPlenumId,
+      name: `Supply Plenum (${supplyTrunkSize.widthIn}"x${supplyTrunkSize.heightIn}")`,
+      plenumKind: 'supply-plenum',
+      position: supplyPlenumPos,
+      rotation: 0,
+      widthIn: supplyTrunkSize.widthIn,
+      heightIn: supplyTrunkSize.heightIn,
+      depthIn: 24,
+      airflowCfm: load.designTotalCfm,
+      staticPressureInWg: 0.25,
+      insulationR: ductR,
+    })
+
+    const returnPlenumId = nextPlId()
+    const returnPlenumPos: Vec3 = [round2(indoorPos[0] - 0.35), 0.25, indoorPos[2]]
+    plenums.push({
+      id: returnPlenumId,
+      name: `Return Plenum (${returnTrunkSize.widthIn}"x${returnTrunkSize.heightIn}")`,
+      plenumKind: 'return-plenum',
+      position: returnPlenumPos,
+      rotation: 0,
+      widthIn: returnTrunkSize.widthIn,
+      heightIn: returnTrunkSize.heightIn,
+      depthIn: 24,
+      airflowCfm: load.designTotalCfm,
+      staticPressureInWg: -0.2,
+      insulationR: ductR,
+    })
+
+    // Main Supply Trunk Spine from Supply Plenum to furthest conditioned room
+    const furthestRoom = conditionedRooms.reduce(
+      (far, entry) => {
+        const dFar = Math.hypot(far.room.centroid[0] - indoorPos[0], far.room.centroid[1] - indoorPos[2])
+        const dCur = Math.hypot(entry.room.centroid[0] - indoorPos[0], entry.room.centroid[1] - indoorPos[2])
+        return dCur > dFar ? entry : far
+      },
+      conditionedRooms[0] ?? { room: rooms[0]!, loadRow: { designCfm: load.designTotalCfm } },
+    )
+
+    const trunkRoute = routeHvacDuctRun({
+      from: supplyPlenumPos,
+      to: [round2(furthestRoom.room.centroid[0]), plenumY, round2(furthestRoom.room.centroid[1])],
+      plenumY,
+      ductHalfSpanM: Math.max(0.12, (supplyTrunkSize.widthIn * 0.0254) / 2),
+      allowDiagonalBranch: false,
+      obstacles,
+    })
+    const supplyTrunkId = nextDuctId()
+    ductRuns.push({
+      id: supplyTrunkId,
+      name: `${supplyTrunkSize.widthIn}"x${supplyTrunkSize.heightIn}" Main Supply Trunk (${load.designTotalCfm} CFM)`,
+      system: 'supply-trunk',
+      shape: 'rectangular',
+      material: 'galvanized-sheet',
+      width: supplyTrunkSize.widthIn,
+      height: supplyTrunkSize.heightIn,
+      diameter: supplyTrunkSize.diameterIn,
+      path: trunkRoute.path,
+      airflowCfm: load.designTotalCfm,
+      velocityFpm: supplyTrunkSize.velocityFpm,
+      frictionRateInWgPer100Ft: supplyTrunkSize.frictionRateInWgPer100Ft,
+      insulationR: ductR,
+      sourceNodeId: supplyPlenumId,
+      showFramingClearances: true,
+    })
+
+    const supplyTermKind: HvacTerminalKind =
+      plenumLocation === 'attic' || plenumLocation === 'conditioned-soffit'
+        ? 'supply-ceiling-diffuser'
+        : 'supply-floor-register'
+    const termY =
+      supplyTermKind === 'supply-ceiling-diffuser' ? round2(levelH - 0.03) : HVAC_TERMINAL_SPECS[supplyTermKind].defaultMountY
+
+    // Place room supply registers + tap Manual D round branches from nearest trunk spine point
+    for (const { loadRow, room } of conditionedRooms) {
+      const regCount = loadRow.recommendedRegisters
+      const cfmEach = Math.max(40, Math.round(loadRow.designCfm / regCount))
+      const branchSized = sizeDuctForCfm({
+        cfm: cfmEach,
+        shape: 'round',
+        material: ductR >= 8 ? 'flex-r8' : 'flex-r6',
+        isTrunk: false,
+        isReturn: false,
+        occupancy,
+      })
+
+      for (let i = 0; i < regCount; i++) {
+        const offsetX = regCount === 1 ? 0 : (i - (regCount - 1) / 2) * 1.4
+        const regPos: Vec3 = [round2(room.centroid[0] + offsetX), termY, round2(room.centroid[1])]
+        const termId = nextTermId()
+        terminals.push({
+          id: termId,
+          name: `${room.name} Supply ${regCount > 1 ? `#${i + 1} ` : ''}(${cfmEach} CFM)`,
+          terminalKind: supplyTermKind,
+          position: regPos,
+          rotation: 0,
+          roomName: room.name,
+          designCfm: cfmEach,
+          neckSizeIn: branchSized.diameterIn,
+          throwFt: Math.min(16, Math.max(6, Math.round(cfmEach / 12))),
+        })
+
+        const tapPt = nearestPointOnSpine(trunkRoute.path, regPos[0], regPos[2], plenumY)
+        const branchRoute = routeHvacDuctRun({
+          from: tapPt,
+          to: regPos,
+          plenumY,
+          ductHalfSpanM: Math.max(0.08, (branchSized.diameterIn * 0.0254) / 2),
+          allowDiagonalBranch: true,
+          obstacles,
+        })
+        ductRuns.push({
+          id: nextDuctId(),
+          name: `${branchSized.diameterIn}" Supply Branch (${room.name}, ${cfmEach} CFM)`,
+          system: 'supply-branch',
+          shape: 'round',
+          material: ductR >= 8 ? 'flex-r8' : 'flex-r6',
+          width: branchSized.diameterIn,
+          height: branchSized.diameterIn,
+          diameter: branchSized.diameterIn,
+          path: branchRoute.path,
+          airflowCfm: cfmEach,
+          velocityFpm: branchSized.velocityFpm,
+          frictionRateInWgPer100Ft: branchSized.frictionRateInWgPer100Ft,
+          insulationR: ductR,
+          sourceNodeId: supplyTrunkId,
+          targetNodeId: termId,
+          showFramingClearances: true,
+        })
+      }
+
+      // Bedroom transfer grille for closed-door pressure relief (Manual D)
+      if (room.category === 'bedroom') {
+        terminals.push({
+          id: nextTermId(),
+          name: `${room.name} Return Transfer Grille`,
+          terminalKind: 'transfer-grille',
+          position: [round2(room.centroid[0] - 0.6), round2(Math.min(levelH - 0.3, 2.25)), round2(room.centroid[1])],
+          rotation: 0,
+          roomName: room.name,
+          designCfm: loadRow.designCfm,
+          neckSizeIn: 8,
+          throwFt: 0,
+        })
+      }
+    }
+
+    // Central Return Grille + Return Trunk back to Return Plenum (IMC 601)
+    const returnRoom =
+      rooms.find((r) => r.category === 'hallway') ??
+      rooms.find((r) => r.category === 'living') ??
+      rooms[0]!
+    const retGrilleId = nextTermId()
+    const retGrillePos: Vec3 = [
+      round2(returnRoom.centroid[0]),
+      round2(Math.min(levelH - 0.35, 2.2)),
+      round2(returnRoom.centroid[1] + 0.35),
+    ]
+    terminals.push({
+      id: retGrilleId,
+      name: `Central Return Air Grille (${load.designTotalCfm} CFM)`,
+      terminalKind: 'return-grille',
+      position: retGrillePos,
+      rotation: 0,
+      roomName: returnRoom.name,
+      designCfm: load.designTotalCfm,
+      neckSizeIn: returnTrunkSize.diameterIn,
+      throwFt: 0,
+    })
+    const retRoute = routeHvacDuctRun({
+      from: retGrillePos,
+      to: returnPlenumPos,
+      plenumY: round2(plenumY + (plenumLocation === 'attic' ? 0.24 : -0.24)),
+      ductHalfSpanM: Math.max(0.12, (returnTrunkSize.widthIn * 0.0254) / 2),
+      allowDiagonalBranch: false,
+      obstacles,
+    })
+    ductRuns.push({
+      id: nextDuctId(),
+      name: `${returnTrunkSize.widthIn}"x${returnTrunkSize.heightIn}" Return Air Trunk (${load.designTotalCfm} CFM)`,
+      system: 'return-trunk',
+      shape: 'rectangular',
+      material: 'galvanized-sheet',
+      width: returnTrunkSize.widthIn,
+      height: returnTrunkSize.heightIn,
+      diameter: returnTrunkSize.diameterIn,
+      path: retRoute.path,
+      airflowCfm: load.designTotalCfm,
+      velocityFpm: returnTrunkSize.velocityFpm,
+      frictionRateInWgPer100Ft: returnTrunkSize.frictionRateInWgPer100Ft,
+      insulationR: ductR,
+      sourceNodeId: retGrilleId,
+      targetNodeId: returnPlenumId,
+      showFramingClearances: true,
+    })
+  }
+
+  // 3. Smart Thermostat in Hallway / Living Room (central interior reference)
+  const statRoom =
+    rooms.find((r) => r.category === 'hallway') ??
+    rooms.find((r) => r.category === 'living') ??
+    rooms[0]!
+  terminals.push({
+    id: nextTermId(),
+    name: `Smart Thermostat (${equipmentSpec.thermostatCable})`,
+    terminalKind: 'smart-thermostat',
+    position: [round2(statRoom.centroid[0] + 0.3), 1.52, round2(statRoom.centroid[1])],
+    rotation: 0,
+    roomName: statRoom.name,
+    designCfm: 0,
+    neckSizeIn: 0,
+    throwFt: 0,
+  })
+
+  // 4. Optional ASHRAE 62.2 ERV Fresh-Air Ventilator & Duct
+  if (includeErv) {
+    const ervId = nextEqId()
+    const ervPos: Vec3 = [round2(indoorPos[0] + 0.8), round2(Math.min(levelH - 0.55, 1.85)), round2(indoorPos[2])]
+    equipment.push({
+      id: ervId,
+      name: `ASHRAE 62.2 ERV (${ventilation.recommendedErvCfm} CFM)`,
+      equipmentKind: 'erv-ventilator',
+      position: ervPos,
+      rotation: 0,
+      roomName: mechRoom.name,
+      coolingTons: 0,
+      heatingBtuh: 0,
+      gasBtuh: 0,
+      airflowCfm: ventilation.recommendedErvCfm,
+      seer2: 0,
+      hspf2: 0,
+      refrigerant,
+      hasSecondaryDrainPan: false,
+      hasFloatSwitch: false,
+      hasDisconnectWithinSight: true,
+      electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'erv-ventilator', occupancy }),
+    })
+
+    const intakeId = nextTermId()
+    const intakePos: Vec3 = [round2(bounds.minX - 0.08), 2.1, round2(ervPos[2])]
+    terminals.push({
+      id: intakeId,
+      name: `Fresh Air Intake Hood (${ventilation.continuousFreshAirCfm} CFM)`,
+      terminalKind: 'fresh-air-intake',
+      position: intakePos,
+      rotation: 0,
+      roomName: 'Exterior',
+      designCfm: ventilation.continuousFreshAirCfm,
+      neckSizeIn: 6,
+      throwFt: 0,
+    })
+
+    const ervDuct = sizeDuctForCfm({
+      cfm: ventilation.continuousFreshAirCfm,
+      shape: 'round',
+      material: 'galvanized-sheet',
+      occupancy,
+    })
+    const ervRoute = routeHvacDuctRun({
+      from: intakePos,
+      to: ervPos,
+      plenumY: round2(plenumY + 0.14),
+      ductHalfSpanM: 0.08,
+      allowDiagonalBranch: false,
+      obstacles,
+    })
+    ductRuns.push({
+      id: nextDuctId(),
+      name: `${ervDuct.diameterIn}" ERV Fresh-Air Duct (${ventilation.continuousFreshAirCfm} CFM)`,
+      system: 'fresh-air-erv',
+      shape: 'round',
+      material: 'galvanized-sheet',
+      width: ervDuct.diameterIn,
+      height: ervDuct.diameterIn,
+      diameter: ervDuct.diameterIn,
+      path: ervRoute.path,
+      airflowCfm: ventilation.continuousFreshAirCfm,
+      velocityFpm: ervDuct.velocityFpm,
+      frictionRateInWgPer100Ft: ervDuct.frictionRateInWgPer100Ft,
+      insulationR: ductR,
+      sourceNodeId: intakeId,
+      targetNodeId: ervId,
+      showFramingClearances: true,
+    })
+  }
+
+  // 5. Optional Bath & Kitchen Spot Exhaust Fans + Rigid Exterior Ducts (IMC 403.3 / 501.3)
+  if (includeExhaustFans) {
+    for (const room of rooms) {
+      if (room.category === 'bathroom') {
+        const fanId = nextEqId()
+        const fanPos: Vec3 = [round2(room.centroid[0]), round2(levelH - 0.05), round2(room.centroid[1])]
+        equipment.push({
+          id: fanId,
+          name: `${room.name} Exhaust Fan (80 CFM)`,
+          equipmentKind: 'bath-exhaust-fan',
+          position: fanPos,
+          rotation: 0,
+          roomName: room.name,
+          coolingTons: 0,
+          heatingBtuh: 0,
+          gasBtuh: 0,
+          airflowCfm: 80,
+          seer2: 0,
+          hspf2: 0,
+          refrigerant,
+          hasSecondaryDrainPan: false,
+          hasFloatSwitch: false,
+          hasDisconnectWithinSight: true,
+          electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'bath-exhaust-fan', occupancy }),
+        })
+        const exRoute = routeHvacDuctRun({
+          from: fanPos,
+          to: [round2(room.centroid[0]), round2(levelH + 0.3), round2(bounds.minZ - 0.1)],
+          plenumY: round2(levelH + 0.3),
+          ductHalfSpanM: 0.06,
+          allowDiagonalBranch: false,
+          obstacles,
+        })
+        const exSized = sizeDuctForCfm({ cfm: 80, shape: 'round', material: 'galvanized-sheet', occupancy })
+        ductRuns.push({
+          id: nextDuctId(),
+          name: `${exSized.diameterIn}" Bath Exhaust Duct (${room.name})`,
+          system: 'exhaust-duct',
+          shape: 'round',
+          material: 'galvanized-sheet',
+          width: exSized.diameterIn,
+          height: exSized.diameterIn,
+          diameter: exSized.diameterIn,
+          path: exRoute.path,
+          airflowCfm: 80,
+          velocityFpm: exSized.velocityFpm,
+          frictionRateInWgPer100Ft: exSized.frictionRateInWgPer100Ft,
+          insulationR: ductR,
+          sourceNodeId: fanId,
+          showFramingClearances: true,
+        })
+      }
+    }
+  }
+
+  return {
+    levelId,
+    codeEdition,
+    climateZone,
+    systemType,
+    plenumLocation,
+    load,
+    equipmentSpec,
+    ventilation,
+    equipment,
+    plenums,
+    terminals,
+    ductRuns,
+    summary: `Auto-populated ${load.recommendedTons}-Ton ${systemType} (${load.designTotalCfm} CFM, Climate Zone ${climateZone}): ${equipment.length} equipment, ${plenums.length} plenums, ${terminals.length} terminals, ${ductRuns.length} duct/lineset runs.`,
+  }
+}
