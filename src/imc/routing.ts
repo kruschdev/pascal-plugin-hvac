@@ -297,6 +297,402 @@ export type XzBounds2D = {
   maxZ: number
 }
 
+export function resolveLevelBuildingId(
+  nodes: Readonly<Record<string, SceneNodeLike>>,
+  lvl: SceneNodeLike | undefined,
+): string | null {
+  if (!lvl) return null
+  if (typeof lvl.parentId === 'string' && nodes[lvl.parentId]?.type === 'building') {
+    return lvl.parentId
+  }
+  for (const n of Object.values(nodes)) {
+    if (n.type === 'building' && Array.isArray(n.children) && n.children.includes(lvl.id)) {
+      return n.id
+    }
+  }
+  return typeof lvl.parentId === 'string' ? lvl.parentId : null
+}
+
+/**
+ * Compare two sibling levels vertically.
+ * Prioritizes Pascal's storey ordinal (`level` / `levelSortOrder`) before `elevation` / `baseElevation`
+ * because every Pascal level carries `baseElevation: 0` by default (additive offset above stacked base).
+ */
+export function compareLevelsVertically(a: SceneNodeLike | undefined, b: SceneNodeLike | undefined): number {
+  const primary = (l: SceneNodeLike | undefined): number => {
+    if (!l) return 0
+    if (typeof l.level === 'number' && Number.isFinite(l.level)) return l.level
+    if (typeof l.levelSortOrder === 'number' && Number.isFinite(l.levelSortOrder)) return l.levelSortOrder
+    if (typeof l.elevation === 'number' && Number.isFinite(l.elevation)) return l.elevation
+    if (typeof l.baseElevation === 'number' && Number.isFinite(l.baseElevation)) return l.baseElevation
+    return 0
+  }
+  const secondary = (l: SceneNodeLike | undefined): number => {
+    if (!l) return 0
+    if (typeof l.elevation === 'number' && Number.isFinite(l.elevation)) return l.elevation
+    if (typeof l.baseElevation === 'number' && Number.isFinite(l.baseElevation)) return l.baseElevation
+    return 0
+  }
+  const dp = primary(a) - primary(b)
+  if (Math.abs(dp) > 1e-6) return dp
+  return secondary(a) - secondary(b)
+}
+
+export type LowerWalledLevelsInfo = {
+  cumulativeBelowHeightM: number
+  lowerLevelIds: string[]
+  groundLevelId: string | null
+  groundWalls: WallSegment2D[]
+  groundRooms: RoomPolygon2D[]
+  allLowerWalls: WallSegment2D[]
+}
+
+/**
+ * Resolve all walled sibling levels strictly below `levelId` in the same building (sorted lowest-first).
+ * Computes `cumulativeBelowHeightM` (sum of above-grade lower storey heights) and extracts the lowest
+ * walled ground-level walls/rooms so upper-story outdoor condensers sit at `worldY = 0` outside ground walls.
+ */
+export function resolveLowerWalledLevels(
+  nodes: Readonly<Record<string, SceneNodeLike>>,
+  levelId: string | null,
+): LowerWalledLevelsInfo {
+  const empty: LowerWalledLevelsInfo = {
+    cumulativeBelowHeightM: 0,
+    lowerLevelIds: [],
+    groundLevelId: null,
+    groundWalls: [],
+    groundRooms: [],
+    allLowerWalls: [],
+  }
+  if (!levelId) return empty
+  const curLvl = nodes[levelId]
+  if (!curLvl || curLvl.type !== 'level') return empty
+
+  const all = Object.values(nodes)
+  const curBldg = resolveLevelBuildingId(nodes, curLvl)
+  const siblingLower = all
+    .filter((o) => {
+      if (o.type !== 'level' || o.id === curLvl.id) return false
+      const oBldg = resolveLevelBuildingId(nodes, o)
+      if (curBldg && oBldg && curBldg !== oBldg) return false
+      if (compareLevelsVertically(o, curLvl) >= 0) return false
+      // Exclude below-grade basements from elevating ground/upper floors above grade
+      const isBasement =
+        (typeof o.level === 'number' && o.level < 0) ||
+        (typeof o.baseElevation === 'number' && o.baseElevation < -0.5) ||
+        (typeof o.elevation === 'number' && o.elevation < -0.5)
+      if (isBasement) return false
+      return all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
+    })
+    .sort((a, b) => compareLevelsVertically(a, b))
+
+  if (siblingLower.length === 0) return empty
+
+  let cumulativeBelowHeightM = 0
+  const lowerLevelIds: string[] = []
+  const allLowerWalls: WallSegment2D[] = []
+  for (const lower of siblingLower) {
+    lowerLevelIds.push(lower.id)
+    cumulativeBelowHeightM += resolveLevelHeightM(nodes, lower.id)
+    allLowerWalls.push(...extractWallSegments(nodes, lower.id))
+  }
+  const groundLevelId = siblingLower[0]!.id
+  return {
+    cumulativeBelowHeightM: round2(cumulativeBelowHeightM),
+    lowerLevelIds,
+    groundLevelId,
+    groundWalls: extractWallSegments(nodes, groundLevelId),
+    groundRooms: extractRoomPolygons(nodes, groundLevelId),
+    allLowerWalls,
+  }
+}
+
+export function distancePointToSegment2D(
+  px: number,
+  pz: number,
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+): { dist: number; t: number; closestX: number; closestZ: number } {
+  const dx = bx - ax
+  const dz = bz - az
+  const lenSq = dx * dx + dz * dz
+  if (lenSq < 1e-10) {
+    return { dist: Math.hypot(px - ax, pz - az), t: 0, closestX: ax, closestZ: az }
+  }
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lenSq))
+  const closestX = ax + dx * t
+  const closestZ = az + dz * t
+  return { dist: Math.hypot(px - closestX, pz - closestZ), t, closestX, closestZ }
+}
+
+// 8 ray directions (4 near-cardinal + 4 near-diagonal) with tiny angular jitter so rays never
+// run collinearly along axis-aligned wall segments.
+const ENCLOSURE_RAYS: ReadonlyArray<readonly [number, number]> = [
+  [Math.cos(0.0017), Math.sin(0.0017)],
+  [Math.cos(Math.PI / 4 + 0.0019), Math.sin(Math.PI / 4 + 0.0019)],
+  [Math.cos(Math.PI / 2 + 0.0023), Math.sin(Math.PI / 2 + 0.0023)],
+  [Math.cos((3 * Math.PI) / 4 + 0.0029), Math.sin((3 * Math.PI) / 4 + 0.0029)],
+  [Math.cos(Math.PI + 0.0031), Math.sin(Math.PI + 0.0031)],
+  [Math.cos((5 * Math.PI) / 4 + 0.0037), Math.sin((5 * Math.PI) / 4 + 0.0037)],
+  [Math.cos((3 * Math.PI) / 2 + 0.0041), Math.sin((3 * Math.PI) / 2 + 0.0041)],
+  [Math.cos((7 * Math.PI) / 4 + 0.0043), Math.sin((7 * Math.PI) / 4 + 0.0043)],
+]
+
+function rayHitsSegment2D(
+  ox: number,
+  oz: number,
+  rdx: number,
+  rdz: number,
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+  extM = 0.05,
+): boolean {
+  const sdx = bx - ax
+  const sdz = bz - az
+  const len = Math.hypot(sdx, sdz)
+  if (len < 1e-6) return false
+  const padT = extM / len
+  const denom = rdx * sdz - rdz * sdx
+  if (Math.abs(denom) < 1e-10) return false
+  const qx = ax - ox
+  const qz = az - oz
+  const t = (qx * sdz - qz * sdx) / denom
+  if (t < -1e-4) return false
+  const u = (qx * rdz - qz * rdx) / denom
+  return u >= -padT && u <= 1 + padT
+}
+
+/**
+ * Strict interior enclosure test (no exterior wall-proximity padding) used for classifying
+ * interior vs exterior faces of walls (e.g., ERV fresh-air intake snapping on L/U-shaped buildings).
+ */
+export function isPointStrictlyInsideBuilding(
+  x: number,
+  z: number,
+  walls: ReadonlyArray<WallSegment2D>,
+  rooms: ReadonlyArray<RoomPolygon2D>,
+): boolean {
+  let inInteriorRoom = false
+  let inExteriorRoom = false
+  for (const r of rooms) {
+    if (!pointInPolygon2D(x, z, r.polygon)) continue
+    if (r.category === 'exterior') inExteriorRoom = true
+    else inInteriorRoom = true
+  }
+  if (inInteriorRoom) return true
+  if (inExteriorRoom) return false
+
+  if (walls.length >= 3) {
+    for (const [rdx, rdz] of ENCLOSURE_RAYS) {
+      let hit = false
+      for (const w of walls) {
+        if (rayHitsSegment2D(x, z, rdx, rdz, w.start[0], w.start[1], w.end[0], w.end[1], 0.05)) {
+          hit = true
+          break
+        }
+      }
+      if (!hit) return false
+    }
+    return true
+  }
+
+  return rooms.length === 0
+}
+
+/**
+ * Building footprint enclosure predicate for duct routing & concave courtyard avoidance:
+ * true if inside any non-exterior room polygon, OR enclosed by walls in all directions,
+ * OR within `wallProximityM` (default 0.45m) of an actual wall segment (while still rejecting
+ * explicit exterior zones like Swimming Pools / Courtyards).
+ */
+export function isPointInsideBuildingFootprint(
+  x: number,
+  z: number,
+  walls: ReadonlyArray<WallSegment2D>,
+  rooms: ReadonlyArray<RoomPolygon2D>,
+  wallProximityM = 0.45,
+): boolean {
+  let inInteriorRoom = false
+  let inExteriorRoom = false
+  for (const r of rooms) {
+    if (!pointInPolygon2D(x, z, r.polygon)) continue
+    if (r.category === 'exterior') inExteriorRoom = true
+    else inInteriorRoom = true
+  }
+  if (inInteriorRoom) return true
+  if (inExteriorRoom) return false
+
+  if (walls.length >= 3) {
+    if (wallProximityM > 0) {
+      for (const w of walls) {
+        const { dist } = distancePointToSegment2D(x, z, w.start[0], w.start[1], w.end[0], w.end[1])
+        if (dist <= wallProximityM) return true
+      }
+    }
+    for (const [rdx, rdz] of ENCLOSURE_RAYS) {
+      let hit = false
+      for (const w of walls) {
+        if (rayHitsSegment2D(x, z, rdx, rdz, w.start[0], w.start[1], w.end[0], w.end[1], 0.05)) {
+          hit = true
+          break
+        }
+      }
+      if (!hit) return false
+    }
+    return true
+  }
+
+  return rooms.length === 0
+}
+
+/**
+ * Check whether an XZ duct segment crosses an open outdoor void (such as a concave U-shaped courtyard
+ * or L-shaped front yard notch) by sampling every `stepM` meters along the segment.
+ */
+export function segmentCrossesOutdoorVoid(
+  a: Vec3,
+  b: Vec3,
+  isInside: (x: number, z: number) => boolean,
+  stepM = 0.5,
+): boolean {
+  const dx = b[0] - a[0]
+  const dz = b[2] - a[2]
+  const dh = Math.hypot(dx, dz)
+  if (dh < 0.25) return false
+  const aInside = isInside(a[0], a[2])
+  const bInside = isInside(b[0], b[2])
+  const steps = Math.max(2, Math.ceil(dh / Math.max(0.1, stepM)))
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps
+    const distFromA = t * dh
+    const distFromB = (1 - t) * dh
+    if (!aInside && distFromA <= 0.35) continue
+    if (!bInside && distFromB <= 0.35) continue
+    const px = a[0] + dx * t
+    const pz = a[2] + dz * t
+    if (!isInside(px, pz)) return true
+  }
+  return false
+}
+
+export function pathCrossesOutdoorVoid(
+  path: ReadonlyArray<Vec3>,
+  isInside: (x: number, z: number) => boolean,
+  stepM = 0.5,
+): boolean {
+  for (let i = 1; i < path.length; i++) {
+    if (segmentCrossesOutdoorVoid(path[i - 1]!, path[i]!, isInside, stepM)) return true
+  }
+  return false
+}
+
+export type ExteriorWallSnapCandidate = {
+  wallId: string
+  point: readonly [number, number]
+  wallCenter: readonly [number, number]
+  interiorBack: readonly [number, number]
+  outwardNormal: readonly [number, number]
+  dist: number
+  interiorPathClear: boolean
+}
+
+/**
+ * Find real exterior wall penetration points nearest to `origin` (for ERV fresh-air intakes & exhausts).
+ * Classifies each wall's true exterior side by probing interior enclosure on both normals, projects
+ * `origin` onto each exterior wall clamped `cornerInsetM` from corners, and offsets `outwardOffsetM`
+ * along the verified outward normal.
+ */
+export function findNearestExteriorWallPoints(params: {
+  origin: readonly [number, number]
+  walls: ReadonlyArray<WallSegment2D>
+  rooms: ReadonlyArray<RoomPolygon2D>
+  outwardOffsetM?: number
+  cornerInsetM?: number
+  extraOffsetsM?: ReadonlyArray<number>
+}): ExteriorWallSnapCandidate[] {
+  const {
+    origin,
+    walls,
+    rooms,
+    outwardOffsetM = 0.08,
+    cornerInsetM = 0.45,
+    extraOffsetsM = [1.4, -1.4, 2.8, -2.8],
+  } = params
+  if (walls.length === 0) return []
+
+  const isInsideFootprint = (x: number, z: number) => isPointInsideBuildingFootprint(x, z, walls, rooms)
+  const results: ExteriorWallSnapCandidate[] = []
+
+  for (const w of walls) {
+    if (w.lengthM < 0.6) continue
+    let plusOutVotes = 0
+    let minusOutVotes = 0
+    for (const frac of [0.5, 0.25, 0.75]) {
+      const wx = w.start[0] + w.ux * w.lengthM * frac
+      const wz = w.start[1] + w.uz * w.lengthM * frac
+      for (const probeDist of [w.thicknessM / 2 + 0.35, w.thicknessM / 2 + 0.7]) {
+        const plusIn = isPointStrictlyInsideBuilding(wx + w.nx * probeDist, wz + w.nz * probeDist, walls, rooms)
+        const minusIn = isPointStrictlyInsideBuilding(wx - w.nx * probeDist, wz - w.nz * probeDist, walls, rooms)
+        if (!plusIn && minusIn) {
+          plusOutVotes += 1
+          break
+        }
+        if (plusIn && !minusIn) {
+          minusOutVotes += 1
+          break
+        }
+      }
+    }
+    if (plusOutVotes === minusOutVotes) continue
+    const outSign = plusOutVotes > minusOutVotes ? 1 : -1
+    const outNx = w.nx * outSign
+    const outNz = w.nz * outSign
+
+    const inset = Math.min(cornerInsetM, w.lengthM * 0.25)
+    const projU = (origin[0] - w.start[0]) * w.ux + (origin[1] - w.start[1]) * w.uz
+    const baseU = Math.max(inset, Math.min(w.lengthM - inset, projU))
+
+    const uCandidates = [baseU]
+    for (const delta of extraOffsetsM) {
+      const cu = baseU + delta
+      if (cu >= inset && cu <= w.lengthM - inset) {
+        uCandidates.push(cu)
+      }
+    }
+
+    const backOffset = w.thicknessM / 2 + 0.14
+    for (const u of uCandidates) {
+      const cx = w.start[0] + w.ux * u
+      const cz = w.start[1] + w.uz * u
+      const px = round2(cx + outNx * outwardOffsetM)
+      const pz = round2(cz + outNz * outwardOffsetM)
+      const bx = round2(cx - outNx * backOffset)
+      const bz = round2(cz - outNz * backOffset)
+      const dist = Math.hypot(px - origin[0], pz - origin[1])
+      const interiorPathClear = !segmentCrossesOutdoorVoid([origin[0], 0, origin[1]], [bx, 0, bz], isInsideFootprint, 0.5)
+      results.push({
+        wallId: w.id,
+        point: [px, pz],
+        wallCenter: [round2(cx), round2(cz)],
+        interiorBack: [bx, bz],
+        outwardNormal: [outNx, outNz],
+        dist,
+        interiorPathClear,
+      })
+    }
+  }
+
+  results.sort((a, b) => {
+    if (a.interiorPathClear !== b.interiorPathClear) return a.interiorPathClear ? -1 : 1
+    return a.dist - b.dist
+  })
+  return results
+}
+
 export type AtticRoofEnvelope = {
   wallH: number
   pitchRiseOver12: number
@@ -321,25 +717,12 @@ export function buildAtticRoofEnvelope(
   const all = Object.values(nodes)
   const levels = all.filter((n) => n.type === 'level')
   const curLvl = levelId ? nodes[levelId] : levels[0]
-  const curElev =
-    typeof curLvl?.baseElevation === 'number'
-      ? curLvl.baseElevation
-      : typeof curLvl?.elevation === 'number'
-        ? curLvl.elevation
-        : typeof curLvl?.level === 'number'
-          ? curLvl.level
-          : 0
+  const curBuildingId = resolveLevelBuildingId(nodes, curLvl)
   const hasRoofAbove = !levels.some((o) => {
     if (!curLvl || o.id === curLvl.id) return false
-    const oElev =
-      typeof o.baseElevation === 'number'
-        ? o.baseElevation
-        : typeof o.elevation === 'number'
-          ? o.elevation
-          : typeof o.level === 'number'
-            ? o.level
-            : 0
-    return oElev > curElev && all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
+    const oBldg = resolveLevelBuildingId(nodes, o)
+    if (curBuildingId && oBldg && curBuildingId !== oBldg) return false
+    return compareLevelsVertically(o, curLvl) > 0 && all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
   })
 
   const assembly = all.find((n) => n.type === 'structural:assembly' && belongsToLevel(nodes, n, levelId))
@@ -359,37 +742,31 @@ export function buildAtticRoofEnvelope(
     cz: number
     cosR: number
     sinR: number
-    halfW: number
-    halfD: number
+    effW: number
+    effD: number
+    width: number
+    depth: number
     overhangM: number
     eaveY: number
+    pitchRad: number
     slopeTan: number
     roofType: string
   }
-  const curBuildingId = typeof curLvl?.parentId === 'string' ? curLvl.parentId : null
   const unwalledUpperLevelIds = new Set<string>()
   if (hasRoofAbove && curLvl) {
     for (const o of levels) {
       if (o.id === curLvl.id) continue
-      const oBldg = typeof o.parentId === 'string' ? o.parentId : null
+      const oBldg = resolveLevelBuildingId(nodes, o)
       if (curBuildingId && oBldg && curBuildingId !== oBldg) continue
-      const oElev =
-        typeof o.baseElevation === 'number'
-          ? o.baseElevation
-          : typeof o.elevation === 'number'
-            ? o.elevation
-            : typeof o.level === 'number'
-              ? o.level
-              : 0
       const oHasWalls = all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
-      if (!oHasWalls && oElev >= curElev) {
+      if (!oHasWalls && compareLevelsVertically(o, curLvl) >= 0) {
         unwalledUpperLevelIds.add(o.id)
       }
     }
   }
   const explicitSegs: ExplicitRoofSeg[] = []
   for (const n of all) {
-    if (n.type !== 'roof-segment') continue
+    if (n.type !== 'roof-segment' || n.visible === false) continue
     let inScope = belongsToLevel(nodes, n, levelId)
     if (!inScope && unwalledUpperLevelIds.size > 0) {
       for (const uid of unwalledUpperLevelIds) {
@@ -432,15 +809,22 @@ export function buildAtticRoofEnvelope(
     const overhangM = typeof n.overhang === 'number' && n.overhang >= 0 ? n.overhang : 0.35
     const segWallH = typeof n.wallHeight === 'number' && Number.isFinite(n.wallHeight) ? n.wallHeight : 0
     const eaveY = wy > 0.05 ? wy + segWallH : wallH + segWallH
+    const swapAxes = (roofType === 'hip' || roofType === 'dutch' || roofType === 'mansard') && width < depth
+    const effYaw = swapAxes ? rot + Math.PI / 2 : rot
+    const effW = swapAxes ? depth : width
+    const effD = swapAxes ? width : depth
     explicitSegs.push({
       cx: wx,
       cz: wz,
-      cosR: Math.cos(rot),
-      sinR: Math.sin(rot),
-      halfW: width / 2,
-      halfD: depth / 2,
+      cosR: Math.cos(effYaw),
+      sinR: Math.sin(effYaw),
+      effW,
+      effD,
+      width,
+      depth,
       overhangM,
       eaveY,
+      pitchRad,
       slopeTan: roofType === 'flat' || pitchRad <= 0.008 ? 0 : Math.tan(pitchRad),
       roofType,
     })
@@ -457,13 +841,43 @@ export function buildAtticRoofEnvelope(
         const dz = z - seg.cz
         const lx = dx * seg.cosR - dz * seg.sinR
         const lz = dx * seg.sinR + dz * seg.cosR
-        if (Math.abs(lx) <= seg.halfW + 0.15 && Math.abs(lz) <= seg.halfD + seg.overhangM + 0.15) {
-          const segY =
-            seg.roofType === 'shed'
-              ? seg.eaveY + Math.max(0, seg.halfD - lz) * seg.slopeTan
-              : seg.eaveY + Math.max(0, seg.halfD - Math.abs(lz)) * seg.slopeTan
-          if (bestSegY === null || segY > bestSegY) bestSegY = segY
+        let sy: number
+        if (seg.roofType === 'conical') {
+          const r = Math.min(seg.width, seg.depth) / 2
+          const dist = Math.hypot(lx, lz)
+          if (dist > r + seg.overhangM + 0.15) continue
+          sy = seg.eaveY + Math.max(0, r - dist) * seg.slopeTan
+        } else {
+          const padX =
+            seg.roofType === 'hip' || seg.roofType === 'dutch' || seg.roofType === 'mansard'
+              ? seg.overhangM + 0.15
+              : 0.15
+          if (Math.abs(lx) > seg.effW / 2 + padX || Math.abs(lz) > seg.effD / 2 + seg.overhangM + 0.15) {
+            continue
+          }
+          if (seg.roofType === 'flat' || seg.pitchRad <= 0.008) {
+            sy = seg.eaveY
+          } else if (seg.roofType === 'shed') {
+            sy = seg.eaveY + Math.max(0, seg.effD / 2 - lz) * seg.slopeTan
+          } else if (seg.roofType === 'hip' || seg.roofType === 'dutch') {
+            const halfW = seg.effW / 2
+            const halfD = seg.effD / 2
+            const hipRise = seg.roofType === 'dutch' ? Math.min(halfD * seg.slopeTan, halfD * 1.35) : halfD * seg.slopeTan
+            const effTan = hipRise / Math.max(0.1, halfD)
+            const dMin = Math.min(halfW - Math.abs(lx), halfD - Math.abs(lz))
+            sy = seg.eaveY + Math.min(hipRise, Math.max(0, dMin) * effTan)
+          } else if (seg.roofType === 'mansard') {
+            const halfW = seg.effW / 2
+            const halfD = seg.effD / 2
+            const inset = Math.min(seg.effW, seg.effD) * 0.18
+            const manRise = Math.min(2.2, Math.max(0.25, inset * seg.slopeTan))
+            const dMin = Math.min(halfW - Math.abs(lx), halfD - Math.abs(lz))
+            sy = seg.eaveY + Math.min(manRise, Math.max(0, dMin) * (manRise / Math.max(0.1, inset)))
+          } else {
+            sy = seg.eaveY + Math.max(0, seg.effD / 2 - Math.abs(lz)) * seg.slopeTan
+          }
         }
+        if (bestSegY === null || sy > bestSegY) bestSegY = sy
       }
       if (bestSegY !== null) return Math.min(fallbackY, bestSegY)
     }
@@ -480,6 +894,29 @@ export function buildAtticRoofEnvelope(
     hasRoofAbove,
     roofYAt,
   }
+}
+
+/**
+ * Evaluate the minimum roof surface height across the center and all 4 XZ corners of an attic
+ * equipment cabinet or plenum footprint so sloping hip/gable rafters never clip the box corners.
+ */
+export function minRoofYOverFootprint(
+  roof: AtticRoofEnvelope,
+  cx: number,
+  cz: number,
+  halfW: number,
+  halfD: number,
+): number {
+  const hw = Math.max(0, halfW)
+  const hd = Math.max(0, halfD)
+  if (hw < 0.01 && hd < 0.01) return roof.roofYAt(cx, cz)
+  return Math.min(
+    roof.roofYAt(cx, cz),
+    roof.roofYAt(cx - hw, cz - hd),
+    roof.roofYAt(cx + hw, cz - hd),
+    roof.roofYAt(cx - hw, cz + hd),
+    roof.roofYAt(cx + hw, cz + hd),
+  )
 }
 
 export function safeRoofCorridorHalfWidth(
@@ -927,6 +1364,8 @@ export function routeHvacDuctRun(params: {
   obstacles?: ReadonlyArray<HvacObstacle>
   xzBounds?: XzBounds2D
   roofEnvelope?: AtticRoofEnvelope
+  footprintContains?: (x: number, z: number) => boolean
+  interiorCorridorSpines?: { xs?: ReadonlyArray<number>; zs?: ReadonlyArray<number> }
 }): {
   path: Vec3[]
   lengthFt: number
@@ -943,6 +1382,8 @@ export function routeHvacDuctRun(params: {
     obstacles = [],
     xzBounds,
     roofEnvelope,
+    footprintContains,
+    interiorCorridorSpines,
   } = params
 
   const ductHalfH = typeof ductHalfSpanM === 'number' ? ductHalfSpanM : ductHalfSpanM.horizontal
@@ -1165,6 +1606,9 @@ export function routeHvacDuctRun(params: {
     return stepUnderRoof(cleanPath(pts), y)
   }
 
+  const isFootprintOk = (cand: ReadonlyArray<Vec3>): boolean =>
+    !footprintContains ? true : !pathCrossesOutdoorVoid(cand, footprintContains, 0.5)
+
   const seenPaths = new Set<string>()
   const pathKey = (cand: ReadonlyArray<Vec3>): string =>
     cand.map((p) => `${Math.round(p[0] * 100)},${Math.round(p[1] * 100)},${Math.round(p[2] * 100)}`).join(';')
@@ -1175,29 +1619,38 @@ export function routeHvacDuctRun(params: {
   let bestClashes = checkClashes(primary)
   let bestRoofOk = isRoofOk(primary)
   let bestInBounds = withinXzBounds(primary)
+  let bestFootprintOk = isFootprintOk(primary)
   let detoured = false
 
   const isDone = (): boolean =>
-    bestRoofOk && bestInBounds && bestClashes.length <= irreducibleEndpointClashes
+    bestRoofOk && bestInBounds && bestFootprintOk && bestClashes.length <= irreducibleEndpointClashes
 
   const tryCandidate = (cand: Vec3[]): boolean => {
-    if (xzBounds && !withinXzBounds(cand)) return false
+    const candInBounds = withinXzBounds(cand)
+    if (xzBounds && !candInBounds) return false
     const key = pathKey(cand)
     if (seenPaths.has(key)) return false
     seenPaths.add(key)
 
+    const candFootprintOk = isFootprintOk(cand)
+    if (bestFootprintOk && !candFootprintOk) return false
     const candRoofOk = isRoofOk(cand)
-    if (bestRoofOk && !candRoofOk) return false
+    if (bestFootprintOk === candFootprintOk && bestRoofOk && !candRoofOk) return false
     const c = checkClashes(cand)
     const better =
-      (!bestInBounds && withinXzBounds(cand)) ||
-      (!bestRoofOk && candRoofOk) ||
-      (candRoofOk === bestRoofOk && c.length < bestClashes.length)
+      (!bestInBounds && candInBounds) ||
+      (candInBounds === bestInBounds && !bestFootprintOk && candFootprintOk) ||
+      (candInBounds === bestInBounds && candFootprintOk === bestFootprintOk && !bestRoofOk && candRoofOk) ||
+      (candInBounds === bestInBounds &&
+        candFootprintOk === bestFootprintOk &&
+        candRoofOk === bestRoofOk &&
+        c.length < bestClashes.length)
     if (better) {
       bestPath = cand
       bestClashes = c
       bestRoofOk = candRoofOk
-      bestInBounds = withinXzBounds(cand)
+      bestInBounds = candInBounds
+      bestFootprintOk = candFootprintOk
       detoured = true
       if (isDone()) return true
     }
@@ -1205,9 +1658,113 @@ export function routeHvacDuctRun(params: {
   }
 
   if (!isDone()) {
-    const candidates: Vec3[][] = [
-      buildCand('z', 0, 0),
-      buildCand('x', 0, 0),
+    // When primary crosses a concave outdoor void (e.g. U-shaped courtyard or L-notch),
+    // immediately try the alternative L-bend AND 2-bend / 3-bend interior wing corridor spines first!
+    if (footprintContains && !bestFootprintOk) {
+      const baseY = clampY(plenumY)
+      const spineYs = dedupYs([
+        plenumY,
+        ...(hasPitchedRoof ? [roofSoffitY] : []),
+        plenumY + 0.35,
+        plenumY - 0.18,
+      ])
+      const spineZs: number[] = []
+      const spineXs: number[] = []
+      const pushUnique = (arr: number[], v: number) => {
+        const rv = round2(v)
+        if (!arr.some((e) => Math.abs(e - rv) < 0.2)) arr.push(rv)
+      }
+      if (interiorCorridorSpines?.zs) {
+        for (const z of interiorCorridorSpines.zs) pushUnique(spineZs, z)
+      }
+      if (interiorCorridorSpines?.xs) {
+        for (const x of interiorCorridorSpines.xs) pushUnique(spineXs, x)
+      }
+      if (xzBounds) {
+        const steps = 7
+        for (let i = 1; i <= steps; i++) {
+          const frac = i / (steps + 1)
+          pushUnique(spineZs, xzBounds.minZ + (xzBounds.maxZ - xzBounds.minZ) * frac)
+          pushUnique(spineXs, xzBounds.minX + (xzBounds.maxX - xzBounds.minX) * frac)
+        }
+      }
+      const midZ = (from[2] + to[2]) / 2
+      const midX = (from[0] + to[0]) / 2
+      spineZs.sort((a, b) => Math.abs(a - midZ) - Math.abs(b - midZ))
+      spineXs.sort((a, b) => Math.abs(a - midX) - Math.abs(b - midX))
+
+      // Try alternative L-bends first at baseY
+      tryCandidate(buildCandAtY('z', 0, baseY))
+      if (!isDone()) tryCandidate(buildCandAtY('x', 0, baseY))
+
+      // 2-bend interior wing corridor detours: route via connecting Z spine or X spine
+      if (!isDone()) {
+        for (const y of spineYs) {
+          for (const sz of spineZs) {
+            const cand = stepUnderRoof(
+              cleanPath([from, [from[0], y, from[2]], [from[0], y, sz], [to[0], y, sz], [to[0], y, to[2]], to]),
+              y,
+            )
+            if (tryCandidate(cand)) break
+          }
+          if (isDone()) break
+          for (const sx of spineXs) {
+            const cand = stepUnderRoof(
+              cleanPath([from, [from[0], y, from[2]], [sx, y, from[2]], [sx, y, to[2]], [to[0], y, to[2]], to]),
+              y,
+            )
+            if (tryCandidate(cand)) break
+          }
+          if (isDone()) break
+        }
+      }
+
+      // 3-bend stepped corridor detours (handles offset/stepped U or S wings when 2-bend isn't enough)
+      if (!bestFootprintOk) {
+        const compactXs = spineXs.slice(0, 6)
+        const compactZs = spineZs.slice(0, 6)
+        for (const y of spineYs.slice(0, 2)) {
+          for (const sx of compactXs) {
+            for (const sz of compactZs) {
+              const c1 = stepUnderRoof(
+                cleanPath([
+                  from,
+                  [from[0], y, from[2]],
+                  [from[0], y, sz],
+                  [sx, y, sz],
+                  [sx, y, to[2]],
+                  [to[0], y, to[2]],
+                  to,
+                ]),
+                y,
+              )
+              if (tryCandidate(c1)) break
+              const c2 = stepUnderRoof(
+                cleanPath([
+                  from,
+                  [from[0], y, from[2]],
+                  [sx, y, from[2]],
+                  [sx, y, sz],
+                  [to[0], y, sz],
+                  [to[0], y, to[2]],
+                  to,
+                ]),
+                y,
+              )
+              if (tryCandidate(c2)) break
+            }
+            if (isDone()) break
+          }
+          if (isDone()) break
+        }
+      }
+    }
+
+    const candidates: Vec3[][] = isDone()
+      ? []
+      : [
+          buildCand('z', 0, 0),
+          buildCand('x', 0, 0),
       // Elevation hops first so attic trunks & branches step cleanly over Priority #2 DWV vents
       // and structural headers (conditioned-soffit & crawlspace runs clamp to maxPlenumY and also try downward clearances)
       buildCand('diag', 0, 0.35),
@@ -1226,15 +1783,21 @@ export function routeHvacDuctRun(params: {
       buildCand('z', 0, -0.18),
       buildCand('x', 0, -0.32),
       buildCand('z', 0, -0.32),
-      ...(hasPitchedRoof
-        ? [
-            buildCandAtY(allowDiagonalBranch ? 'diag' : 'x', 0, roofSoffitY),
-            buildCandAtY('z', 0, roofSoffitY),
-            buildCandAtY('x', 0, roofSoffitY),
-            buildCandAtY('x', 0, roofSoffitY - 0.16),
-            buildCandAtY('z', 0, roofSoffitY - 0.16),
-          ]
-        : []),
+          ...(hasPitchedRoof
+            ? [
+                buildCandAtY(allowDiagonalBranch ? 'diag' : 'x', 0, roofSoffitY),
+                buildCandAtY('z', 0, roofSoffitY),
+                buildCandAtY('x', 0, roofSoffitY),
+                buildCandAtY('x', 0, roofSoffitY - 0.16),
+                buildCandAtY('z', 0, roofSoffitY - 0.16),
+                buildCandAtY('x', 0, roofSoffitY - 0.32),
+                buildCandAtY('z', 0, roofSoffitY - 0.32),
+                buildCandAtY('ux', 0.65, roofSoffitY),
+                buildCandAtY('ux', -0.65, roofSoffitY),
+                buildCandAtY('uz', 0.65, roofSoffitY),
+                buildCandAtY('uz', -0.65, roofSoffitY),
+              ]
+            : []),
       buildCand('ux', 0.65, 0),
       buildCand('ux', -0.65, 0),
       buildCand('uz', 0.65, 0),
@@ -1303,7 +1866,7 @@ export function routeHvacDuctRun(params: {
           plenumY,
           yAbove,
           ...(yBelow !== undefined ? [yBelow] : []),
-          ...(hasPitchedRoof ? [roofSoffitY] : []),
+          ...(hasPitchedRoof ? [roofSoffitY, roofSoffitY - 0.28] : []),
           plenumY + 0.55,
         ])
         const bypassXs = [obs.box.minX - hClear, obs.box.maxX + hClear]
@@ -1475,6 +2038,8 @@ export function routeCondensateDrain(params: {
   obstacles?: ReadonlyArray<HvacObstacle>
   xzBounds?: XzBounds2D
   roofEnvelope?: AtticRoofEnvelope
+  slopeInPerFt?: number
+  footprintContains?: (x: number, z: number) => boolean
 }): {
   path: Vec3[]
   slopeInPerFt: number
@@ -1482,8 +2047,11 @@ export function routeCondensateDrain(params: {
   detoured: boolean
   clashes: HvacObstacle[]
 } {
-  const { from, to, obstacles = [], xzBounds, roofEnvelope } = params
-  const slopeInPerFt = 0.25
+  const { from, to, obstacles = [], xzBounds, roofEnvelope, footprintContains } = params
+  const slopeInPerFt =
+    typeof params.slopeInPerFt === 'number' && Number.isFinite(params.slopeInPerFt)
+      ? Math.max(0.13, Math.min(1.0, params.slopeInPerFt))
+      : 0.25
   const slopeRatio = slopeInPerFt / 12
   const isAtticStart = from[1] >= 2.2
   const horizEstimateM = Math.abs(to[0] - from[0]) + Math.abs(to[2] - from[2])
@@ -1600,6 +2168,9 @@ export function routeCondensateDrain(params: {
   const buildSloped = (waypoints: ReadonlyArray<readonly [number, number]>): Vec3[] =>
     buildSlopedWithProfile(waypoints, startY, isAtticStart)
 
+  const isFootprintOk = (cand: ReadonlyArray<Vec3>): boolean =>
+    !footprintContains ? true : !pathCrossesOutdoorVoid(cand, footprintContains, 0.5)
+
   const primary = buildSloped([
     [to[0], from[2]],
     [to[0], to[2]],
@@ -1608,10 +2179,11 @@ export function routeCondensateDrain(params: {
   let clashes = checkClashes(primary)
   let bestRoofOk = isRoofOk(primary)
   let bestInBounds = withinXzBounds(primary)
+  let bestFootprintOk = isFootprintOk(primary)
   let detoured = false
 
   const isDone = (): boolean =>
-    bestRoofOk && bestInBounds && clashes.length <= irreducibleEndpointClashes
+    bestRoofOk && bestInBounds && bestFootprintOk && clashes.length <= irreducibleEndpointClashes
 
   if (!isDone()) {
     const waypointSets: Array<ReadonlyArray<readonly [number, number]>> = [
@@ -1706,21 +2278,29 @@ export function routeCondensateDrain(params: {
     for (const prof of profiles) {
       for (const wp of waypointSets) {
         const cand = buildSlopedWithProfile(wp, prof.runY, prof.dropAtEnd, prof.slopeRatio ?? slopeRatio)
-        if (xzBounds && !withinXzBounds(cand)) continue
+        const candInBounds = withinXzBounds(cand)
+        if (xzBounds && !candInBounds) continue
+        const candFootprintOk = isFootprintOk(cand)
+        if (bestFootprintOk && !candFootprintOk) continue
         const candRoofOk = isRoofOk(cand)
-        if (bestRoofOk && !candRoofOk) continue
+        if (bestFootprintOk === candFootprintOk && bestRoofOk && !candRoofOk) continue
         const c = checkClashes(cand)
         const better =
-          (!bestInBounds && withinXzBounds(cand)) ||
-          (!bestRoofOk && candRoofOk) ||
-          (candRoofOk === bestRoofOk && c.length < clashes.length)
+          (!bestInBounds && candInBounds) ||
+          (candInBounds === bestInBounds && !bestFootprintOk && candFootprintOk) ||
+          (candInBounds === bestInBounds && candFootprintOk === bestFootprintOk && !bestRoofOk && candRoofOk) ||
+          (candInBounds === bestInBounds &&
+            candFootprintOk === bestFootprintOk &&
+            candRoofOk === bestRoofOk &&
+            c.length < clashes.length)
         if (better) {
           const slopeCheck = measureCondensateSlope(cand)
           if (!slopeCheck.hasUphillSegment && (slopeCheck.horizontalDistFt < 1.0 || slopeCheck.overallSlopeInPerFt >= 0.125)) {
             best = cand
             clashes = c
             bestRoofOk = candRoofOk
-            bestInBounds = withinXzBounds(cand)
+            bestInBounds = candInBounds
+            bestFootprintOk = candFootprintOk
             detoured = true
             if (isDone()) break
           }

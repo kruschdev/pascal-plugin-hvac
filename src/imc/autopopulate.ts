@@ -18,6 +18,7 @@ import {
   type ElectricalPowerDemand,
   type SceneNodeLike,
   type Vec3,
+  extractHvacFramingContext,
   getHvacEquipmentElectricalDemand,
 } from './framing-interop'
 import {
@@ -27,14 +28,21 @@ import {
   type XzBounds2D,
   buildAtticRoofEnvelope,
   detectHvacClashes,
+  distancePointToSegment2D,
   extractHvacObstacles,
   extractRoomPolygons,
   extractWallSegments,
+  findNearestExteriorWallPoints,
+  isPointInsideBuildingFootprint,
+  minRoofYOverFootprint,
+  pathClearOfRoof,
   pointInPolygon2D,
   resolveLevelHeightM,
+  resolveLowerWalledLevels,
   routeCondensateDrain,
   routeHvacDuctRun,
   safeRoofCorridorHalfWidth,
+  segmentCrossesOutdoorVoid,
 } from './routing'
 import {
   calculateAshrae622Ventilation,
@@ -56,6 +64,7 @@ import {
   type HvacPlenumKind,
   type HvacSystemType,
   type HvacTerminalKind,
+  INCHES_TO_METERS,
   type OccupancyType,
   type RefrigerantType,
   round2,
@@ -159,9 +168,17 @@ export type HvacAutoPopulatePlan = {
   summary: string
 }
 
-function nearestPointOnSpine(spine: ReadonlyArray<Vec3>, x: number, z: number, fallbackY: number): Vec3 {
+function nearestPointOnSpine(
+  spine: ReadonlyArray<Vec3>,
+  x: number,
+  z: number,
+  fallbackY: number,
+  footprintContains?: (px: number, pz: number) => boolean,
+): Vec3 {
   let bestPt: Vec3 = spine[0] ?? [x, fallbackY, z]
   let bestDist = Infinity
+  let bestInteriorPt: Vec3 | null = null
+  let bestInteriorDist = Infinity
   for (let i = 1; i < spine.length; i++) {
     const a = spine[i - 1]!
     const b = spine[i]!
@@ -174,12 +191,17 @@ function nearestPointOnSpine(spine: ReadonlyArray<Vec3>, x: number, z: number, f
     const py = a[1] + (b[1] - a[1]) * t
     const pz = a[2] + dz * t
     const d = Math.hypot(x - px, z - pz)
+    const pt: Vec3 = [round2(px), round2(py), round2(pz)]
     if (d < bestDist) {
       bestDist = d
-      bestPt = [round2(px), round2(py), round2(pz)]
+      bestPt = pt
+    }
+    if (footprintContains && d < bestInteriorDist && !segmentCrossesOutdoorVoid(pt, [x, py, z], footprintContains, 0.5)) {
+      bestInteriorDist = d
+      bestInteriorPt = pt
     }
   }
-  return bestPt
+  return bestInteriorPt ?? bestPt
 }
 
 function sceneBounds(
@@ -374,7 +396,13 @@ function findClearSpotForRiser(params: {
   insidePolygon?: ReadonlyArray<readonly [number, number]>
   excludePolygons?: ReadonlyArray<ReadonlyArray<readonly [number, number]>>
   floorObstacles?: ReadonlyArray<HvacObstacle>
-  roofConstraint?: { roof: AtticRoofEnvelope; requiredTopY: number; preferRidgeWeight?: number }
+  roofConstraint?: {
+    roof: AtticRoofEnvelope
+    requiredTopY: number
+    preferRidgeWeight?: number
+    footprintHalfW?: number
+    footprintHalfD?: number
+  }
 }): { spot: [number, number]; riserClashes: number; floorClear: number; foundValid: boolean } {
   const {
     baseX,
@@ -431,7 +459,8 @@ function findClearSpotForRiser(params: {
     }
   }
 
-  // When searching for attic placement under a pitched roof, also sample along the ridge centerline
+  // When searching for attic placement under a pitched roof, sample along the ridge centerline
+  // AND a 5x5 interior grid so asymmetric hip/multi-segment roofs find the true highest peak.
   if (roofConstraint?.roof.hasRoofAbove) {
     const r = roofConstraint.roof
     const ridgeSteps = 9
@@ -443,6 +472,19 @@ function findClearSpotForRiser(params: {
       } else {
         const rz = round2(bounds.minZ + 0.45 + (bounds.maxZ - bounds.minZ - 0.9) * frac)
         candSet.push([round2(r.center), rz])
+      }
+    }
+    const gridSteps = 5
+    const spanX = bounds.maxX - bounds.minX
+    const spanZ = bounds.maxZ - bounds.minZ
+    if (spanX > 1.0 && spanZ > 1.0) {
+      for (let ix = 1; ix <= gridSteps; ix++) {
+        for (let iz = 1; iz <= gridSteps; iz++) {
+          candSet.push([
+            round2(bounds.minX + (spanX * ix) / (gridSteps + 1)),
+            round2(bounds.minZ + (spanZ * iz) / (gridSteps + 1)),
+          ])
+        }
       }
     }
   }
@@ -475,7 +517,14 @@ function findClearSpotForRiser(params: {
     }
 
     if (roofConstraint && roofConstraint.roof.hasRoofAbove) {
-      if (roofConstraint.roof.roofYAt(cx, cz) < roofConstraint.requiredTopY) continue
+      const roofClearY = minRoofYOverFootprint(
+        roofConstraint.roof,
+        cx,
+        cz,
+        roofConstraint.footprintHalfW ?? 0,
+        roofConstraint.footprintHalfD ?? 0,
+      )
+      if (roofClearY < roofConstraint.requiredTopY) continue
     }
 
     const riserClashes = detectHvacClashes(
@@ -702,6 +751,11 @@ export function planHvacAutoPopulate(
   const rawRooms = extractRoomPolygons(nodes, levelId)
   const levelH = resolveLevelHeightM(nodes, levelId)
   const obstacles = extractHvacObstacles(nodes, levelId)
+  const framingCtx = extractHvacFramingContext(nodes, levelId)
+  const ceilingJoistClearM = framingCtx.framingPresent
+    ? round2(Math.max(0.18, Math.min(0.42, framingCtx.joistDepthIn * INCHES_TO_METERS)))
+    : 0.2
+  const lowerLevels = resolveLowerWalledLevels(nodes, levelId)
   const bounds = sceneBounds(walls, rawRooms)
   const indoorBounds: XzBounds2D = {
     minX: bounds.maxX - bounds.minX > 0.35 ? round2(bounds.minX + 0.15) : round2(bounds.minX),
@@ -709,6 +763,30 @@ export function planHvacAutoPopulate(
     minZ: bounds.maxZ - bounds.minZ > 0.35 ? round2(bounds.minZ + 0.15) : round2(bounds.minZ),
     maxZ: bounds.maxZ - bounds.minZ > 0.35 ? round2(bounds.maxZ - 0.15) : round2(bounds.maxZ),
   }
+  const hasFootprintGeometry = walls.length >= 3 || rawRooms.some((r) => r.category !== 'exterior')
+  const footprintContains = hasFootprintGeometry
+    ? (x: number, z: number) => isPointInsideBuildingFootprint(x, z, walls, rawRooms)
+    : undefined
+  const interiorCorridorSpines = (() => {
+    const xs: number[] = []
+    const zs: number[] = []
+    const pushDedup = (arr: number[], v: number) => {
+      const rv = round2(v)
+      if (!arr.some((e) => Math.abs(e - rv) < 0.25)) arr.push(rv)
+    }
+    for (const r of rawRooms) {
+      if (r.category === 'exterior') continue
+      pushDedup(xs, clampToSpan(r.centroid[0], indoorBounds.minX, indoorBounds.maxX))
+      pushDedup(zs, clampToSpan(r.centroid[1], indoorBounds.minZ, indoorBounds.maxZ))
+    }
+    for (const w of walls) {
+      const mx = (w.start[0] + w.end[0]) / 2
+      const mz = (w.start[1] + w.end[1]) / 2
+      pushDedup(xs, clampToSpan(mx, indoorBounds.minX, indoorBounds.maxX))
+      pushDedup(zs, clampToSpan(mz, indoorBounds.minZ, indoorBounds.maxZ))
+    }
+    return { xs, zs }
+  })()
   const roofEnvelope = buildAtticRoofEnvelope(nodes, levelId, bounds, levelH)
   const atticRoof = plenumLocation === 'attic' && roofEnvelope.hasRoofAbove ? roofEnvelope : undefined
   const ridgeCenterX = roofEnvelope.ridgeAlongX ? bounds.cx : roofEnvelope.center
@@ -839,8 +917,10 @@ export function planHvacAutoPopulate(
     (o) => o.category === 'plumbing' && o.box.maxY >= levelH - 0.35 && o.box.minY <= levelH,
   )
   const useTrueAtticPlenum = plenumLocation === 'attic' && roofEnvelope.hasRoofAbove && systemType !== 'rooftop-package'
+  // Elevate attic trunks & branches clear above ceiling joists/tie beams (default 0.20m or structural joistDepthIn)
+  // while still clamping strictly beneath ridgePeakY - halfV - 0.10 below.
   let plenumY = useTrueAtticPlenum
-    ? round2(Math.max(levelH + 0.28, levelH + supplyHalfV + 0.08))
+    ? round2(levelH + ceilingJoistClearM + supplyHalfV + 0.04)
     : systemType === 'rooftop-package'
       ? round2(levelH - Math.max(0.28, supplyHalfV + 0.12))
       : plenumLocation === 'conditioned-soffit' || plenumLocation === 'attic'
@@ -849,14 +929,31 @@ export function planHvacAutoPopulate(
           : round2(levelH - Math.max(0.22, supplyHalfV + 0.08))
         : round2(Math.min(-0.26, maxPlenumYFor(supplyHalfV) ?? -0.26))
   let retPlenumY = useTrueAtticPlenum
-    ? round2(Math.max(plenumY + 0.24, levelH + retHalfV + 0.14))
+    ? round2(Math.max(plenumY + 0.24, levelH + ceilingJoistClearM + retHalfV + 0.08))
     : systemType === 'rooftop-package'
       ? round2(Math.min(plenumY - 0.16, levelH - Math.max(0.34, retHalfV + 0.14)))
       : round2(plenumY - 0.24)
 
   if (atticRoof) {
-    const ridgeSupCap = round2(ridgePeakY - supplyHalfV - 0.1)
-    const ridgeRetCap = round2(ridgePeakY - retHalfV - 0.1)
+    // Sample multiple points along the ridge centerline so multi-wing/L/U roofs whose AABB center
+    // sits over a lower porch or courtyard still find the true main-wing attic headroom, while clamping
+    // strictly beneath the 4-corner footprint roof height so ceiling-joist elevation boost never clips rafters.
+    let bestSupRoofY = minRoofYOverFootprint(atticRoof, ridgeCenterX, ridgeCenterZ, supplyHalfX, supplyHalfX)
+    let bestRetRoofY = minRoofYOverFootprint(atticRoof, ridgeCenterX, ridgeCenterZ, retHalfX, retHalfX)
+    for (const frac of [0.2, 0.35, 0.65, 0.8]) {
+      const sx = atticRoof.ridgeAlongX
+        ? round2(bounds.minX + (bounds.maxX - bounds.minX) * frac)
+        : ridgeCenterX
+      const sz = atticRoof.ridgeAlongX
+        ? ridgeCenterZ
+        : round2(bounds.minZ + (bounds.maxZ - bounds.minZ) * frac)
+      const sy = minRoofYOverFootprint(atticRoof, sx, sz, supplyHalfX, supplyHalfX)
+      const ry = minRoofYOverFootprint(atticRoof, sx, sz, retHalfX, retHalfX)
+      if (sy > bestSupRoofY) bestSupRoofY = sy
+      if (ry > bestRetRoofY) bestRetRoofY = ry
+    }
+    const ridgeSupCap = round2(bestSupRoofY - supplyHalfV - 0.14)
+    const ridgeRetCap = round2(bestRetRoofY - retHalfV - 0.14)
     if (ridgeSupCap <= levelH + 0.05) {
       plenumY = round2(levelH - Math.max(0.18, supplyHalfV + 0.06))
     } else if (plenumY > ridgeSupCap) {
@@ -950,14 +1047,18 @@ export function planHvacAutoPopulate(
     }
   }
 
-  // Evaluate attic headroom under pitched roof (VIS-01):
-  // Prefer ridge centerline; switch to horizontal low-profile attic orientation (0.52m tall)
-  // when vertical cabinet + top plenum cannot clear rafters with >= 12 cm margin;
-  // fall back to interior floor placement if even horizontal attic orientation does not fit.
+  // Evaluate attic headroom under pitched roof (VIS-01 / 4-corner footprint clearance):
+  // Verify ALL 4 XZ corners of the AHU + supply/return plenum boxes clear the sloping roof plane by >= 14 cm;
+  // switch to horizontal low-profile attic orientation (0.52m tall) or fall back to indoor floor if not.
   const ridgeSpanM = roofEnvelope.ridgeAlongX ? bounds.maxX - bounds.minX : bounds.maxZ - bounds.minZ
-  const vertAtticRequiredRoofY = atticPlatformY + 1.43 + Math.max(0.45, supplyPlenumH) + 0.12
-  const horizAtticRequiredRoofY = atticPlatformY + 0.52 + 0.12
-  const horizPlenumRequiredRoofY = atticPlatformY + 0.05 + Math.max(0.45, supplyPlenumH) + 0.12
+  const supplyPlenumHalfW = Math.max(0.35, (supplyTrunkSize.widthIn * INCHES_TO_METERS) / 2)
+  const retPlenumHalfW = Math.max(0.35, (returnTrunkSize.widthIn * INCHES_TO_METERS) / 2)
+  // Top of vertical AHU supply plenum: pos[1] + heightM = atticPlatformY + 1.43 + supplyPlenumH * 1.5
+  const vertAtticRequiredRoofY =
+    atticPlatformY + 1.43 + Math.max(0.45, supplyPlenumH * 1.5) + 0.14
+  const horizAtticRequiredRoofY = atticPlatformY + 0.52 + 0.14
+  const horizPlenumRequiredRoofY =
+    atticPlatformY + 0.05 + Math.max(0.45, Math.max(supplyPlenumH, retPlenumH) * 1.5) + 0.14
   let isAtticMountedAhu = !chosenDedicatedRoom && canMountInAttic
   let isHorizontalAtticAhu = false
 
@@ -977,8 +1078,9 @@ export function planHvacAutoPopulate(
       requiredRoofY: number,
       topCheckY: number,
       gableInsetM = 0.45,
+      footprintHalfW = supplyPlenumHalfW,
+      footprintHalfD = 0.35,
     ): [number, number] | null => {
-      if (atticRoof && ridgePeakY < requiredRoofY) return null
       const searchBounds =
         gableInsetM > 0.5 && ridgeSpanM > gableInsetM * 2 + 0.3
           ? roofEnvelope.ridgeAlongX
@@ -1009,22 +1111,55 @@ export function planHvacAutoPopulate(
         bounds: searchBounds,
         minFloorClearanceM: 0.95,
         floorObstacles: atticLevelObstacles,
-        roofConstraint: atticRoof ? { roof: atticRoof, requiredTopY: requiredRoofY, preferRidgeWeight: 30 } : undefined,
+        roofConstraint: atticRoof
+          ? {
+              roof: atticRoof,
+              requiredTopY: requiredRoofY,
+              preferRidgeWeight: 30,
+              footprintHalfW,
+              footprintHalfD,
+            }
+          : undefined,
       })
-      if (res.foundValid && (!atticRoof || atticRoof.roofYAt(res.spot[0], res.spot[1]) >= requiredRoofY)) {
+      if (
+        res.foundValid &&
+        (!atticRoof ||
+          minRoofYOverFootprint(atticRoof, res.spot[0], res.spot[1], footprintHalfW, footprintHalfD) >= requiredRoofY)
+      ) {
         return res.spot
       }
       return null
     }
 
-    const vertSpot = tryAtticMode(vertAtticRequiredRoofY, round2(atticPlatformY + supplyPlenumMidOffset), 0.45)
+    const vertSpot = tryAtticMode(
+      vertAtticRequiredRoofY,
+      round2(atticPlatformY + supplyPlenumMidOffset),
+      0.45,
+      supplyPlenumHalfW,
+      0.38,
+    )
     if (vertSpot) {
       ;[clearX, clearZ] = vertSpot
       isHorizontalAtticAhu = false
     } else {
       const horizReqY = Math.max(horizAtticRequiredRoofY, horizPlenumRequiredRoofY)
-      // Horizontal cabinet (1.32m) + end-mounted supply & return plenums need >= 1.2m gable inset on both ends
-      const horizSpot = ridgeSpanM >= 2.8 ? tryAtticMode(horizReqY, round2(atticPlatformY + 0.52), 1.2) : null
+      // Horizontal cabinet (1.32m) + end-mounted supply & return plenums span ~1.0m along the ridge axis
+      const horizFootprintHalfX = roofEnvelope.ridgeAlongX
+        ? Math.max(1.05, 0.66 + Math.max(supplyPlenumHalfW, retPlenumHalfW))
+        : Math.max(0.36, supplyPlenumHalfW)
+      const horizFootprintHalfZ = roofEnvelope.ridgeAlongX
+        ? Math.max(0.36, supplyPlenumHalfW)
+        : Math.max(1.05, 0.66 + Math.max(supplyPlenumHalfW, retPlenumHalfW))
+      const horizSpot =
+        ridgeSpanM >= 2.8
+          ? tryAtticMode(
+              horizReqY,
+              round2(atticPlatformY + 0.52),
+              1.2,
+              horizFootprintHalfX,
+              horizFootprintHalfZ,
+            )
+          : null
       if (horizSpot) {
         ;[clearX, clearZ] = horizSpot
         isHorizontalAtticAhu = true
@@ -1093,28 +1228,173 @@ export function planHvacAutoPopulate(
         : round2(Math.PI / 2)
     : 0
 
-  // Place outdoor condenser on the nearest exterior side wall to the mechanical core, maintaining >= 1.2m
+  // Place outdoor condenser on an exterior wall outside the building footprint, maintaining >= 1.2m
   // ignition-source clearance from any exterior fuel-gas meter/regulator vent (IFGC / NFPA 54).
-  const outdoorOnWest = Math.abs(indoorPos[0] - bounds.minX) < Math.abs(bounds.maxX - indoorPos[0])
-  const outdoorX = round2(outdoorOnWest ? bounds.minX - 0.95 : bounds.maxX + 0.95)
-  const extWallObstacles = obstacles.filter(
-    (o) =>
-      o.category === 'plumbing' &&
-      Math.abs((o.box.minX + o.box.maxX) / 2 - (outdoorOnWest ? bounds.minX : bounds.maxX)) <= 1.5,
-  )
-  let outdoorZ = clampToSpan(indoorPos[2], bounds.minZ + 0.4, bounds.maxZ - 0.4)
-  const isOutdoorClear = (tz: number): boolean =>
-    extWallObstacles.every((o) => Math.abs(tz - (o.box.minZ + o.box.maxZ) / 2) >= 1.2)
-  if (!isOutdoorClear(outdoorZ)) {
-    for (const dz of [1.4, -1.4, 2.2, -2.2]) {
-      const candZ = round2(indoorPos[2] + dz)
-      if (candZ >= bounds.minZ + 0.4 && candZ <= bounds.maxZ - 0.4 && isOutdoorClear(candZ)) {
-        outdoorZ = candZ
-        break
+  // On upper stories (`cumulativeBelowHeightM > 0.1`), ground the condenser at grade (`y = -cumulativeBelowHeightM`)
+  // strictly outside the union of active-level AND ground-level wall footprints, preferring an exterior wall
+  // where the active story aligns with the ground floor so the unit never floats over a 1-story roof (VIS-V3-03).
+  const isUpperStory = lowerLevels.cumulativeBelowHeightM > 0.1
+  const gradeY = isUpperStory ? round2(-lowerLevels.cumulativeBelowHeightM) : 0
+  const groundBounds = isUpperStory
+    ? sceneBounds(lowerLevels.groundWalls, lowerLevels.groundRooms)
+    : bounds
+  const unionBounds = (() => {
+    if (!isUpperStory) return bounds
+    let minX = Math.min(bounds.minX, groundBounds.minX)
+    let maxX = Math.max(bounds.maxX, groundBounds.maxX)
+    let minZ = Math.min(bounds.minZ, groundBounds.minZ)
+    let maxZ = Math.max(bounds.maxZ, groundBounds.maxZ)
+    for (const w of lowerLevels.allLowerWalls) {
+      minX = Math.min(minX, w.start[0], w.end[0])
+      maxX = Math.max(maxX, w.start[0], w.end[0])
+      minZ = Math.min(minZ, w.start[1], w.end[1])
+      maxZ = Math.max(maxZ, w.start[1], w.end[1])
+    }
+    return { minX, maxX, minZ, maxZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2 }
+  })()
+
+  const groundObstacles = isUpperStory && lowerLevels.groundLevelId
+    ? extractHvacObstacles(nodes, lowerLevels.groundLevelId)
+    : []
+  const allExtPlumbingObstacles = [...obstacles, ...groundObstacles].filter((o) => o.category === 'plumbing')
+
+  type OutdoorSide = 'west' | 'east' | 'north' | 'south'
+  let outdoorSide: OutdoorSide
+  let outdoorX: number
+  let outdoorZ: number
+
+  if (isUpperStory) {
+    const overlapMinZ = Math.max(bounds.minZ, groundBounds.minZ)
+    const overlapMaxZ = Math.min(bounds.maxZ, groundBounds.maxZ)
+    const spanMinZ = overlapMaxZ - overlapMinZ >= 0.8 ? overlapMinZ + 0.4 : groundBounds.minZ + 0.4
+    const spanMaxZ = overlapMaxZ - overlapMinZ >= 0.8 ? overlapMaxZ - 0.4 : groundBounds.maxZ - 0.4
+    const overlapMinX = Math.max(bounds.minX, groundBounds.minX)
+    const overlapMaxX = Math.min(bounds.maxX, groundBounds.maxX)
+    const spanMinX = overlapMaxX - overlapMinX >= 0.8 ? overlapMinX + 0.4 : groundBounds.minX + 0.4
+    const spanMaxX = overlapMaxX - overlapMinX >= 0.8 ? overlapMaxX - 0.4 : groundBounds.maxX - 0.4
+
+    const pickClearAlongAxis = (
+      baseCoord: number,
+      lo: number,
+      hi: number,
+      wallCoord: number,
+      axis: 'z' | 'x',
+    ): number => {
+      const relevant = allExtPlumbingObstacles.filter((o) => {
+        const oc = axis === 'z' ? (o.box.minX + o.box.maxX) / 2 : (o.box.minZ + o.box.maxZ) / 2
+        return Math.abs(oc - wallCoord) <= 1.5
+      })
+      const isClear = (v: number): boolean =>
+        relevant.every((o) => {
+          const ov = axis === 'z' ? (o.box.minZ + o.box.maxZ) / 2 : (o.box.minX + o.box.maxX) / 2
+          return Math.abs(v - ov) >= 1.2
+        })
+      const primary = clampToSpan(baseCoord, lo, hi)
+      if (isClear(primary)) return primary
+      for (const d of [1.4, -1.4, 2.2, -2.2]) {
+        const cand = round2(primary + d)
+        if (cand >= lo && cand <= hi && isClear(cand)) return cand
+      }
+      return primary
+    }
+
+    const sideSpecs: Array<{
+      side: OutdoorSide
+      x: number
+      z: number
+      alignedGap: number
+      score: number
+    }> = [
+      (() => {
+        const x = round2(unionBounds.minX - 0.95)
+        const z = pickClearAlongAxis(indoorPos[2], spanMinZ, spanMaxZ, unionBounds.minX, 'z')
+        const alignedGap = Math.abs(bounds.minX - unionBounds.minX)
+        const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
+        return {
+          side: 'west' as const,
+          x,
+          z,
+          alignedGap,
+          score: (alignedGap <= 0.35 ? 100 : -alignedGap * 25) - dist * 3 + 2,
+        }
+      })(),
+      (() => {
+        const x = round2(unionBounds.maxX + 0.95)
+        const z = pickClearAlongAxis(indoorPos[2], spanMinZ, spanMaxZ, unionBounds.maxX, 'z')
+        const alignedGap = Math.abs(bounds.maxX - unionBounds.maxX)
+        const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
+        return {
+          side: 'east' as const,
+          x,
+          z,
+          alignedGap,
+          score: (alignedGap <= 0.35 ? 100 : -alignedGap * 25) - dist * 3 + 2,
+        }
+      })(),
+      (() => {
+        const x = pickClearAlongAxis(indoorPos[0], spanMinX, spanMaxX, unionBounds.minZ, 'x')
+        const z = round2(unionBounds.minZ - 0.95)
+        const alignedGap = Math.abs(bounds.minZ - unionBounds.minZ)
+        const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
+        return {
+          side: 'north' as const,
+          x,
+          z,
+          alignedGap,
+          score: (alignedGap <= 0.35 ? 100 : -alignedGap * 25) - dist * 3,
+        }
+      })(),
+      (() => {
+        const x = pickClearAlongAxis(indoorPos[0], spanMinX, spanMaxX, unionBounds.maxZ, 'x')
+        const z = round2(unionBounds.maxZ + 0.95)
+        const alignedGap = Math.abs(bounds.maxZ - unionBounds.maxZ)
+        const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
+        return {
+          side: 'south' as const,
+          x,
+          z,
+          alignedGap,
+          score: (alignedGap <= 0.35 ? 100 : -alignedGap * 25) - dist * 3,
+        }
+      })(),
+    ]
+    sideSpecs.sort((a, b) => b.score - a.score)
+    const chosenSide = sideSpecs[0]!
+    outdoorSide = chosenSide.side
+    outdoorX = chosenSide.x
+    outdoorZ = chosenSide.z
+  } else {
+    const outdoorOnWest = Math.abs(indoorPos[0] - bounds.minX) < Math.abs(bounds.maxX - indoorPos[0])
+    outdoorSide = outdoorOnWest ? 'west' : 'east'
+    outdoorX = round2(outdoorOnWest ? bounds.minX - 0.95 : bounds.maxX + 0.95)
+    const extWallObstacles = allExtPlumbingObstacles.filter(
+      (o) => Math.abs((o.box.minX + o.box.maxX) / 2 - (outdoorOnWest ? bounds.minX : bounds.maxX)) <= 1.5,
+    )
+    outdoorZ = clampToSpan(indoorPos[2], bounds.minZ + 0.4, bounds.maxZ - 0.4)
+    const isOutdoorClear = (tz: number): boolean =>
+      extWallObstacles.every((o) => Math.abs(tz - (o.box.minZ + o.box.maxZ) / 2) >= 1.2)
+    if (!isOutdoorClear(outdoorZ)) {
+      for (const dz of [1.4, -1.4, 2.2, -2.2]) {
+        const candZ = round2(indoorPos[2] + dz)
+        if (candZ >= bounds.minZ + 0.4 && candZ <= bounds.maxZ - 0.4 && isOutdoorClear(candZ)) {
+          outdoorZ = candZ
+          break
+        }
       }
     }
   }
-  const outdoorPos: Vec3 = [outdoorX, 0, outdoorZ]
+  const outdoorOnWest = outdoorSide === 'west'
+  const outdoorOutDx = outdoorSide === 'west' ? -1 : outdoorSide === 'east' ? 1 : 0
+  const outdoorOutDz = outdoorSide === 'north' ? -1 : outdoorSide === 'south' ? 1 : 0
+  const outdoorRotation =
+    outdoorSide === 'east'
+      ? 0
+      : outdoorSide === 'west'
+        ? round2(Math.PI)
+        : outdoorSide === 'north'
+          ? round2(Math.PI / 2)
+          : round2(-Math.PI / 2)
+  const outdoorPos: Vec3 = [outdoorX, gradeY, outdoorZ]
 
   const indoorKind: HvacEquipmentKind =
     systemType === 'split-gas-furnace'
@@ -1174,7 +1454,7 @@ export function planHvacAutoPopulate(
       name: `${HVAC_EQUIPMENT_SPECS[outdoorKind].label} (${load.recommendedTons}-Ton, ${equipmentSpec.minSeer2} SEER2)`,
       equipmentKind: outdoorKind,
       position: outdoorPos,
-      rotation: 0,
+      rotation: outdoorRotation,
       roomName: 'Exterior Pad',
       coolingTons: load.recommendedTons,
       heatingBtuh: systemType === 'split-heat-pump' ? equipmentSpec.heatingOutputBtuh : 0,
@@ -1194,9 +1474,10 @@ export function planHvacAutoPopulate(
     })
 
     // Insulated Copper Refrigerant Lineset (Indoor Coil -> Outdoor Condenser)
-    // Try preferred outdoor-facing cabinet takeoff first; if adjacent plumbing equipment/vents block it,
-    // rotate cleanly to the clearest takeoff face of the AHU/furnace.
-    const outDir = outdoorOnWest ? -1 : 1
+    // Route inside the building to a header-free exterior wall exit (preferring low-wall y = 0.35m below
+    // window sills/door headers on ground stories, or header-clear vertical drop flush along the exterior wall
+    // to `gradeY + 0.35` on upper stories), verifying ZERO structural beam/header clashes across the full path.
+    const outDir = outdoorOutDx !== 0 ? outdoorOutDx : Math.abs(indoorPos[0] - bounds.minX) < Math.abs(bounds.maxX - indoorPos[0]) ? -1 : 1
     const coilTakeoffY = isHorizontalAtticAhu ? round2(indoorPos[1] + 0.28) : round2(indoorPos[1] + 0.95)
     const coilHighY = isHorizontalAtticAhu ? round2(indoorPos[1] + 0.4) : round2(indoorPos[1] + 1.25)
     const linesetFaces: ReadonlyArray<Vec3> = [
@@ -1206,39 +1487,141 @@ export function planHvacAutoPopulate(
       [round2(indoorPos[0] - outDir * 0.22), coilTakeoffY, indoorPos[2]],
       [round2(indoorPos[0] + outDir * 0.22), coilHighY, indoorPos[2]],
     ]
-    const linesetTarget: Vec3 = [round2(outdoorPos[0] + (outdoorOnWest ? 0.35 : -0.35)), 0.35, outdoorPos[2]]
     const linesetMaxY = maxPlenumYFor(0.03)
-    const linesetPlenumY =
-      plenumLocation === 'attic'
-        ? round2(Math.min(levelH + 0.16, linesetMaxY ?? levelH + 0.16))
-        : plenumLocation === 'conditioned-soffit'
-          ? round2(Math.min(levelH - 0.18, linesetMaxY ?? levelH - 0.18))
-          : round2(Math.min(-0.18, linesetMaxY ?? -0.18))
-    let linesetRoute = routeHvacDuctRun({
-      from: linesetFaces[0]!,
-      to: linesetTarget,
-      plenumY: linesetPlenumY,
-      maxPlenumY: linesetMaxY,
-      ductHalfSpanM: 0.03,
-      allowDiagonalBranch: false,
-      obstacles,
-      roofEnvelope: atticRoof,
-    })
-    if (linesetRoute.clashes.length > 0) {
-      for (let fi = 1; fi < linesetFaces.length; fi++) {
-        const cand = routeHvacDuctRun({
-          from: linesetFaces[fi]!,
-          to: linesetTarget,
-          plenumY: linesetPlenumY,
-          maxPlenumY: linesetMaxY,
-          ductHalfSpanM: 0.03,
-          allowDiagonalBranch: false,
-          obstacles,
-          roofEnvelope: atticRoof,
-        })
-        if (cand.clashes.length < linesetRoute.clashes.length) {
-          linesetRoute = cand
-          if (cand.clashes.length === 0) break
+    const linesetPlenumY = useTrueAtticPlenum
+      ? round2(Math.min(levelH + ceilingJoistClearM + 0.06, linesetMaxY ?? levelH + ceilingJoistClearM + 0.06))
+      : plenumLocation === 'attic' || plenumLocation === 'conditioned-soffit'
+        ? round2(Math.min(levelH - 0.18, linesetMaxY ?? levelH - 0.18))
+        : round2(Math.min(-0.18, linesetMaxY ?? -0.18))
+    const wallEdgeX = outdoorSide === 'west' ? unionBounds.minX : outdoorSide === 'east' ? unionBounds.maxX : outdoorPos[0]
+    const wallEdgeZ = outdoorSide === 'north' ? unionBounds.minZ : outdoorSide === 'south' ? unionBounds.maxZ : outdoorPos[2]
+    const linesetCondStubPt: Vec3 = [
+      round2(outdoorPos[0] - outdoorOutDx * 0.35),
+      round2(gradeY + 0.35),
+      round2(outdoorPos[2] - outdoorOutDz * 0.35),
+    ]
+    const clampLinesetExitY = (wx: number, wz: number, desiredY: number): number => {
+      const soffitExit = round2(Math.min(levelH - 0.18, desiredY))
+      if (!atticRoof) return desiredY
+      const cx = clampToSpan(wx, bounds.minX, bounds.maxX)
+      const cz = clampToSpan(wz, bounds.minZ, bounds.maxZ)
+      const cap = atticRoof.roofYAt(cx, cz) - 0.13
+      if (cap <= levelH + 0.05) return soffitExit
+      return round2(Math.min(desiredY, cap))
+    }
+
+    const dedupPathPts = (pts: ReadonlyArray<Vec3>): Vec3[] => {
+      const dedup: Vec3[] = []
+      for (const p of pts) {
+        const prev = dedup[dedup.length - 1]
+        if (!prev || Math.hypot(p[0] - prev[0], p[1] - prev[1], p[2] - prev[2]) > 0.01) {
+          dedup.push(p)
+        }
+      }
+      return dedup
+    }
+
+    const buildLinesetCand = (fromFace: Vec3, exitAlong: number, rawExitY: number, wallStandoffM: number) => {
+      const dropX = outdoorOutDx !== 0 ? round2(wallEdgeX + outdoorOutDx * wallStandoffM) : round2(exitAlong)
+      const dropZ = outdoorOutDz !== 0 ? round2(wallEdgeZ + outdoorOutDz * wallStandoffM) : round2(exitAlong)
+      const exitY = rawExitY <= 0.6 ? round2(rawExitY) : clampLinesetExitY(dropX, dropZ, rawExitY)
+      const insidePt: Vec3 = [
+        outdoorOutDx !== 0
+          ? clampToSpan(wallEdgeX - outdoorOutDx * 0.14, indoorBounds.minX, indoorBounds.maxX)
+          : clampToSpan(exitAlong, indoorBounds.minX, indoorBounds.maxX),
+        exitY,
+        outdoorOutDz !== 0
+          ? clampToSpan(wallEdgeZ - outdoorOutDz * 0.14, indoorBounds.minZ, indoorBounds.maxZ)
+          : clampToSpan(exitAlong, indoorBounds.minZ, indoorBounds.maxZ),
+      ]
+      const exitPt: Vec3 = [dropX, exitY, dropZ]
+      const dropBottomPt: Vec3 = [dropX, round2(gradeY + 0.35), dropZ]
+      const gradeCornerPt: Vec3 =
+        outdoorOutDx !== 0
+          ? [dropX, round2(gradeY + 0.35), outdoorPos[2]]
+          : [outdoorPos[0], round2(gradeY + 0.35), dropZ]
+
+      const innerRoute = routeHvacDuctRun({
+        from: fromFace,
+        to: insidePt,
+        plenumY: linesetPlenumY,
+        maxPlenumY: linesetMaxY,
+        ductHalfSpanM: 0.03,
+        allowDiagonalBranch: false,
+        obstacles,
+        xzBounds: indoorBounds,
+        roofEnvelope: atticRoof,
+        footprintContains,
+        interiorCorridorSpines,
+      })
+      const path = dedupPathPts([...innerRoute.path, exitPt, dropBottomPt, gradeCornerPt, linesetCondStubPt])
+      const clashes = detectHvacClashes(path, obstacles, 0.03)
+      const roofOk = !atticRoof || pathClearOfRoof(path, atticRoof, 0.03, 0.08)
+      return { path, clashes, roofOk }
+    }
+
+    const baseAlong = outdoorOutDx !== 0 ? outdoorPos[2] : outdoorPos[0]
+    const alongLo = outdoorOutDx !== 0 ? wallMinZ : wallMinX
+    const alongHi = outdoorOutDx !== 0 ? wallMaxZ : wallMaxX
+    const highExitY = clampLinesetExitY(
+      outdoorOutDx !== 0 ? round2(wallEdgeX + outdoorOutDx * 0.16) : outdoorPos[0],
+      outdoorOutDz !== 0 ? round2(wallEdgeZ + outdoorOutDz * 0.16) : outdoorPos[2],
+      linesetPlenumY,
+    )
+    // Ground-story units prefer low-wall exit (y = 0.35m below window sills & door headers);
+    // upper-story units try flush wall exit at highExitY and low-above-floor y = 0.35m (below upper headers).
+    const exitElevations = isUpperStory
+      ? [highExitY, 0.35, round2(Math.max(0.35, levelH - 0.18))]
+      : [0.35, highExitY, round2(Math.max(0.35, levelH - 0.18))]
+
+    let linesetRoute = buildLinesetCand(linesetFaces[0]!, baseAlong, exitElevations[0]!, 0.16)
+    const isLinesetBetter = (
+      cand: { clashes: HvacObstacle[]; roofOk: boolean },
+      cur: { clashes: HvacObstacle[]; roofOk: boolean },
+    ) => (!cur.roofOk && cand.roofOk) || (cand.roofOk === cur.roofOk && cand.clashes.length < cur.clashes.length)
+
+    if (linesetRoute.clashes.length > 0 || !linesetRoute.roofOk) {
+      // Collect lateral exit coordinates that step cleanly past any structural headers on the chosen exterior wall
+      const alongCandidates: number[] = [baseAlong]
+      const pushAlong = (v: number) => {
+        const cv = clampToSpan(v, alongLo, alongHi)
+        if (!alongCandidates.some((e) => Math.abs(e - cv) < 0.12)) alongCandidates.push(cv)
+      }
+      for (const obs of obstacles) {
+        if (obs.category !== 'structural') continue
+        const nearWall =
+          outdoorOutDx !== 0
+            ? obs.box.minX <= wallEdgeX + 0.45 && obs.box.maxX >= wallEdgeX - 0.45
+            : obs.box.minZ <= wallEdgeZ + 0.45 && obs.box.maxZ >= wallEdgeZ - 0.45
+        if (!nearWall) continue
+        if (outdoorOutDx !== 0) {
+          pushAlong(obs.box.minZ - 0.24)
+          pushAlong(obs.box.maxZ + 0.24)
+        } else {
+          pushAlong(obs.box.minX - 0.24)
+          pushAlong(obs.box.maxX + 0.24)
+        }
+      }
+      for (const d of [0.85, -0.85, 1.65, -1.65, 2.6, -2.6, 3.8, -3.8]) {
+        pushAlong(baseAlong + d)
+      }
+
+      // First try alternate exit elevations & lateral shifts along the exterior wall with standard standoff (0.16m),
+      // then wider standoff (0.28m) to clear deep commercial steel headers (e.g. W14x48) if needed, and alternate coil faces.
+      outerLineset: for (const standoff of [0.16, 0.28]) {
+        for (const along of alongCandidates) {
+          for (const ey of exitElevations) {
+            for (let fi = 0; fi < linesetFaces.length; fi++) {
+              if (standoff === 0.16 && along === baseAlong && ey === exitElevations[0] && fi === 0) continue
+              const cand = buildLinesetCand(linesetFaces[fi]!, along, ey, standoff)
+              if (isLinesetBetter(cand, linesetRoute)) {
+                linesetRoute = cand
+                if (linesetRoute.clashes.length === 0 && linesetRoute.roofOk) break outerLineset
+              }
+              // Only test secondary coil faces at the primary exit & first few lateral shifts for speed
+              if (along !== baseAlong && fi >= 1) break
+            }
+          }
         }
       }
     }
@@ -1343,10 +1726,40 @@ export function planHvacAutoPopulate(
       showFramingClearances: true,
     })
   } else if (systemType === 'rooftop-package') {
-    const [rtuX, rtuZ] = findClearMechanicalSpot(bounds.cx, bounds.cz, obstacles, bounds, 0.75)
+    // Anchor RTU strictly on top of the flat roof deck (clearing any structural flat-roof joist band, VIS-V3-10)
+    // and ensure concave L/U commercial buildings place the RTU over an actual roofed wing.
+    const overheadRoofBeamTopY = obstacles.reduce((maxY, o) => {
+      if (o.category === 'structural' && o.box.minY >= levelH - 0.08 && o.box.maxY > levelH + 0.05 && o.box.maxY <= levelH + 0.7) {
+        return Math.max(maxY, o.box.maxY)
+      }
+      return maxY
+    }, 0)
+    const hasRoofJoistDeck = framingCtx.framingPresent || overheadRoofBeamTopY > levelH + 0.05
+    const rtuBaseY = hasRoofJoistDeck
+      ? round2(
+          Math.max(
+            levelH + 0.3,
+            overheadRoofBeamTopY > 0 ? overheadRoofBeamTopY + 0.02 : 0,
+            framingCtx.framingPresent ? levelH + framingCtx.joistDepthIn * INCHES_TO_METERS + 0.02 : 0,
+          ),
+        )
+      : round2(levelH + 0.03)
+
+    let rtuSeedX = bounds.cx
+    let rtuSeedZ = bounds.cz
+    if (footprintContains && !footprintContains(rtuSeedX, rtuSeedZ)) {
+      const largestRoom = rooms
+        .filter((r) => r.category !== 'exterior')
+        .sort((a, b) => b.areaSqm - a.areaSqm)[0]
+      if (largestRoom) {
+        rtuSeedX = largestRoom.centroid[0]
+        rtuSeedZ = largestRoom.centroid[1]
+      }
+    }
+    const [rtuX, rtuZ] = findClearMechanicalSpot(rtuSeedX, rtuSeedZ, obstacles, bounds, 0.75)
     rtuPos = [
       clampToSpan(rtuX, indoorBounds.minX, indoorBounds.maxX),
-      round2(levelH + 0.15),
+      rtuBaseY,
       clampToSpan(rtuZ, indoorBounds.minZ, indoorBounds.maxZ),
     ]
     equipment.push({
@@ -1373,44 +1786,76 @@ export function planHvacAutoPopulate(
       }),
     })
 
-    // Sloped 3/4" PVC RTU Condensate Drain across flat roof deck (y ≈ levelH + 0.08 -> levelH + 0.02)
-    // to nearest interior roof drain / plumbing chase or roof-edge scupper strictly inside walls (VIS-04).
-    const rtuCondFrom: Vec3 = [
-      clampToSpan(rtuPos[0] + 0.45, indoorBounds.minX, indoorBounds.maxX),
-      round2(levelH + 0.08),
-      rtuPos[2],
-    ]
+    // Sloped 3/4" PVC RTU Condensate Drain routed ON TOP of the flat roof deck (never slicing through
+    // roof joists below rtuBaseY) toward the nearest perimeter roof-edge scupper strictly inside walls (VIS-V3-10 / VIS-04).
+    const rtuCondSlopeInPerFt = 0.15
+    const rtuCondSlopeRatio = rtuCondSlopeInPerFt / 12
     const scupperInsetX = bounds.maxX - bounds.minX > 0.7 ? 0.25 : 0.15
     const scupperInsetZ = bounds.maxZ - bounds.minZ > 0.7 ? 0.25 : 0.15
-    const makeRoofTarget = (tx: number, tz: number): Vec3 => {
+    const rtuCondStartX = clampToSpan(rtuPos[0] + 0.45, indoorBounds.minX, indoorBounds.maxX)
+    const rtuCondStartZ = rtuPos[2]
+
+    const candidateScuppersXZ: Array<readonly [number, number]> = []
+    const pushScupperXZ = (tx: number, tz: number) => {
       const cx = clampToSpan(tx, bounds.minX + scupperInsetX, bounds.maxX - scupperInsetX)
       const cz = clampToSpan(tz, bounds.minZ + scupperInsetZ, bounds.maxZ - scupperInsetZ)
-      const dist = Math.hypot(cx - rtuCondFrom[0], cz - rtuCondFrom[2])
-      const targetY = round2(Math.min(levelH + 0.03, rtuCondFrom[1] - Math.max(0.04, dist * (0.25 / 12))))
-      return [cx, targetY, cz]
+      if (footprintContains && !footprintContains(cx, cz)) return
+      if (!candidateScuppersXZ.some((e) => Math.abs(e[0] - cx) < 0.08 && Math.abs(e[1] - cz) < 0.08)) {
+        candidateScuppersXZ.push([cx, cz])
+      }
     }
-    const rtuCondTargetList: Vec3[] = []
-    if (wetCoreRoom) {
-      rtuCondTargetList.push(makeRoofTarget(wetCoreRoom.centroid[0], wetCoreRoom.centroid[1]))
+    if (walls.length > 0) {
+      const extSnaps = findNearestExteriorWallPoints({
+        origin: [rtuCondStartX, rtuCondStartZ],
+        walls,
+        rooms: rawRooms,
+        outwardOffsetM: 0.08,
+        cornerInsetM: 0.35,
+        extraOffsetsM: [],
+      })
+      for (const snap of extSnaps.slice(0, 4)) {
+        pushScupperXZ(snap.interiorBack[0], snap.interiorBack[1])
+      }
     }
-    const edgeScuppers: Vec3[] = [
-      makeRoofTarget(bounds.maxX - scupperInsetX, rtuPos[2]),
-      makeRoofTarget(bounds.minX + scupperInsetX, rtuPos[2]),
-      makeRoofTarget(rtuPos[0], bounds.minZ + scupperInsetZ),
-      makeRoofTarget(rtuPos[0], bounds.maxZ - scupperInsetZ),
-    ].sort(
+    const aabbEdgeScuppers: Array<readonly [number, number]> = [
+      [bounds.maxX - scupperInsetX, rtuPos[2]],
+      [bounds.minX + scupperInsetX, rtuPos[2]],
+      [rtuPos[0], bounds.minZ + scupperInsetZ],
+      [rtuPos[0], bounds.maxZ - scupperInsetZ],
+    ]
+    aabbEdgeScuppers.sort(
       (a, b) =>
-        Math.hypot(a[0] - rtuCondFrom[0], a[2] - rtuCondFrom[2]) -
-        Math.hypot(b[0] - rtuCondFrom[0], b[2] - rtuCondFrom[2]),
+        Math.hypot(a[0] - rtuCondStartX, a[1] - rtuCondStartZ) -
+        Math.hypot(b[0] - rtuCondStartX, b[1] - rtuCondStartZ),
     )
-    rtuCondTargetList.push(...edgeScuppers)
+    for (const [ex, ez] of aabbEdgeScuppers) pushScupperXZ(ex, ez)
+    if (wetCoreRoom) pushScupperXZ(wetCoreRoom.centroid[0], wetCoreRoom.centroid[1])
+    if (candidateScuppersXZ.length === 0) {
+      candidateScuppersXZ.push([
+        clampToSpan(bounds.maxX - scupperInsetX, indoorBounds.minX, indoorBounds.maxX),
+        rtuPos[2],
+      ])
+    }
+
+    const nearestTargetXZ = candidateScuppersXZ[0]!
+    const nearestRunM = Math.abs(nearestTargetXZ[0] - rtuCondStartX) + Math.abs(nearestTargetXZ[1] - rtuCondStartZ)
+    const desiredStartOffset = Math.max(0.04, Math.min(0.22, nearestRunM * rtuCondSlopeRatio + 0.015))
+    const rtuCondStartY = round2(rtuBaseY + desiredStartOffset)
+    const rtuCondFrom: Vec3 = [rtuCondStartX, rtuCondStartY, rtuCondStartZ]
+
+    const rtuCondTargetList: Vec3[] = candidateScuppersXZ.map(([cx, cz]) => {
+      const runM = Math.abs(cx - rtuCondFrom[0]) + Math.abs(cz - rtuCondFrom[2])
+      const targetY = round2(Math.max(rtuBaseY + 0.01, rtuCondFrom[1] - Math.max(0.03, runM * rtuCondSlopeRatio)))
+      return [cx, targetY, cz]
+    })
 
     let rtuCondRoute = routeCondensateDrain({
       from: rtuCondFrom,
       to: rtuCondTargetList[0]!,
       obstacles,
       xzBounds: indoorBounds,
-      roofEnvelope: atticRoof,
+      slopeInPerFt: rtuCondSlopeInPerFt,
+      footprintContains,
     })
     if (rtuCondRoute.clashes.length > 0) {
       for (let ti = 1; ti < rtuCondTargetList.length; ti++) {
@@ -1419,7 +1864,8 @@ export function planHvacAutoPopulate(
           to: rtuCondTargetList[ti]!,
           obstacles,
           xzBounds: indoorBounds,
-          roofEnvelope: atticRoof,
+          slopeInPerFt: rtuCondSlopeInPerFt,
+          footprintContains,
         })
         if (cand.clashes.length < rtuCondRoute.clashes.length) {
           rtuCondRoute = cand
@@ -1451,7 +1897,7 @@ export function planHvacAutoPopulate(
       name: `Multi-Zone Mini-Split Outdoor (${load.recommendedTons}-Ton)`,
       equipmentKind: 'mini-split-outdoor',
       position: outdoorPos,
-      rotation: 0,
+      rotation: outdoorRotation,
       roomName: 'Exterior Pad',
       coolingTons: load.recommendedTons,
       heatingBtuh: equipmentSpec.heatingOutputBtuh,
@@ -1486,12 +1932,11 @@ export function planHvacAutoPopulate(
 
   if (systemType === 'mini-split-multizone') {
     const msMaxY = maxPlenumYFor(0.03)
-    const msPlenumY =
-      plenumLocation === 'attic'
-        ? round2(Math.min(levelH + 0.12, msMaxY ?? levelH + 0.12))
-        : plenumLocation === 'conditioned-soffit'
-          ? round2(Math.min(levelH - 0.18, msMaxY ?? levelH - 0.18))
-          : round2(Math.min(-0.18, msMaxY ?? -0.18))
+    const msPlenumY = useTrueAtticPlenum
+      ? round2(Math.min(levelH + ceilingJoistClearM + 0.06, msMaxY ?? levelH + ceilingJoistClearM + 0.06))
+      : plenumLocation === 'attic' || plenumLocation === 'conditioned-soffit'
+        ? round2(Math.min(levelH - 0.18, msMaxY ?? levelH - 0.18))
+        : round2(Math.min(-0.18, msMaxY ?? -0.18))
     for (const { loadRow, room } of conditionedRooms) {
       if (
         room.category === 'bathroom' ||
@@ -1520,7 +1965,11 @@ export function planHvacAutoPopulate(
         throwFt: 18,
       })
       const lineRoute = routeHvacDuctRun({
-        from: [round2(outdoorPos[0] + (outdoorOnWest ? 0.25 : -0.25)), 0.45, outdoorPos[2]],
+        from: [
+          round2(outdoorPos[0] - outdoorOutDx * 0.25),
+          round2(gradeY + 0.45),
+          round2(outdoorPos[2] - outdoorOutDz * 0.25),
+        ],
         to: headPos,
         plenumY: msPlenumY,
         maxPlenumY: msMaxY,
@@ -1651,7 +2100,8 @@ export function planHvacAutoPopulate(
           cx >= indoorBounds.minX && cx <= indoorBounds.maxX && cz >= indoorBounds.minZ && cz <= indoorBounds.maxZ
         if (!inBounds) continue
         if (isAtticMountedAhu && atticRoof) {
-          if (retPlenumBaseY + Math.max(0.45, retPlenumH) > atticRoof.roofYAt(cx, cz) - 0.12) continue
+          const minRetRoofY = minRoofYOverFootprint(atticRoof, cx, cz, retPlenumW / 2, 0.32)
+          if (retPlenumBaseY + Math.max(0.45, retPlenumH) > minRetRoofY - 0.14) continue
         }
         const inRoom = pointInPolygon2D(cx, cz, mechRoom.polygon)
         const inAnyIndoorRoom =
@@ -1716,17 +2166,25 @@ export function planHvacAutoPopulate(
     )
 
     const supplyMaxY = maxPlenumYFor(supplyHalfV)
-    let trunkBaseX = clampToSpan(furthestRoom.room.centroid[0], indoorBounds.minX, indoorBounds.maxX)
-    let trunkBaseZ = clampToSpan(furthestRoom.room.centroid[1], indoorBounds.minZ, indoorBounds.maxZ)
+    const rawTrunkX = clampToSpan(furthestRoom.room.centroid[0], indoorBounds.minX, indoorBounds.maxX)
+    const rawTrunkZ = clampToSpan(furthestRoom.room.centroid[1], indoorBounds.minZ, indoorBounds.maxZ)
+    let trunkBaseX = rawTrunkX
+    let trunkBaseZ = rawTrunkZ
     if (atticRoof && plenumY > levelH + 0.05) {
-      // Keep main attic supply trunk inside the safe inner ridge corridor so it never pokes through sloped rafters (VIS-01)
+      // Keep main attic supply trunk inside the safe inner ridge corridor so it never pokes through sloped rafters (VIS-01),
+      // without pulling the trunk endpoint out into an open concave U/L courtyard (VIS-V3-04).
       const corrHalf = Math.min(atticRoof.halfSpan * 0.55, safeRoofCorridorHalfWidth(atticRoof, plenumY, supplyHalfV, 0.1))
       const corrLo = atticRoof.center - corrHalf
       const corrHi = atticRoof.center + corrHalf
-      if (atticRoof.ridgeAlongX) {
-        trunkBaseZ = clampToSpan(trunkBaseZ, Math.max(indoorBounds.minZ, corrLo), Math.min(indoorBounds.maxZ, corrHi))
-      } else {
-        trunkBaseX = clampToSpan(trunkBaseX, Math.max(indoorBounds.minX, corrLo), Math.min(indoorBounds.maxX, corrHi))
+      const candX = atticRoof.ridgeAlongX
+        ? trunkBaseX
+        : clampToSpan(trunkBaseX, Math.max(indoorBounds.minX, corrLo), Math.min(indoorBounds.maxX, corrHi))
+      const candZ = atticRoof.ridgeAlongX
+        ? clampToSpan(trunkBaseZ, Math.max(indoorBounds.minZ, corrLo), Math.min(indoorBounds.maxZ, corrHi))
+        : trunkBaseZ
+      if (!footprintContains || footprintContains(candX, candZ)) {
+        trunkBaseX = candX
+        trunkBaseZ = candZ
       }
     }
 
@@ -1739,6 +2197,8 @@ export function planHvacAutoPopulate(
       obstacles,
       bounds,
       minFloorClearanceM: Math.max(0.45, supplyHalfX + 0.12),
+      insidePolygon:
+        footprintContains && !footprintContains(bounds.cx, bounds.cz) ? furthestRoom.room.polygon : undefined,
       floorObstacles: plenumLocation === 'attic' ? atticLevelObstacles : obstacles,
       roofConstraint:
         atticRoof && plenumY > levelH + 0.05
@@ -1756,6 +2216,8 @@ export function planHvacAutoPopulate(
       obstacles,
       xzBounds: indoorBounds,
       roofEnvelope: atticRoof,
+      footprintContains,
+      interiorCorridorSpines,
     })
     if (trunkRoute.clashes.length > 0 && plenumLocation === 'attic') {
       for (const [dy, dx, dz] of [
@@ -1769,6 +2231,7 @@ export function planHvacAutoPopulate(
         const candY = supplyMaxY !== undefined ? Math.min(round2(plenumY + dy), supplyMaxY) : round2(plenumY + dy)
         const candX = clampToSpan(trunkEndX + dx, indoorBounds.minX, indoorBounds.maxX)
         const candZ = clampToSpan(trunkEndZ + dz, indoorBounds.minZ, indoorBounds.maxZ)
+        if (footprintContains && !footprintContains(candX, candZ)) continue
         if (atticRoof && candY > levelH + 0.05 && candY + supplyHalfV > atticRoof.roofYAt(candX, candZ) - 0.1) {
           continue
         }
@@ -1782,6 +2245,8 @@ export function planHvacAutoPopulate(
           obstacles,
           xzBounds: indoorBounds,
           roofEnvelope: atticRoof,
+          footprintContains,
+          interiorCorridorSpines,
         })
         if (cand.clashes.length < trunkRoute.clashes.length) {
           trunkRoute = cand
@@ -1813,7 +2278,7 @@ export function planHvacAutoPopulate(
         ? 'supply-ceiling-diffuser'
         : 'supply-floor-register'
     const termY =
-      supplyTermKind === 'supply-ceiling-diffuser' ? round2(levelH - 0.03) : HVAC_TERMINAL_SPECS[supplyTermKind].defaultMountY
+      supplyTermKind === 'supply-ceiling-diffuser' ? round2(levelH - 0.04) : HVAC_TERMINAL_SPECS[supplyTermKind].defaultMountY
 
     // Place room supply registers + tap Manual D round branches from nearest trunk spine point
     for (const { loadRow, room } of conditionedRooms) {
@@ -1858,7 +2323,7 @@ export function planHvacAutoPopulate(
           throwFt: Math.min(16, Math.max(6, Math.round(cfmEach / 12))),
         })
 
-        const tapPt = nearestPointOnSpine(trunkRoute.path, regPos[0], regPos[2], plenumY)
+        const tapPt = nearestPointOnSpine(trunkRoute.path, regPos[0], regPos[2], plenumY, footprintContains)
         const branchPlenumY =
           branchMaxY !== undefined ? Math.min(plenumY, branchMaxY) : plenumY
         const branchRoute = routeHvacDuctRun({
@@ -1871,6 +2336,8 @@ export function planHvacAutoPopulate(
           obstacles,
           xzBounds: indoorBounds,
           roofEnvelope: atticRoof,
+          footprintContains,
+          interiorCorridorSpines,
         })
         ductRuns.push({
           id: nextDuctId(),
@@ -1948,7 +2415,9 @@ export function planHvacAutoPopulate(
           ]
 
     const retGrilleY =
-      plenumLocation === 'attic' ? round2(levelH - 0.03) : round2(Math.min(levelH - 0.35, 2.2))
+      plenumLocation === 'attic' || systemType === 'rooftop-package'
+        ? round2(levelH - 0.04)
+        : round2(Math.min(levelH - 0.35, 2.2))
     const retMinClear = Math.max(0.42, retClashSpan.horizontal + 0.08)
     const retMaxY = maxPlenumYFor(retHalfV)
     const retCeilingObstacles =
@@ -2054,6 +2523,8 @@ export function planHvacAutoPopulate(
         obstacles,
         xzBounds: indoorBounds,
         roofEnvelope: atticRoof,
+        footprintContains,
+        interiorCorridorSpines,
       })
       const better =
         !chosenRetRoute ||
@@ -2218,10 +2689,7 @@ export function planHvacAutoPopulate(
     let ervInAttic = isAtticMountedAhu
     const atticErvMountY = round2(atticPlatformY + 0.04)
     const indoorErvMountY = round2(Math.min(levelH - 0.55, 1.85))
-    const ervAtticReqRoofY = atticErvMountY + 0.6 + 0.12
-    if (ervInAttic && atticRoof && ridgePeakY < ervAtticReqRoofY) {
-      ervInAttic = false
-    }
+    const ervAtticReqRoofY = atticErvMountY + 0.6 + 0.14
 
     let ervBaseX = indoorPos[0]
     let ervBaseZ = indoorPos[2]
@@ -2230,7 +2698,7 @@ export function planHvacAutoPopulate(
       const tz = round2(indoorPos[2] + oz)
       if (ervInAttic || isInsideWithMargin(tx, tz, mechRoom.polygon, 0.22)) {
         if (tx >= bounds.minX + 0.4 && tx <= bounds.maxX - 0.4 && tz >= bounds.minZ + 0.4 && tz <= bounds.maxZ - 0.4) {
-          if (!ervInAttic || !atticRoof || atticRoof.roofYAt(tx, tz) >= ervAtticReqRoofY) {
+          if (!ervInAttic || !atticRoof || minRoofYOverFootprint(atticRoof, tx, tz, 0.34, 0.24) >= ervAtticReqRoofY) {
             ervBaseX = tx
             ervBaseZ = tz
             break
@@ -2256,10 +2724,20 @@ export function planHvacAutoPopulate(
       floorObstacles: ervInAttic ? [...atticLevelObstacles, ervObstacles[ervObstacles.length - 1]!] : ervObstacles,
       roofConstraint:
         ervInAttic && atticRoof
-          ? { roof: atticRoof, requiredTopY: ervAtticReqRoofY, preferRidgeWeight: 28 }
+          ? {
+              roof: atticRoof,
+              requiredTopY: ervAtticReqRoofY,
+              preferRidgeWeight: 28,
+              footprintHalfW: 0.34,
+              footprintHalfD: 0.24,
+            }
           : undefined,
     })
-    if (ervInAttic && atticRoof && (!ervSpotRes.foundValid || atticRoof.roofYAt(ervSpotRes.spot[0], ervSpotRes.spot[1]) < ervAtticReqRoofY)) {
+    if (
+      ervInAttic &&
+      atticRoof &&
+      (!ervSpotRes.foundValid || minRoofYOverFootprint(atticRoof, ervSpotRes.spot[0], ervSpotRes.spot[1], 0.34, 0.24) < ervAtticReqRoofY)
+    ) {
       ervInAttic = false
       ervMountY = indoorErvMountY
       ervSpotRes = findClearSpotForRiser({
@@ -2309,49 +2787,103 @@ export function planHvacAutoPopulate(
     // Gate high/upper attic intake elevations strictly on useTrueAtticPlenum (HVA-BUG-03)
     const baseIntakeY =
       useTrueAtticPlenum && ervInAttic
-        ? round2(levelH + 0.25)
+        ? round2(levelH + ceilingJoistClearM + 0.06)
         : round2(Math.min(levelH - 0.35, 2.1))
     const highIntakeY = useTrueAtticPlenum
-      ? round2(Math.max(baseIntakeY, levelH + 0.34))
+      ? round2(Math.max(baseIntakeY, levelH + ceilingJoistClearM + 0.14))
       : round2(Math.min(levelH - 0.25, 2.25))
     const upperIntakeY = useTrueAtticPlenum
-      ? round2(levelH + 0.62)
+      ? round2(levelH + ceilingJoistClearM + 0.42)
       : round2(Math.min(levelH - 0.55, 1.85))
 
-    // Clamp & deduplicate all intake candidates strictly to walled building spans (HVA-BUG-02)
-    // and below pitched roof rafters at the wall line (VIS-01)
-    const intakeCandidates: Vec3[] = []
-    const pushIntake = (ix: number, rawY: number, iz: number) => {
+    const minDistToActualWall = (x: number, z: number): number => {
+      if (walls.length === 0) return 0
+      let best = Infinity
+      for (const w of walls) {
+        const { dist } = distancePointToSegment2D(x, z, w.start[0], w.start[1], w.end[0], w.end[1])
+        if (dist < best) best = dist
+      }
+      return best
+    }
+
+    type IntakeCandidate = {
+      intakePos: Vec3
+      interiorBack: Vec3
+      outwardNormal: readonly [number, number]
+    }
+    // Snap fresh-air intake hood FIRST onto verified real exterior walls (VIS-V3-04 Part A)
+    // so L/U-shaped footprints never float an intake hood out in an open yard; discard any synthetic
+    // AABB candidate that isn't within 0.25m of an actual wall segment!
+    const intakeCandidates: IntakeCandidate[] = []
+    const pushIntake = (
+      ix: number,
+      rawY: number,
+      iz: number,
+      backX: number,
+      backZ: number,
+      outNormal: readonly [number, number],
+      isSyntheticAabb = false,
+    ) => {
+      if (isSyntheticAabb && walls.length > 0 && minDistToActualWall(ix, iz) > 0.25) return
       const iy = clampExteriorExitY(ix, iz, rawY, ervHalfSpan)
       const pt: Vec3 = [round2(ix), iy, round2(iz)]
       if (
         !intakeCandidates.some(
-          (e) => Math.abs(e[0] - pt[0]) < 0.05 && Math.abs(e[1] - pt[1]) < 0.05 && Math.abs(e[2] - pt[2]) < 0.05,
+          (e) =>
+            Math.abs(e.intakePos[0] - pt[0]) < 0.05 &&
+            Math.abs(e.intakePos[1] - pt[1]) < 0.05 &&
+            Math.abs(e.intakePos[2] - pt[2]) < 0.05,
         )
       ) {
-        intakeCandidates.push(pt)
+        intakeCandidates.push({
+          intakePos: pt,
+          interiorBack: [
+            clampToSpan(backX, indoorBounds.minX, indoorBounds.maxX),
+            iy,
+            clampToSpan(backZ, indoorBounds.minZ, indoorBounds.maxZ),
+          ],
+          outwardNormal: outNormal,
+        })
       }
     }
+
+    const realWallIntakes = findNearestExteriorWallPoints({
+      origin: [ervPos[0], ervPos[2]],
+      walls,
+      rooms: rawRooms,
+      outwardOffsetM: 0.08,
+      cornerInsetM: 0.45,
+      extraOffsetsM: [1.4, -1.4, 2.8, -2.8],
+    })
+    for (const rw of realWallIntakes) {
+      pushIntake(rw.point[0], baseIntakeY, rw.point[1], rw.interiorBack[0], rw.interiorBack[1], rw.outwardNormal, false)
+      pushIntake(rw.point[0], highIntakeY, rw.point[1], rw.interiorBack[0], rw.interiorBack[1], rw.outwardNormal, false)
+      pushIntake(rw.point[0], upperIntakeY, rw.point[1], rw.interiorBack[0], rw.interiorBack[1], rw.outwardNormal, false)
+    }
+
     const clampedErvZ = clampToSpan(ervPos[2], wallMinZ, wallMaxZ)
     const clampedErvX = clampToSpan(ervPos[0], wallMinX, wallMaxX)
     const addSideWallIntakes = () => {
-      pushIntake(primaryIntakeX, baseIntakeY, clampedErvZ)
-      pushIntake(primaryIntakeX, highIntakeY, clampedErvZ)
-      pushIntake(primaryIntakeX, upperIntakeY, clampedErvZ)
+      const pSign = intakeOnWest ? -1 : 1
+      const pBackX = intakeOnWest ? bounds.minX + 0.18 : bounds.maxX - 0.18
+      const oBackX = intakeOnWest ? bounds.maxX - 0.18 : bounds.minX + 0.18
+      pushIntake(primaryIntakeX, baseIntakeY, clampedErvZ, pBackX, clampedErvZ, [pSign, 0], true)
+      pushIntake(primaryIntakeX, highIntakeY, clampedErvZ, pBackX, clampedErvZ, [pSign, 0], true)
+      pushIntake(primaryIntakeX, upperIntakeY, clampedErvZ, pBackX, clampedErvZ, [pSign, 0], true)
       for (const dz of [1.4, -1.4, 2.8, -2.8]) {
         const cz = round2(ervPos[2] + dz)
         if (cz >= wallMinZ && cz <= wallMaxZ) {
-          pushIntake(primaryIntakeX, highIntakeY, cz)
+          pushIntake(primaryIntakeX, highIntakeY, cz, pBackX, cz, [pSign, 0], true)
         }
       }
-      pushIntake(oppIntakeX, highIntakeY, clampedErvZ)
-      pushIntake(oppIntakeX, upperIntakeY, clampedErvZ)
+      pushIntake(oppIntakeX, highIntakeY, clampedErvZ, oBackX, clampedErvZ, [-pSign, 0], true)
+      pushIntake(oppIntakeX, upperIntakeY, clampedErvZ, oBackX, clampedErvZ, [-pSign, 0], true)
     }
     const addNorthSouthIntakes = () => {
-      pushIntake(clampedErvX, highIntakeY, round2(bounds.minZ - 0.08))
-      pushIntake(clampedErvX, highIntakeY, round2(bounds.maxZ + 0.08))
-      pushIntake(clampedErvX, upperIntakeY, round2(bounds.minZ - 0.08))
-      pushIntake(clampedErvX, upperIntakeY, round2(bounds.maxZ + 0.08))
+      pushIntake(clampedErvX, highIntakeY, round2(bounds.minZ - 0.08), clampedErvX, bounds.minZ + 0.18, [0, -1], true)
+      pushIntake(clampedErvX, highIntakeY, round2(bounds.maxZ + 0.08), clampedErvX, bounds.maxZ - 0.18, [0, 1], true)
+      pushIntake(clampedErvX, upperIntakeY, round2(bounds.minZ - 0.08), clampedErvX, bounds.minZ + 0.18, [0, -1], true)
+      pushIntake(clampedErvX, upperIntakeY, round2(bounds.maxZ + 0.08), clampedErvX, bounds.maxZ - 0.18, [0, 1], true)
     }
     if (atticRoof && !atticRoof.ridgeAlongX) {
       addNorthSouthIntakes()
@@ -2360,44 +2892,60 @@ export function planHvacAutoPopulate(
       addSideWallIntakes()
       addNorthSouthIntakes()
     }
+    if (intakeCandidates.length === 0) {
+      // Degenerate single/collinear-wall fallback
+      const pSign = intakeOnWest ? -1 : 1
+      const pBackX = intakeOnWest ? bounds.minX + 0.18 : bounds.maxX - 0.18
+      pushIntake(primaryIntakeX, baseIntakeY, clampedErvZ, pBackX, clampedErvZ, [pSign, 0], false)
+    }
 
-    let intakePos: Vec3 = intakeCandidates[0]!
-    let ervRoute = routeHvacDuctRun({
-      from: intakePos,
-      to: ervPos,
-      plenumY: ervPlenumY,
-      maxPlenumY: ervMaxY,
-      ductHalfSpanM: ervHalfSpan,
-      allowDiagonalBranch: false,
-      obstacles,
-      roofEnvelope: atticRoof,
-    })
+    const routeErvCandidate = (cand: IntakeCandidate) => {
+      // Route strictly inside the building envelope between the interior back of the intake wall
+      // and the ERV cabinet, then prepend the perpendicular wall-penetration stub to intakePos.
+      const inner = routeHvacDuctRun({
+        from: cand.interiorBack,
+        to: ervPos,
+        plenumY: ervPlenumY,
+        maxPlenumY: ervMaxY,
+        ductHalfSpanM: ervHalfSpan,
+        allowDiagonalBranch: false,
+        obstacles,
+        xzBounds: indoorBounds,
+        roofEnvelope: atticRoof,
+        footprintContains,
+        interiorCorridorSpines,
+      })
+      const fullPath: Vec3[] = [cand.intakePos]
+      for (const p of inner.path) {
+        const prev = fullPath[fullPath.length - 1]!
+        if (Math.hypot(p[0] - prev[0], p[1] - prev[1], p[2] - prev[2]) > 0.01) {
+          fullPath.push(p)
+        }
+      }
+      return { path: fullPath, clashes: detectHvacClashes(fullPath, obstacles, ervHalfSpan) }
+    }
+
+    let chosenIntake = intakeCandidates[0]!
+    let ervRoute = routeErvCandidate(chosenIntake)
     if (ervRoute.clashes.length > 0) {
       for (let ii = 1; ii < intakeCandidates.length; ii++) {
         const candIn = intakeCandidates[ii]!
-        const candRoute = routeHvacDuctRun({
-          from: candIn,
-          to: ervPos,
-          plenumY: ervPlenumY,
-          maxPlenumY: ervMaxY,
-          ductHalfSpanM: ervHalfSpan,
-          allowDiagonalBranch: false,
-          obstacles,
-          roofEnvelope: atticRoof,
-        })
+        const candRoute = routeErvCandidate(candIn)
         if (candRoute.clashes.length < ervRoute.clashes.length) {
-          intakePos = candIn
+          chosenIntake = candIn
           ervRoute = candRoute
           if (candRoute.clashes.length === 0) break
         }
       }
     }
+    const intakePos = chosenIntake.intakePos
+    const intakeRotation = round2(Math.atan2(chosenIntake.outwardNormal[0], chosenIntake.outwardNormal[1]))
     terminals.push({
       id: intakeId,
       name: `Fresh Air Intake Hood (${ventilation.continuousFreshAirCfm} CFM)`,
       terminalKind: 'fresh-air-intake',
       position: intakePos,
-      rotation: 0,
+      rotation: intakeRotation,
       roomName: 'Exterior',
       designCfm: ventilation.continuousFreshAirCfm,
       neckSizeIn: 6,
@@ -2432,10 +2980,11 @@ export function planHvacAutoPopulate(
         const exSized = sizeDuctForCfm({ cfm: 80, shape: 'round', material: 'galvanized-sheet', occupancy })
         const exHalfSpan = Math.max(0.06, (exSized.diameterIn * 0.0254) / 2)
         const exMaxY = maxPlenumYFor(exHalfSpan)
-        const exCappedBelowSlab = plenumLocation === 'conditioned-soffit' || !roofEnvelope.hasRoofAbove
+        const exCappedBelowSlab =
+          plenumLocation === 'conditioned-soffit' || !roofEnvelope.hasRoofAbove || systemType === 'rooftop-package'
         const exSoffitCapY = round2(levelH - Math.max(0.16, exHalfSpan + 0.06))
-        const fanY = round2(levelH - 0.05)
-        const rawExPlenumY = exCappedBelowSlab ? exSoffitCapY : round2(levelH + 0.3)
+        const fanY = systemType === 'rooftop-package' ? round2(levelH - 0.18) : round2(levelH - 0.05)
+        const rawExPlenumY = exCappedBelowSlab ? exSoffitCapY : round2(levelH + ceilingJoistClearM + exHalfSpan + 0.04)
         const exPlenumY = exCappedBelowSlab
           ? rawExPlenumY
           : exMaxY !== undefined && plenumLocation === 'attic'
@@ -2476,16 +3025,36 @@ export function planHvacAutoPopulate(
         })
         const cFanX = clampToSpan(fanX, wallMinX, wallMaxX)
         const cFanZ = clampToSpan(fanZ, wallMinZ, wallMaxZ)
-        const rawBathTargets: Vec3[] = [
-          [cFanX, clampExteriorExitY(cFanX, bounds.minZ - 0.1, exPlenumY, exHalfSpan), round2(bounds.minZ - 0.1)],
-          [cFanX, clampExteriorExitY(cFanX, bounds.maxZ + 0.1, exPlenumY, exHalfSpan), round2(bounds.maxZ + 0.1)],
-          [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
-          [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
-        ]
-        rawBathTargets.sort(
-          (a, b) =>
-            Math.hypot(a[0] - fanX, a[2] - fanZ) - Math.hypot(b[0] - fanX, b[2] - fanZ),
-        )
+        const rawBathTargets: Vec3[] = []
+        if (walls.length > 0) {
+          const bathWallSnaps = findNearestExteriorWallPoints({
+            origin: [fanX, fanZ],
+            walls,
+            rooms: rawRooms,
+            outwardOffsetM: 0.1,
+            cornerInsetM: 0.35,
+            extraOffsetsM: [],
+          })
+          for (const snap of bathWallSnaps.slice(0, 4)) {
+            rawBathTargets.push([
+              snap.point[0],
+              clampExteriorExitY(snap.point[0], snap.point[1], exPlenumY, exHalfSpan),
+              snap.point[1],
+            ])
+          }
+        }
+        if (rawBathTargets.length === 0) {
+          rawBathTargets.push(
+            [cFanX, clampExteriorExitY(cFanX, bounds.minZ - 0.1, exPlenumY, exHalfSpan), round2(bounds.minZ - 0.1)],
+            [cFanX, clampExteriorExitY(cFanX, bounds.maxZ + 0.1, exPlenumY, exHalfSpan), round2(bounds.maxZ + 0.1)],
+            [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
+            [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
+          )
+          rawBathTargets.sort(
+            (a, b) =>
+              Math.hypot(a[0] - fanX, a[2] - fanZ) - Math.hypot(b[0] - fanX, b[2] - fanZ),
+          )
+        }
         const exRouteMaxY = exCappedBelowSlab
           ? exSoffitCapY
           : exMaxY !== undefined && exMaxY > 0
@@ -2500,6 +3069,8 @@ export function planHvacAutoPopulate(
           allowDiagonalBranch: false,
           obstacles,
           roofEnvelope: atticRoof,
+          footprintContains,
+          interiorCorridorSpines,
         })
         if (exRoute.clashes.length > 0) {
           for (let ei = 1; ei < rawBathTargets.length; ei++) {
@@ -2512,6 +3083,8 @@ export function planHvacAutoPopulate(
               allowDiagonalBranch: false,
               obstacles,
               roofEnvelope: atticRoof,
+              footprintContains,
+              interiorCorridorSpines,
             })
             if (cand.clashes.length < exRoute.clashes.length) {
               exRoute = cand
@@ -2548,10 +3121,13 @@ export function planHvacAutoPopulate(
         const hoodDiam = Math.max(6, hoodSized.diameterIn)
         const hoodHalfSpan = Math.max(0.08, (hoodDiam * 0.0254) / 2)
         const hoodMaxY = maxPlenumYFor(hoodHalfSpan)
-        const hoodCappedBelowSlab = plenumLocation === 'conditioned-soffit' || !roofEnvelope.hasRoofAbove
+        const hoodCappedBelowSlab =
+          plenumLocation === 'conditioned-soffit' || !roofEnvelope.hasRoofAbove || systemType === 'rooftop-package'
         const hoodSoffitCapY = round2(levelH - Math.max(0.16, hoodHalfSpan + 0.06))
         const hoodY = round2(Math.min(levelH - 0.5, 1.78))
-        const rawHoodPlenumY = hoodCappedBelowSlab ? hoodSoffitCapY : round2(levelH + 0.34)
+        const rawHoodPlenumY = hoodCappedBelowSlab
+          ? hoodSoffitCapY
+          : round2(levelH + ceilingJoistClearM + hoodHalfSpan + 0.04)
         const hoodPlenumY = hoodCappedBelowSlab
           ? rawHoodPlenumY
           : hoodMaxY !== undefined && plenumLocation === 'attic'
@@ -2592,16 +3168,36 @@ export function planHvacAutoPopulate(
         const hoodFrom: Vec3 = [hoodPos[0], round2(hoodPos[1] + 0.25), hoodPos[2]]
         const cHoodX = clampToSpan(hoodX, wallMinX, wallMaxX)
         const cHoodZ = clampToSpan(hoodZ, wallMinZ, wallMaxZ)
-        const hoodTargets: Vec3[] = [
-          [cHoodX, clampExteriorExitY(cHoodX, bounds.minZ - 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.minZ - 0.1)],
-          [cHoodX, clampExteriorExitY(cHoodX, bounds.maxZ + 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.maxZ + 0.1)],
-          [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
-          [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
-        ]
-        hoodTargets.sort(
-          (a, b) =>
-            Math.hypot(a[0] - hoodX, a[2] - hoodZ) - Math.hypot(b[0] - hoodX, b[2] - hoodZ),
-        )
+        const hoodTargets: Vec3[] = []
+        if (walls.length > 0) {
+          const hoodWallSnaps = findNearestExteriorWallPoints({
+            origin: [hoodX, hoodZ],
+            walls,
+            rooms: rawRooms,
+            outwardOffsetM: 0.1,
+            cornerInsetM: 0.35,
+            extraOffsetsM: [],
+          })
+          for (const snap of hoodWallSnaps.slice(0, 4)) {
+            hoodTargets.push([
+              snap.point[0],
+              clampExteriorExitY(snap.point[0], snap.point[1], hoodPlenumY, hoodHalfSpan),
+              snap.point[1],
+            ])
+          }
+        }
+        if (hoodTargets.length === 0) {
+          hoodTargets.push(
+            [cHoodX, clampExteriorExitY(cHoodX, bounds.minZ - 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.minZ - 0.1)],
+            [cHoodX, clampExteriorExitY(cHoodX, bounds.maxZ + 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.maxZ + 0.1)],
+            [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
+            [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
+          )
+          hoodTargets.sort(
+            (a, b) =>
+              Math.hypot(a[0] - hoodX, a[2] - hoodZ) - Math.hypot(b[0] - hoodX, b[2] - hoodZ),
+          )
+        }
         const hoodRouteMaxY = hoodCappedBelowSlab
           ? hoodSoffitCapY
           : hoodMaxY !== undefined && hoodMaxY > 0
@@ -2616,6 +3212,8 @@ export function planHvacAutoPopulate(
           allowDiagonalBranch: false,
           obstacles,
           roofEnvelope: atticRoof,
+          footprintContains,
+          interiorCorridorSpines,
         })
         if (hoodRoute.clashes.length > 0) {
           for (let hi = 1; hi < hoodTargets.length; hi++) {
@@ -2628,6 +3226,8 @@ export function planHvacAutoPopulate(
               allowDiagonalBranch: false,
               obstacles,
               roofEnvelope: atticRoof,
+              footprintContains,
+              interiorCorridorSpines,
             })
             if (cand.clashes.length < hoodRoute.clashes.length) {
               hoodRoute = cand

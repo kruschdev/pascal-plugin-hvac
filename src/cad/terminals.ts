@@ -36,12 +36,30 @@ export function buildHvacTerminalCad(params: {
     return g
   }
 
-  if (terminalKind === 'return-grille' || terminalKind === 'transfer-grille') {
-    const w = terminalKind === 'return-grille' ? 0.54 : 0.36
-    const h = terminalKind === 'return-grille' ? 0.54 : 0.16
+  if (terminalKind === 'return-grille') {
+    // Ceiling-flush horizontal filter-back return grille (max local Y = 0.00 so at levelH - 0.04 it never pokes into roof joists)
+    const w = 0.54
+    const d = 0.54
+    const frame = new Mesh(new BoxGeometry(w, 0.026, d), pool.enamelWhite)
+    frame.position.y = -0.013
+    g.add(frame)
+    const bladeCount = 7
+    const bladeGeo = new BoxGeometry(w - 0.06, 0.018, 0.016)
+    for (let i = 0; i < bladeCount; i++) {
+      const z = -d * 0.35 + (i / (bladeCount - 1)) * (d * 0.7)
+      const blade = new Mesh(bladeGeo, pool.returnViolet)
+      blade.position.set(0, -0.022, z)
+      g.add(blade)
+    }
+    return g
+  }
+
+  if (terminalKind === 'transfer-grille') {
+    const w = 0.36
+    const h = 0.16
     const frame = new Mesh(new BoxGeometry(w, h, 0.03), pool.enamelWhite)
     g.add(frame)
-    const bladeCount = terminalKind === 'return-grille' ? 7 : 3
+    const bladeCount = 3
     const bladeGeo = new BoxGeometry(w - 0.06, 0.014, 0.024)
     for (let i = 0; i < bladeCount; i++) {
       const y = -h * 0.35 + (i / Math.max(1, bladeCount - 1)) * (h * 0.7)
@@ -62,18 +80,20 @@ export function buildHvacTerminalCad(params: {
   }
 
   if (terminalKind === 'supply-ceiling-diffuser' || terminalKind === 'exhaust-grille') {
+    // Flush downward-projecting ceiling diffuser / exhaust grille (max local Y = +0.02 so at levelH - 0.04 it clears roof joists)
     const isExhaust = terminalKind === 'exhaust-grille'
-    const plate = new Mesh(new BoxGeometry(0.32, 0.025, 0.32), pool.enamelWhite)
+    const plate = new Mesh(new BoxGeometry(0.32, 0.02, 0.32), pool.enamelWhite)
+    plate.position.y = -0.01
     g.add(plate)
     const inner = new Mesh(
-      new BoxGeometry(0.22, 0.03, 0.22),
+      new BoxGeometry(0.22, 0.024, 0.22),
       isExhaust ? pool.exhaustAmber : pool.supplyBranchCyan,
     )
-    inner.position.y = -0.008
+    inner.position.y = -0.022
     g.add(inner)
     const r = Math.max(0.05, (neckSizeIn * 0.0254) / 2)
-    const collar = new Mesh(new CylinderGeometry(r, r, 0.1, 14), pool.galvanizedSheet)
-    collar.position.y = 0.06
+    const collar = new Mesh(new CylinderGeometry(r, r, 0.02, 14), pool.galvanizedSheet)
+    collar.position.y = 0.01
     g.add(collar)
     return g
   }
