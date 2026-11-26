@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { auditSceneHvac } from '../imc/audit'
 import { planHvacAutoPopulate } from '../imc/autopopulate'
 import { routeHvacDuctRun, type HvacObstacle } from '../imc/routing'
 import type { SceneNodeLike } from '../imc/framing-interop'
@@ -48,5 +49,60 @@ describe('Cross-Trade 4-MEP Coordination Regression Suite (XTRADE-04)', () => {
     expect(bathFan).toBeDefined()
     const fanDistToVent = Math.hypot(bathFan!.position[0] - 7.5, bathFan!.position[2] - 4)
     expect(fanDistToVent).toBeGreaterThan(0.25)
+  })
+
+  test('auditSceneHvac auto-detects commercial occupancy from packaged-rtu/3-phase panels when occupancy is omitted (XTRADE-22)', () => {
+    const scene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', name: 'Ground Floor', height: 3.05 },
+      rtu_1: {
+        id: 'rtu_1',
+        type: 'hvac:equipment',
+        parentId: 'level_0',
+        name: 'Packaged RTU (6 Ton)',
+        equipmentKind: 'rooftop-package-unit',
+        position: [2, 3.3, 2],
+        coolingTons: 6,
+        airflowCfm: 2400,
+        electricalDemand: { voltage: 208, phases: 3, mca: 35, mop: 50, disconnectRequired: true },
+      },
+      trunk_sup: {
+        id: 'trunk_sup',
+        type: 'hvac:duct-run',
+        parentId: 'level_0',
+        name: '26"x12" Main Supply Trunk (2400 CFM)',
+        system: 'supply-trunk',
+        shape: 'rectangular',
+        width: 26,
+        height: 12,
+        material: 'galvanized-sheet',
+        insulationR: 8,
+        airflowCfm: 2400,
+        path: [
+          [2, 2.75, 2],
+          [10, 2.75, 2],
+        ],
+      },
+      trunk_ret: {
+        id: 'trunk_ret',
+        type: 'hvac:duct-run',
+        parentId: 'level_0',
+        name: '24"x14" Return Air Trunk (2400 CFM)',
+        system: 'return-trunk',
+        shape: 'rectangular',
+        width: 24,
+        height: 14,
+        material: 'galvanized-sheet',
+        insulationR: 8,
+        airflowCfm: 2400,
+        path: [
+          [10, 2.75, 4],
+          [2, 2.75, 4],
+        ],
+      },
+    }
+
+    const audit = auditSceneHvac(scene)
+    const velWarns = audit.findings.filter((f) => /Duct velocity/i.test(f.title))
+    expect(velWarns).toHaveLength(0)
   })
 })

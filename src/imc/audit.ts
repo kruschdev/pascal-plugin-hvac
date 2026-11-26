@@ -70,7 +70,18 @@ export function auditSceneHvac(
 ): HvacAuditResult {
   const codeEdition = options.codeEdition ?? 'IMC-2021'
   const climateZone = options.climateZone ?? '4A'
-  const occupancy = options.occupancy ?? 'residential'
+  const inferredCommercial = Object.values(nodes).some(
+    (n) =>
+      (n.type === 'hvac:equipment' &&
+        (n.equipmentKind === 'rooftop-package-unit' ||
+          n.equipmentKind === 'packaged-rtu' ||
+          n.equipmentKind === 'vrf-outdoor' ||
+          n.occupancy === 'commercial')) ||
+      (n.type === 'hvac:duct-run' && n.occupancy === 'commercial') ||
+      (n.type === 'electrical:panel' &&
+        (n.voltageSystem === '208Y/120V-3P' || n.voltageSystem === '480Y/277V-3P')),
+  )
+  const occupancy: OccupancyType = options.occupancy ?? (inferredCommercial ? 'commercial' : 'residential')
   const cacheKey = `${codeEdition}|${climateZone}|${occupancy}`
 
   let byKey = auditCache.get(nodes)

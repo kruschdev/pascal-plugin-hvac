@@ -619,7 +619,7 @@ export const hvacAgentOperations = {
     const audit = auditSceneHvac(asRecord(nodes), {
       codeEdition: input.codeEdition ?? 'IMC-2021',
       climateZone: input.climateZone ?? '4A',
-      occupancy: input.occupancy ?? 'residential',
+      occupancy: input.occupancy,
     })
     return { result: audit }
   },
