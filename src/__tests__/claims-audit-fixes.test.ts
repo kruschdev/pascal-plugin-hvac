@@ -865,13 +865,15 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
     expect(xfmrObs.box.maxY).toBeGreaterThanOrEqual(0.95 + 1.83 - 0.01)
 
     const expObs = obsList.find((o) => o.id === 'exp_tank')!
-    expect(expObs.box.maxX - expObs.box.minX).toBeCloseTo(0.32, 2)
-    expect(expObs.box.maxY).toBeCloseTo(0.45, 2)
+    expect(expObs.box.maxX - expObs.box.minX).toBeCloseTo(0.24, 2)
+    expect(expObs.box.minY).toBeCloseTo(-0.15, 2)
+    expect(expObs.box.maxY).toBeCloseTo(0.25, 2)
 
     const tanklessObs = obsList.find((o) => o.id === 'tankless_wh')!
-    expect(tanklessObs.box.maxX - tanklessObs.box.minX).toBeCloseTo(0.45, 2)
-    expect(tanklessObs.box.maxZ - tanklessObs.box.minZ).toBeCloseTo(0.30, 2)
-    expect(tanklessObs.box.maxY).toBeCloseTo(0.65, 2)
+    expect(tanklessObs.box.maxX - tanklessObs.box.minX).toBeCloseTo(0.44, 2)
+    expect(tanklessObs.box.maxZ - tanklessObs.box.minZ).toBeCloseTo(0.44, 2)
+    expect(tanklessObs.box.minY).toBeCloseTo(0.9, 2)
+    expect(tanklessObs.box.maxY).toBeCloseTo(1.95, 2)
 
     // Direct detectHvacClashes deduplicates diagonal beam sub-segments to 1 hit
     const directHits = detectHvacClashes([[0, 2.2, 0], [6, 2.2, 6]], obsList, 0.1)

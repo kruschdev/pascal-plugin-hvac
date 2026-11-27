@@ -19,8 +19,8 @@ import {
   type TaggedOpeningPrism,
   TradeOccupancyGrid,
   compileBuildingAnatomy,
+  countPathOpeningPrismHits,
   evaluatePlacementCandidate,
-  extractLevelOpeningPrisms,
   segmentIntersectsOrientedPrismY,
 } from '@kruschdev/pascal-mep-kernel'
 import {
@@ -1250,35 +1250,16 @@ type HeaderSafeExhaustCandidate = {
   readonly dropped: boolean
 }
 
-function countPathOpeningHits(
-  path: ReadonlyArray<Vec3>,
-  openingPrisms: readonly TaggedOpeningPrism[],
-  pad: Vec3,
-): number {
-  if (openingPrisms.length === 0 || path.length < 2) return 0
-  let hits = 0
-  for (let i = 1; i < path.length; i++) {
-    const a = path[i - 1]!
-    const b = path[i]!
-    for (let j = 0; j < openingPrisms.length; j++) {
-      if (segmentIntersectsOrientedPrismY(a, b, openingPrisms[j]!, pad)) {
-        hits += 1
-        break
-      }
-    }
-  }
-  return hits
-}
-
 /**
  * Build header-safe and opening-safe exterior wall cap termination candidates for kitchen range
  * hoods (`IMC 505.4`) and bath exhaust fans (`IMC 403.3 / 501.3`).
  *
  * Explicitly checks each candidate wall penetration against structural header beams
  * (`category === 'structural'` with `box.minY >= 1.8`) AND 3D window/door opening prisms
- * (`extractLevelOpeningPrisms`), generating lateral-past-header shifts AND drop-under-header
- * elevations (`header.box.minY - ductHalfV - 0.04`, clamped `>= 2.05m`) so exhaust ducts never
- * penetrate LVL window headers on 1st floors beneath 2nd stories (`hasRoofAbove === false`).
+ * (`anatomy.getOpeningPrisms`), generating lateral-past-header shifts AND drop-under-header
+ * elevations (`header.box.minY - ductHalfV - 0.04`, clamped via `clampExteriorExitY` and `>= 2.05m`)
+ * so exhaust ducts never penetrate LVL window headers on 1st floors beneath 2nd stories
+ * (`hasRoofAbove === false`).
  */
 function buildHeaderSafeExteriorExhaustTargets(params: {
   origin: readonly [number, number]
@@ -1348,7 +1329,7 @@ function buildHeaderSafeExteriorExhaustTargets(params: {
     ]
     const seg: readonly Vec3[] = [back, pt]
     const headerHits = detectHvacClashes(seg, structuralHeaders, ductHalfSpan).length
-    const openingHits = countPathOpeningHits(seg, openingPrisms, openingPad)
+    const openingHits = countPathOpeningPrismHits(seg, openingPrisms, ductHalfSpan + 0.04)
     const totalObsHits = detectHvacClashes(seg, obstacles, ductHalfSpan).length
     candidates.push({
       point: pt,
@@ -1395,11 +1376,13 @@ function buildHeaderSafeExteriorExhaustTargets(params: {
         segmentIntersectsOrientedPrismY(backPt, exitPt, op, openingPad),
       )
 
-      // Option A: Drop strictly underneath the blocking LVL/structural header (clamped >= 2.05m),
-      // automatically checked against opening prisms so we never drop into window glazing.
+      // Option A: Drop strictly underneath the blocking LVL/structural header (clamped by
+      // `clampExteriorExitY` and >= 2.05m), automatically checked against opening prisms so we
+      // never drop into window glazing or violate a low eave / soffit cap.
       if (hitHeaders.length > 0) {
         const lowestHeaderMinY = Math.min(...hitHeaders.map((h) => h.box.minY))
-        const droppedY = Math.floor((lowestHeaderMinY - ductHalfSpan - 0.04) * 100) / 100
+        const rawDroppedY = Math.floor((lowestHeaderMinY - ductHalfSpan - 0.04) * 100) / 100
+        const droppedY = clampExteriorExitY(snap.point[0], snap.point[1], rawDroppedY, ductHalfSpan)
         if (droppedY >= 2.05) {
           addCandidate(
             snap.point[0],
@@ -1496,7 +1479,8 @@ function buildHeaderSafeExteriorExhaustTargets(params: {
       const hitHeaders = detectHvacClashes([[bx, ey, bz], [px, ey, pz]], structuralHeaders, ductHalfSpan)
       if (hitHeaders.length > 0) {
         const lowestHeaderMinY = Math.min(...hitHeaders.map((h) => h.box.minY))
-        const droppedY = Math.floor((lowestHeaderMinY - ductHalfSpan - 0.04) * 100) / 100
+        const rawDroppedY = Math.floor((lowestHeaderMinY - ductHalfSpan - 0.04) * 100) / 100
+        const droppedY = clampExteriorExitY(px, pz, rawDroppedY, ductHalfSpan)
         if (droppedY >= 2.05) {
           addCandidate(px, droppedY, pz, bx, bz, true, true)
         }
@@ -1554,9 +1538,31 @@ function routeHeaderSafeExhaustRun(params: {
     cavityContext,
     plenumLocation,
   } = params
-  const openingPad: Vec3 = [ductHalfSpan + 0.04, ductHalfSpan + 0.04, ductHalfSpan + 0.04]
+  const openingPadM = ductHalfSpan + 0.04
+  const isPathRoofOk = (p: ReadonlyArray<Vec3>): boolean =>
+    !roofEnvelope || pathClearOfRoof(p, roofEnvelope, ductHalfSpan, 0.14, ductHalfSpan)
+  const isPathFootprintOk = (p: ReadonlyArray<Vec3>): boolean => {
+    if (!footprintContains || p.length < 2) return true
+    for (let i = 1; i < p.length; i++) {
+      if (segmentCrossesOutdoorVoid(p[i - 1]!, p[i]!, footprintContains, 0.5)) return false
+    }
+    return true
+  }
+  type ExhaustEval = {
+    path: Vec3[]
+    clashes: HvacObstacle[]
+    openingHits: number
+    roofOk: boolean
+    footprintOk: boolean
+  }
+  const isBetterExhaust = (cand: ExhaustEval, cur: ExhaustEval): boolean => {
+    if (cand.footprintOk !== cur.footprintOk) return cand.footprintOk
+    if (cand.roofOk !== cur.roofOk) return cand.roofOk
+    if (cand.clashes.length !== cur.clashes.length) return cand.clashes.length < cur.clashes.length
+    return cand.openingHits < cur.openingHits
+  }
 
-  const evalCandidate = (cand: HeaderSafeExhaustCandidate) => {
+  const evalCandidate = (cand: HeaderSafeExhaustCandidate): ExhaustEval => {
     const effPlenumY = cand.dropped ? Math.min(plenumY, cand.point[1]) : plenumY
     const effMaxY =
       cand.dropped
@@ -1587,13 +1593,15 @@ function routeHeaderSafeExhaustRun(params: {
     if (!last || Math.hypot(cand.point[0] - last[0], cand.point[1] - last[1], cand.point[2] - last[2]) > 0.01) {
       stubPath.push(cand.point)
     }
-    let bestLocal = {
+    let bestLocal: ExhaustEval = {
       path: stubPath,
       clashes: detectHvacClashes(stubPath, obstacles, ductHalfSpan),
-      openingHits: countPathOpeningHits(stubPath, openingPrisms, openingPad),
+      openingHits: countPathOpeningPrismHits(stubPath, openingPrisms, openingPadM),
+      roofOk: isPathRoofOk(stubPath),
+      footprintOk: isPathFootprintOk(stubPath),
     }
 
-    if (bestLocal.clashes.length > 0 || bestLocal.openingHits > 0) {
+    if (!bestLocal.footprintOk || !bestLocal.roofOk || bestLocal.clashes.length > 0 || bestLocal.openingHits > 0) {
       const direct = routeHvacDuctRun({
         from,
         to: cand.point,
@@ -1608,12 +1616,15 @@ function routeHeaderSafeExhaustRun(params: {
         cavityContext,
         plenumLocation,
       })
-      const directOpeningHits = countPathOpeningHits(direct.path, openingPrisms, openingPad)
-      if (
-        direct.clashes.length < bestLocal.clashes.length ||
-        (direct.clashes.length === bestLocal.clashes.length && directOpeningHits < bestLocal.openingHits)
-      ) {
-        bestLocal = { path: direct.path, clashes: direct.clashes, openingHits: directOpeningHits }
+      const directEval: ExhaustEval = {
+        path: direct.path,
+        clashes: direct.clashes,
+        openingHits: countPathOpeningPrismHits(direct.path, openingPrisms, openingPadM),
+        roofOk: isPathRoofOk(direct.path),
+        footprintOk: isPathFootprintOk(direct.path),
+      }
+      if (isBetterExhaust(directEval, bestLocal)) {
+        bestLocal = directEval
       }
     }
     return bestLocal
@@ -1622,16 +1633,13 @@ function routeHeaderSafeExhaustRun(params: {
   let best = evalCandidate(targets[0]!)
   const maxChecks = Math.min(targets.length, 14)
   for (let i = 1; i < maxChecks; i++) {
-    if (best.clashes.length === 0 && best.openingHits === 0) break
+    if (best.footprintOk && best.roofOk && best.clashes.length === 0 && best.openingHits === 0) break
     const cand = evalCandidate(targets[i]!)
-    if (
-      cand.clashes.length < best.clashes.length ||
-      (cand.clashes.length === best.clashes.length && cand.openingHits < best.openingHits)
-    ) {
+    if (isBetterExhaust(cand, best)) {
       best = cand
     }
   }
-  return best
+  return { path: best.path, clashes: best.clashes, openingHits: best.openingHits }
 }
 
 /**
@@ -1662,7 +1670,7 @@ export function planHvacAutoPopulate(
   const levelH = resolveLevelHeightM(nodes, levelId)
   const obstacles = extractHvacObstacles(nodes, levelId)
   const anatomy = compileBuildingAnatomy(nodes as Readonly<Record<string, KernelSceneNodeLike>>)
-  const levelOpeningPrisms = extractLevelOpeningPrisms(anatomy.getWalls(levelId))
+  const levelOpeningPrisms = anatomy.getOpeningPrisms(levelId)
   const levelOccupancy = anatomy.createOccupancyGrid(levelId, {
     forTrade: 'hvac',
     includeElectricalWorkingSpace: true,
@@ -1886,7 +1894,6 @@ export function planHvacAutoPopulate(
   const exteriorWindowPoints = extractWallOpeningPoints('window', outdoorOpeningLevels)
   const MIN_DOOR_CLEARANCE_M = IMC_RULE_THRESHOLDS.condenserDoorClearanceM
   const MIN_WIN_PLUMB_CLEARANCE_M = IMC_RULE_THRESHOLDS.condenserWindowPlumbingClearanceM
-  const MIN_SIBLING_CONDENSER_M = IMC_RULE_THRESHOLDS.condenserSiblingClearanceM
   const minDistToDoors = (cx: number, cz: number): number => {
     let best = Infinity
     for (const d of exteriorDoorPoints) {

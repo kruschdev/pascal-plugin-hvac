@@ -74,10 +74,10 @@ export const IMC_CONDENSATE_SLOPE_RULE: RoutingConstraintRule = {
   title: 'Condensate drain slope below 1/8"/ft minimum',
   suggestedFix:
     'Increase downward pitch to at least 1/8" to 1/4" per foot along the horizontal run.',
-  placementMarginM: 0.005,
   params: {
     targetSystems: ['condensate-drain'],
     minSlopeInPerFt: 0.12,
+    placementSlopeMarginInPerFt: 0.005,
   },
 }
 
@@ -217,7 +217,8 @@ const atticThresholdAuditOffsetM =
   IECC_ATTIC_DUCT_INSULATION_RULE.params.atticThresholdOffsetM ?? 0.05
 const atticPlacementMarginM = IECC_ATTIC_DUCT_INSULATION_RULE.placementMarginM ?? 0.07
 const condensateMinSlopeAudit = IMC_CONDENSATE_SLOPE_RULE.params.minSlopeInPerFt ?? 0.12
-const condensateSlopePlacementMargin = IMC_CONDENSATE_SLOPE_RULE.placementMarginM ?? 0.005
+const condensateSlopePlacementMargin =
+  IMC_CONDENSATE_SLOPE_RULE.params.placementSlopeMarginInPerFt ?? 0.005
 
 /**
  * Typed numeric & material thresholds derived directly from `IMC_DECLARATIVE_RULES`

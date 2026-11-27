@@ -30,7 +30,6 @@ import {
   distancePointToSegment2D as kernelDistancePointToSegment2D,
   extractBaseRoomPolygons,
   extractLevelOpeningPrisms,
-  extractNodeYawRad,
   extractTradeOccupancyObstacles,
   isHighestWalledLevelInBuilding,
   pointInPolygon2D as kernelPointInPolygon2D,
@@ -632,7 +631,11 @@ export function buildAtticRoofEnvelope(
     footprintPadM: 0.15,
   })
   const hasRoofAbove = isHighestWalledLevelInBuilding(kernelNodes, levelId)
-  const pitchRiseOver12 = shell.fallbackPitchRiseOver12 > 0 ? shell.fallbackPitchRiseOver12 : 6
+  const pitchRiseOver12 = shell.isFlatRoof
+    ? 0
+    : shell.fallbackPitchRiseOver12 > 0
+      ? shell.fallbackPitchRiseOver12
+      : 6
 
   const spanX = Math.max(0.5, bounds.maxX - bounds.minX)
   const spanZ = Math.max(0.5, bounds.maxZ - bounds.minZ)
@@ -694,6 +697,7 @@ export function safeRoofCorridorHalfWidth(
   halfH: number,
   clearanceM = 0.08,
 ): number {
+  if (roof.isFlatRoof) return 0
   const slope = roof.pitchRiseOver12 / 12
   if (slope <= 1e-4) return 0
   const neededRise = y + halfH + clearanceM - roof.wallH
@@ -819,50 +823,6 @@ export function extractHvacObstacles(
             },
           })
         }
-        continue
-      }
-    }
-
-    // Preserve HVAC's exact equipment envelope defaults for compact expansion tanks and
-    // tankless water heaters (XT-13 / REAL-HVC-01 backwards-compatibility).
-    if (obs.kind === 'plumbing-equipment') {
-      const src = nodes[obs.nodeId]
-      const eqKind = typeof src?.equipmentKind === 'string' ? src.equipmentKind : ''
-      const pos = Array.isArray(src?.position) && src.position.length >= 3 ? src.position : null
-      if (
-        pos &&
-        src &&
-        typeof src.width !== 'number' &&
-        typeof src.depth !== 'number' &&
-        typeof src.height !== 'number' &&
-        (eqKind === 'expansion-tank' || eqKind.startsWith('water-heater-tankless'))
-      ) {
-        const isTankless = eqKind.startsWith('water-heater-tankless')
-        const w = isTankless ? 0.45 : 0.32
-        const d = isTankless ? 0.3 : 0.32
-        const h = isTankless ? 0.65 : 0.45
-        const rot = extractNodeYawRad(src.rotation)
-        const cosR = Math.abs(Math.cos(rot))
-        const sinR = Math.abs(Math.sin(rot))
-        const halfX = (w * cosR + d * sinR) / 2
-        const halfZ = (w * sinR + d * cosR) / 2
-        const px = Number(pos[0])
-        const py = Number(pos[1])
-        const pz = Number(pos[2])
-        obstacles.push({
-          id: obs.id,
-          nodeId: obs.nodeId,
-          category,
-          label: obs.label,
-          box: {
-            minX: px - halfX,
-            maxX: px + halfX,
-            minY: py,
-            maxY: py + h,
-            minZ: pz - halfZ,
-            maxZ: pz + halfZ,
-          },
-        })
         continue
       }
     }
@@ -1023,6 +983,26 @@ export type RouteHvacViaLegalCavityParams = {
   interiorPolygons?: readonly (readonly (readonly [number, number])[])[]
 }
 
+let nextHvacCavityRunSeq = 1
+
+function polygonListSignature(
+  polys?: readonly (readonly (readonly [number, number])[])[],
+): string {
+  if (!polys || polys.length === 0) return '0'
+  let acc = `${polys.length}:`
+  for (let i = 0; i < polys.length; i++) {
+    const p = polys[i]!
+    acc += `${p.length}@`
+    for (let j = 0; j < p.length; j++) {
+      const pt = p[j]!
+      acc += `${Math.round(pt[0] * 1000) / 1000},${Math.round(pt[1] * 1000) / 1000}`
+      if (j + 1 < p.length) acc += ','
+    }
+    acc += ';'
+  }
+  return acc
+}
+
 /**
  * Layer 2 — Route an HVAC duct, exhaust, refrigerant lineset (`mode: 'orthogonal'`) or
  * gravity-sloped condensate drain (`mode: 'gravity-slope'`) through legal building cavities
@@ -1032,6 +1012,7 @@ export type RouteHvacViaLegalCavityParams = {
 export function routeHvacViaLegalCavity(params: RouteHvacViaLegalCavityParams): CavityRouteResult {
   const mode = params.mode ?? 'orthogonal'
   const levelId = params.levelId !== undefined ? params.levelId : (params.cavityContext?.levelId ?? null)
+  const sameContextLevel = params.cavityContext !== undefined && levelId === params.cavityContext.levelId
   const kernelNodes = params.nodes as Readonly<Record<string, KernelSceneNodeLike>> | undefined
 
   const anatomy =
@@ -1041,7 +1022,7 @@ export function routeHvacViaLegalCavity(params: RouteHvacViaLegalCavityParams): 
 
   const baseOccupancy =
     params.occupancy ??
-    params.cavityContext?.occupancy ??
+    (sameContextLevel ? params.cavityContext?.occupancy : undefined) ??
     anatomy.createOccupancyGrid(levelId, {
       forTrade: 'hvac',
       includeElectricalWorkingSpace: true,
@@ -1096,8 +1077,10 @@ export function routeHvacViaLegalCavity(params: RouteHvacViaLegalCavityParams): 
   const clearanceM = params.clearanceM ?? 0.02
   const roofClearanceM = params.roofClearanceM ?? (mode === 'gravity-slope' ? 0.06 : 0.14)
 
-  let outdoorPolygons = params.outdoorPolygons ?? params.cavityContext?.outdoorPolygons
-  let interiorPolygons = params.interiorPolygons ?? params.cavityContext?.interiorPolygons
+  let outdoorPolygons =
+    params.outdoorPolygons ?? (sameContextLevel ? params.cavityContext?.outdoorPolygons : undefined)
+  let interiorPolygons =
+    params.interiorPolygons ?? (sameContextLevel ? params.cavityContext?.interiorPolygons : undefined)
   if (!outdoorPolygons && !interiorPolygons && params.nodes) {
     const rooms = extractRoomPolygons(params.nodes, levelId)
     const part = getPartitionedRoomPolygons(rooms)
@@ -1115,7 +1098,8 @@ export function routeHvacViaLegalCavity(params: RouteHvacViaLegalCavityParams): 
   let graph = params.graph
   if (!graph) {
     const cache = params.cavityContext?.graphCache
-    const cacheKey = `${round2(halfXZ)}|${round2(halfY)}|${params.atticElevationM !== undefined ? round2(params.atticElevationM) : 'auto'}|${params.flatSoffitMarginM !== undefined ? round2(params.flatSoffitMarginM) : 'auto'}|${round2(roofClearanceM)}|${includeSubFloorLayer ? 1 : 0}`
+    const levelKey = levelId ?? '__all__'
+    const cacheKey = `${levelKey}|${round2(halfXZ)}|${round2(halfY)}|${params.atticElevationM !== undefined ? round2(params.atticElevationM) : 'auto'}|${params.flatSoffitMarginM !== undefined ? round2(params.flatSoffitMarginM) : 'auto'}|${round2(roofClearanceM)}|${includeSubFloorLayer ? 1 : 0}|${polygonListSignature(interiorPolygons)}|${polygonListSignature(outdoorPolygons)}`
     graph = cache?.get(cacheKey)
     if (!graph) {
       graph = compileLegalCavityGraph(anatomy, levelId, {
@@ -1167,6 +1151,10 @@ export function routeHvacViaLegalCavity(params: RouteHvacViaLegalCavityParams): 
         )
       : undefined
 
+  const shouldReserve = params.reserveOnCommit === true
+  const reserveDirectly = shouldReserve && effectiveOccupancy === baseOccupancy
+  const resolvedRunId = params.runId ?? (shouldReserve ? `hvac-cavity-${nextHvacCavityRunSeq++}` : undefined)
+
   const result = routeInLegalCavities({
     anatomy,
     graph,
@@ -1183,21 +1171,22 @@ export function routeHvacViaLegalCavity(params: RouteHvacViaLegalCavityParams): 
       ...(minSlopeInPerFt !== undefined ? { minSlopeInPerFt } : {}),
       roofClearanceM,
       ...(params.preferWallFollowing !== undefined ? { preferWallFollowing: params.preferWallFollowing } : {}),
-      reserveOnCommit: params.reserveOnCommit === true,
-      ...(params.runId !== undefined ? { runId: params.runId } : {}),
+      reserveOnCommit: reserveDirectly,
+      ...(resolvedRunId !== undefined ? { runId: resolvedRunId } : {}),
       ...(params.ignoreObstacleNodeIds ? { ignoreObstacleNodeIds: params.ignoreObstacleNodeIds } : {}),
     },
   })
 
-  if (params.reserveOnCommit === true && effectiveOccupancy !== baseOccupancy && result.path.length >= 2) {
-    baseOccupancy.reserveRun({
-      runId: params.runId ?? `hvac-cavity-${Date.now()}`,
+  if (shouldReserve && effectiveOccupancy !== baseOccupancy && result.path.length >= 2) {
+    const reservationId = baseOccupancy.reserveRun({
+      runId: resolvedRunId ?? `hvac-cavity-${nextHvacCavityRunSeq++}`,
       trade: 'hvac',
       path: result.path,
       halfXZ,
       halfY,
       clearanceM,
     })
+    return { ...result, reservationId }
   }
 
   return result
@@ -1605,7 +1594,7 @@ export function routeHvacDuctRun(params: {
   if (!isDone()) {
     // When primary crosses a concave outdoor void (e.g. U-shaped courtyard or L-notch),
     // immediately try the alternative L-bend AND 2-bend / 3-bend interior wing corridor spines first!
-    if (!isDone() && footprintContains && !bestFootprintOk) {
+    if (footprintContains && !bestFootprintOk) {
       const baseY = clampY(plenumY)
       const spineYs = dedupYs([
         plenumY,

@@ -4,9 +4,14 @@
  * Framework-free: zero React, Three.js, or `@pascal-app/*` imports.
  */
 
-import { evaluatePlacementCandidate } from '@kruschdev/pascal-mep-kernel'
+import {
+  type SceneNodeLike as KernelSceneNodeLike,
+  compileBuildingAnatomy,
+  evaluatePlacementCandidate,
+} from '@kruschdev/pascal-mep-kernel'
 import {
   type SceneNodeLike,
+  belongsToLevel,
   resolveNodeLevelId,
 } from './framing-interop'
 import {
@@ -20,10 +25,14 @@ import {
   pointInPolygon2D,
   polylineLengthM,
   resolveLevelHeightM,
+  resolveLowerWalledLevels,
 } from './routing'
 import {
   IECC_ATTIC_DUCT_INSULATION_RULE,
   IMC_CONDENSATE_SLOPE_RULE,
+  IMC_CONDENSER_DOOR_CLEARANCE_RULE,
+  IMC_CONDENSER_SIBLING_CLEARANCE_RULE,
+  IMC_CONDENSER_WINDOW_PLUMBING_CLEARANCE_RULE,
   IMC_PROHIBITED_RETURN_CATEGORIES,
   IMC_PROHIBITED_RETURN_ZONES_RULE,
   IMC_RANGE_HOOD_MATERIAL_RULE,
@@ -122,6 +131,8 @@ export function auditSceneHvac(
   const obstaclesByLevel = new Map<string, HvacObstacle[]>()
   const roomsByLevel = new Map<string, RoomPolygon2D[]>()
   const levelHeightCache = new Map<string, number>()
+  const lowerLevelsCache = new Map<string, ReturnType<typeof resolveLowerWalledLevels>>()
+  const anatomy = compileBuildingAnatomy(nodes as Readonly<Record<string, KernelSceneNodeLike>>)
 
   const getObstaclesForLevel = (lvlId: string | null): HvacObstacle[] => {
     const key = lvlId ?? '__all__'
@@ -150,13 +161,61 @@ export function auditSceneHvac(
     }
     return h
   }
+  const getLowerLevels = (lvlId: string | null) => {
+    const key = lvlId ?? '__all__'
+    let info = lowerLevelsCache.get(key)
+    if (!info) {
+      info = resolveLowerWalledLevels(nodes, lvlId)
+      lowerLevelsCache.set(key, info)
+    }
+    return info
+  }
 
-  // 1. Equipment checks (IMC 307.2 condensate drain & secondary pan, NEC 440.14 disconnect, gas furnace fuel-gas)
+  // 1. Equipment checks (IMC 307.2 condensate drain & secondary pan, NEC 440.14 disconnect,
+  //    IMC 304 / M1403 outdoor condenser clearances, gas furnace fuel-gas)
+  const condenserTargetRoles = new Set<string>(IMC_CONDENSER_DOOR_CLEARANCE_RULE.params.targetRoles)
+  const condenserRules = [
+    IMC_CONDENSER_DOOR_CLEARANCE_RULE,
+    IMC_CONDENSER_WINDOW_PLUMBING_CLEARANCE_RULE,
+    IMC_CONDENSER_SIBLING_CLEARANCE_RULE,
+  ] as const
+  const positionedCondensers: Array<{
+    eq: SceneNodeLike
+    kind: HvacEquipmentKind
+    levelId: string | null
+    cx: number
+    cy: number
+    cz: number
+    worldY: number
+  }> = []
   const levelCoolingCoils = new Map<string, string[]>()
   for (const eq of equipment) {
     const kind = (eq.equipmentKind as HvacEquipmentKind) || 'air-handler'
     const spec = HVAC_EQUIPMENT_SPECS[kind]
-    const eqLevelKey = resolveNodeLevelId(nodes, eq) ?? '__root__'
+    const eqLevelId = resolveNodeLevelId(nodes, eq)
+    const eqLevelKey = eqLevelId ?? '__root__'
+    if (
+      spec?.isOutdoor &&
+      condenserTargetRoles.has(kind) &&
+      Array.isArray(eq.position) &&
+      eq.position.length >= 3
+    ) {
+      const cx = Number(eq.position[0])
+      const cy = Number(eq.position[1])
+      const cz = Number(eq.position[2])
+      if (Number.isFinite(cx) && Number.isFinite(cy) && Number.isFinite(cz)) {
+        const lower = getLowerLevels(eqLevelId)
+        positionedCondensers.push({
+          eq,
+          kind,
+          levelId: eqLevelId,
+          cx,
+          cy,
+          cz,
+          worldY: lower.cumulativeBelowHeightM + cy,
+        })
+      }
+    }
     if (
       kind === 'gas-furnace-96' ||
       ((kind === 'air-handler' || kind === 'gas-furnace-80') &&
@@ -207,6 +266,118 @@ export function auditSceneHvac(
         suggestedFix: 'Enable Fuel Gas in Plumbing Auto-Populate or route a sized black-iron/CSST gas line with drip leg.',
         nodeIds: [eq.id],
       })
+    }
+  }
+
+  // 1b. Declarative outdoor condenser clearances (IMC 304 / M1403): doors, windows/plumbing, siblings
+  const reportedSiblingPairs = new Set<string>()
+  for (const cond of positionedCondensers) {
+    const { eq, kind, levelId: condLevelId, cx, cy, cz, worldY } = cond
+    const scopeLevels: Array<string | null> = [condLevelId]
+    if (cy < -0.1) {
+      const groundLevelId = getLowerLevels(condLevelId).groundLevelId
+      if (groundLevelId && !scopeLevels.includes(groundLevelId)) {
+        scopeLevels.push(groundLevelId)
+      }
+    }
+
+    let nearestDoor: { id: string; dist: number } | null = null
+    let nearestWindow: { id: string; dist: number } | null = null
+    const seenOpenings = new Set<string>()
+    for (const lvlId of scopeLevels) {
+      for (const wall of anatomy.getWalls(lvlId)) {
+        for (const op of wall.openings) {
+          seenOpenings.add(op.id)
+          const dist = Math.hypot(cx - op.centerX, cz - op.centerZ)
+          if (op.kind === 'door') {
+            if (!nearestDoor || dist < nearestDoor.dist) nearestDoor = { id: op.id, dist }
+          } else if (op.kind === 'window') {
+            if (!nearestWindow || dist < nearestWindow.dist) nearestWindow = { id: op.id, dist }
+          }
+        }
+      }
+    }
+    // Also capture standalone unparented door/window nodes with explicit world positions
+    for (const n of all) {
+      if ((n.type !== 'door' && n.type !== 'window') || n.visible === false || seenOpenings.has(n.id)) continue
+      if (!scopeLevels.some((lid) => belongsToLevel(nodes, n, lid))) continue
+      if (Array.isArray(n.position) && n.position.length >= 3) {
+        const px = Number(n.position[0])
+        const pz = Number(n.position[2])
+        if (!Number.isFinite(px) || !Number.isFinite(pz)) continue
+        const dist = Math.hypot(cx - px, cz - pz)
+        if (n.type === 'door') {
+          if (!nearestDoor || dist < nearestDoor.dist) nearestDoor = { id: n.id, dist }
+        } else if (!nearestWindow || dist < nearestWindow.dist) {
+          nearestWindow = { id: n.id, dist }
+        }
+      }
+    }
+
+    let nearestPlumb: { id: string; dist: number } | null = null
+    for (const lvlId of scopeLevels) {
+      for (const obs of getObstaclesForLevel(lvlId)) {
+        if (obs.category !== 'plumbing') continue
+        const ox = (obs.box.minX + obs.box.maxX) / 2
+        const oz = (obs.box.minZ + obs.box.maxZ) / 2
+        const dist = Math.hypot(cx - ox, cz - oz)
+        const baseObsId = obs.nodeId ?? obs.id.replace(/:seg.*$/, '')
+        if (!nearestPlumb || dist < nearestPlumb.dist) {
+          nearestPlumb = { id: baseObsId, dist }
+        }
+      }
+    }
+
+    let nearestSib: { id: string; dist: number } | null = null
+    for (const other of positionedCondensers) {
+      if (other.eq.id === eq.id) continue
+      if (other.levelId !== condLevelId && Math.abs(other.worldY - worldY) > 1.0) continue
+      const pairKey = [eq.id, other.eq.id].sort().join('|')
+      if (reportedSiblingPairs.has(pairKey)) continue
+      const dist = Math.hypot(cx - other.cx, cz - other.cz)
+      if (!nearestSib || dist < nearestSib.dist) {
+        nearestSib = { id: other.eq.id, dist }
+      }
+    }
+
+    const nearFixtures: Array<{ kind: string; horizontalDistM: number }> = []
+    if (nearestDoor) nearFixtures.push({ kind: 'door', horizontalDistM: nearestDoor.dist })
+    if (nearestWindow) nearFixtures.push({ kind: 'window', horizontalDistM: nearestWindow.dist })
+    if (nearestPlumb) nearFixtures.push({ kind: 'plumbing', horizontalDistM: nearestPlumb.dist })
+    if (nearestSib) nearFixtures.push({ kind: 'sibling-condenser', horizontalDistM: nearestSib.dist })
+
+    if (nearFixtures.length > 0) {
+      const clearanceEval = evaluatePlacementCandidate(
+        condenserRules,
+        {
+          id: eq.id,
+          kind,
+          role: kind,
+          pos: [cx, cy, cz],
+          nearFixtures,
+        },
+        'audit',
+      )
+      for (const v of clearanceEval.violations) {
+        let refId: string | undefined
+        if (v.ruleId === IMC_CONDENSER_DOOR_CLEARANCE_RULE.id) {
+          refId = nearestDoor?.id
+        } else if (v.ruleId === IMC_CONDENSER_SIBLING_CLEARANCE_RULE.id) {
+          refId = nearestSib?.id
+          if (refId) reportedSiblingPairs.add([eq.id, refId].sort().join('|'))
+        } else if (v.ruleId === IMC_CONDENSER_WINDOW_PLUMBING_CLEARANCE_RULE.id) {
+          refId = v.message.includes('"window"') ? nearestWindow?.id : nearestPlumb?.id
+        }
+        const nodeIds = refId && refId !== eq.id ? [eq.id, refId] : [eq.id]
+        push({
+          severity: v.severity,
+          codeRef: v.codeRef,
+          title: v.title,
+          detail: `${eq.name ?? eq.id}: ${v.message}`,
+          suggestedFix: v.suggestedFix,
+          nodeIds,
+        })
+      }
     }
   }
 
@@ -539,11 +710,16 @@ export function auditSceneHvac(
       'audit',
     )
     if (!returnEval.legal || IMC_PROHIBITED_RETURN_CATEGORIES.has(roomCat)) {
+      const aboveCeilingInConditioned = termY > lvlH && !IMC_PROHIBITED_RETURN_CATEGORIES.has(roomCat)
       push({
         severity: IMC_PROHIBITED_RETURN_ZONES_RULE.severity,
         codeRef: IMC_PROHIBITED_RETURN_ZONES_RULE.codeRef,
-        title: `Return air grille placed in prohibited ${roomCat} zone`,
-        detail: `${t.name ?? t.id} draws return air from ${roomLabel || roomCat}; IMC 601.5 and IRC M1602.2 prohibit return air from bathrooms, kitchens, garages, closets, utility rooms, attics, or exterior spaces.`,
+        title: aboveCeilingInConditioned
+          ? 'Return air grille placed in above-ceiling / attic zone'
+          : `Return air grille placed in prohibited ${roomCat} zone`,
+        detail: aboveCeilingInConditioned
+          ? `${t.name ?? t.id} is positioned above ceiling height (${round2(termY)} m > ${round2(lvlH)} m) over ${roomLabel || roomCat}; IMC 601.5 and IRC M1602.2 prohibit drawing return air from unconditioned attic / above-ceiling spaces.`
+          : `${t.name ?? t.id} draws return air from ${roomLabel || roomCat}; IMC 601.5 and IRC M1602.2 prohibit return air from bathrooms, kitchens, garages, closets, utility rooms, attics, or exterior spaces.`,
         suggestedFix: IMC_PROHIBITED_RETURN_ZONES_RULE.suggestedFix,
         nodeIds: [t.id],
       })
