@@ -936,23 +936,31 @@ export function pathClearOfRoof(
   path: ReadonlyArray<Vec3>,
   roof: AtticRoofEnvelope,
   halfH: number,
-  clearanceM = 0.08,
+  clearanceM = 0.14,
+  ductHalfWidthM = 0,
 ): boolean {
   if (!roof.hasRoofAbove) return true
   const { bounds, wallH, roofYAt } = roof
+  const hw = Math.max(0, ductHalfWidthM)
   for (let i = 0; i < path.length - 1; i++) {
     const a = path[i]!
     const b = path[i + 1]!
-    if (Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) < 0.02) continue
-    for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+    const segLen = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    if (segLen < 0.02) continue
+    const steps = Math.max(4, Math.ceil(segLen / 0.45))
+    for (let s = 0; s <= steps; s++) {
+      const f = s / steps
       const px = a[0] + (b[0] - a[0]) * f
       const py = a[1] + (b[1] - a[1]) * f
       const pz = a[2] + (b[2] - a[2]) * f
       if (px < bounds.minX - 0.1 || px > bounds.maxX + 0.1 || pz < bounds.minZ - 0.1 || pz > bounds.maxZ + 0.1) {
         continue
       }
-      if (py > wallH + 0.05 && py + halfH > roofYAt(px, pz) - clearanceM) {
-        return false
+      if (py > wallH + 0.05) {
+        const minRoofY = hw > 0.02 ? minRoofYOverFootprint(roof, px, pz, hw, hw) : roofYAt(px, pz)
+        if (py + halfH > minRoofY - clearanceM) {
+          return false
+        }
       }
     }
   }
@@ -1476,16 +1484,19 @@ export function routeHvacDuctRun(params: {
   }
 
   const hasPitchedRoof = Boolean(roofEnvelope?.hasRoofAbove)
-  const roofSoffitY = roofEnvelope ? round2(roofEnvelope.wallH - Math.max(0.08, ductHalfV + 0.04)) : plenumY
+  const roofSoffitY = roofEnvelope ? round2(roofEnvelope.wallH - Math.max(0.12, ductHalfV + 0.1)) : plenumY
+  const roofClearMarginM = 0.14
 
   const isRoofOk = (cand: ReadonlyArray<Vec3>): boolean =>
-    !hasPitchedRoof || !roofEnvelope ? true : pathClearOfRoof(cand, roofEnvelope, ductHalfV, 0.08)
+    !hasPitchedRoof || !roofEnvelope
+      ? true
+      : pathClearOfRoof(cand, roofEnvelope, ductHalfV, roofClearMarginM, ductHalfH)
 
   const stepUnderRoof = (pts: Vec3[], y: number): Vec3[] => {
     if (!hasPitchedRoof || !roofEnvelope || y <= roofEnvelope.wallH + 0.05) return pts
-    if (pathClearOfRoof(pts, roofEnvelope, ductHalfV, 0.08)) return pts
+    if (pathClearOfRoof(pts, roofEnvelope, ductHalfV, roofClearMarginM, ductHalfH)) return pts
 
-    const safeHalf = safeRoofCorridorHalfWidth(roofEnvelope, y, ductHalfV, 0.1)
+    const safeHalf = safeRoofCorridorHalfWidth(roofEnvelope, y, ductHalfV, roofClearMarginM + 0.02)
     const lo = roofEnvelope.center - safeHalf
     const hi = roofEnvelope.center + safeHalf
     const alongX = roofEnvelope.ridgeAlongX
@@ -1493,7 +1504,11 @@ export function routeHvacDuctRun(params: {
     const toPerp = alongX ? to[2] : to[0]
 
     const safeEndY = (pt: Vec3): number => {
-      const cap = roofEnvelope.roofYAt(pt[0], pt[2]) - ductHalfV - 0.09
+      const minRoofY =
+        ductHalfH > 0.02
+          ? minRoofYOverFootprint(roofEnvelope, pt[0], pt[2], ductHalfH, ductHalfH)
+          : roofEnvelope.roofYAt(pt[0], pt[2])
+      const cap = minRoofY - ductHalfV - roofClearMarginM
       if (cap <= roofEnvelope.wallH + 0.05) return Math.min(y, roofSoffitY)
       return Math.min(y, round2(cap))
     }
@@ -1501,14 +1516,16 @@ export function routeHvacDuctRun(params: {
     const fromSafeY = safeEndY(from)
     const toSafeY = safeEndY(to)
 
-    // If corridor has no width at y, or both ends sit outside the same eave side, route cleanly at soffit/safe height
-    if (safeHalf < 0.15 || (fromPerp < lo && toPerp < lo) || (fromPerp > hi && toPerp > hi)) {
-      const lowY = Math.min(fromSafeY, toSafeY, roofSoffitY)
-      return cleanPath(
-        pts.map((p, idx) =>
-          idx === 0 || idx === pts.length - 1 ? p : ([p[0], Math.min(p[1], lowY), p[2]] as Vec3),
+    const dropToSoffit = (rawPts: Vec3[], targetY: number): Vec3[] =>
+      cleanPath(
+        rawPts.map((p, idx) =>
+          idx === 0 || idx === rawPts.length - 1 ? p : ([p[0], Math.min(p[1], targetY), p[2]] as Vec3),
         ),
       )
+
+    // If corridor has no width at y, or both ends sit outside the same eave side, route cleanly at soffit/safe height
+    if (safeHalf < 0.15 || (fromPerp < lo && toPerp < lo) || (fromPerp > hi && toPerp > hi)) {
+      return dropToSoffit(pts, Math.min(fromSafeY, toSafeY, roofSoffitY))
     }
 
     const clampPerp = (v: number): number => {
@@ -1550,7 +1567,79 @@ export function routeHvacDuctRun(params: {
       out.push([to[0], y, to[2]])
     }
     out.push(to)
-    return cleanPath(out)
+    const stepped = cleanPath(out)
+    if (pathClearOfRoof(stepped, roofEnvelope, ductHalfV, roofClearMarginM, ductHalfH)) {
+      return stepped
+    }
+
+    // 4-sided hip / multi-segment roof safeguard: when the ridge-axis eave slopes down steeply
+    // (e.g. front/back hip eave), pull the attic run inward along the ridge axis toward the safe hip interior
+    // before rising above wallH, or drop cleanly to conditioned soffit height so no duct clips hip rafters.
+    const hipCenterAlong = alongX
+      ? (roofEnvelope.bounds.minX + roofEnvelope.bounds.maxX) / 2
+      : (roofEnvelope.bounds.minZ + roofEnvelope.bounds.maxZ) / 2
+    const pullTowardHipInterior = (pt: Vec3): Vec3 => {
+      let cx = alongX ? pt[0] : clampPerp(pt[0])
+      let cz = alongX ? clampPerp(pt[2]) : pt[2]
+      for (let step = 0; step < 12; step++) {
+        const minR =
+          ductHalfH > 0.02
+            ? minRoofYOverFootprint(roofEnvelope, cx, cz, ductHalfH, ductHalfH)
+            : roofEnvelope.roofYAt(cx, cz)
+        if (minR >= y + ductHalfV + roofClearMarginM) break
+        if (alongX) {
+          cx = round2(cx + (hipCenterAlong - cx) * 0.28)
+        } else {
+          cz = round2(cz + (hipCenterAlong - cz) * 0.28)
+        }
+        if (xzBounds) {
+          cx = Math.max(xzBounds.minX, Math.min(xzBounds.maxX, cx))
+          cz = Math.max(xzBounds.minZ, Math.min(xzBounds.maxZ, cz))
+        }
+      }
+      return [cx, y, cz]
+    }
+    const fIn = pullTowardHipInterior(from)
+    const tIn = pullTowardHipInterior(to)
+    const hipCandidates: Vec3[][] = [
+      cleanPath([
+        from,
+        [from[0], roofSoffitY, from[2]],
+        [fIn[0], roofSoffitY, from[2]],
+        [fIn[0], roofSoffitY, fIn[2]],
+        fIn,
+        [tIn[0], y, fIn[2]],
+        tIn,
+        [tIn[0], roofSoffitY, tIn[2]],
+        [to[0], roofSoffitY, tIn[2]],
+        [to[0], roofSoffitY, to[2]],
+        to,
+      ]),
+      cleanPath([
+        from,
+        [from[0], roofSoffitY, from[2]],
+        [from[0], roofSoffitY, fIn[2]],
+        [fIn[0], roofSoffitY, fIn[2]],
+        fIn,
+        [fIn[0], y, tIn[2]],
+        tIn,
+        [tIn[0], roofSoffitY, tIn[2]],
+        [tIn[0], roofSoffitY, to[2]],
+        [to[0], roofSoffitY, to[2]],
+        to,
+      ]),
+    ]
+    for (const hc of hipCandidates) {
+      if (
+        withinXzBounds(hc) &&
+        pathClearOfRoof(hc, roofEnvelope, ductHalfV, roofClearMarginM, ductHalfH) &&
+        (!footprintContains || !pathCrossesOutdoorVoid(hc, footprintContains, 0.5))
+      ) {
+        return hc
+      }
+    }
+    // Guaranteed hip/flat-roof-safe fallback: stay strictly below ceiling height (`roofSoffitY`)
+    return dropToSoffit(pts, roofSoffitY)
   }
 
   const buildCandAtY = (mode: 'x' | 'z' | 'diag' | 'ux' | 'uz', offsetM: number, rawY: number): Vec3[] => {

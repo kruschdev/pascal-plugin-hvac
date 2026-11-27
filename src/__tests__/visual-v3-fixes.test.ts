@@ -4,6 +4,7 @@ import { buildHvacTerminalCad } from '../cad/terminals'
 import { auditSceneHvac } from '../imc/audit'
 import { planHvacAutoPopulate } from '../imc/autopopulate'
 import type { SceneNodeLike } from '../imc/framing-interop'
+import { buildHvacElectricalCoordination } from '../imc/schedule'
 import {
   buildAtticRoofEnvelope,
   distancePointToSegment2D,
@@ -534,5 +535,411 @@ describe('Round 3 Visual & Geometric Regression Suite (VIS-V3-03, VIS-V3-04, VIS
     })
     const aptAudit = auditSceneHvac(materialize(aptScene, aptPlan), { climateZone: '4A' })
     expect(aptAudit.errorCount).toBe(0)
+  })
+
+  function buildLargeCourtyardResidence(opts: { includeEastGarage?: boolean; includePitchedRoof?: boolean } = {}): Record<string, SceneNodeLike> {
+    const includeEastGarage = opts.includeEastGarage ?? true
+    const includePitchedRoof = opts.includePitchedRoof ?? true
+    // 20m-wide x 14m-deep U-shaped courtyard residence (>5-Ton load):
+    // West wing: X = 0..7, Z = 0..14 (Living, Dining, Kitchen, Laundry, Bed 1, Bed 2, Bath 1)
+    // North connecting bridge: X = 7..13, Z = 0..4 (Foyer / Hallway)
+    // South open courtyard void: X = 7..13, Z = 4..14 (Lanai + Pool)
+    // East wing: X = 13..20, Z = 0..14 (Master Bed, Master Bath, Office, optional Garage 2)
+    const nodes: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.7 },
+      // Perimeter U-shaped walls
+      w_n: { id: 'w_n', type: 'wall', parentId: 'level_0', start: [0, 0], end: [20, 0], height: 2.7, thickness: 0.16 },
+      w_w: { id: 'w_w', type: 'wall', parentId: 'level_0', start: [0, 0], end: [0, 14], height: 2.7, thickness: 0.16 },
+      w_ws: { id: 'w_ws', type: 'wall', parentId: 'level_0', start: [0, 14], end: [7, 14], height: 2.7, thickness: 0.16 },
+      w_cw: { id: 'w_cw', type: 'wall', parentId: 'level_0', start: [7, 14], end: [7, 4], height: 2.7, thickness: 0.16 },
+      w_cn: { id: 'w_cn', type: 'wall', parentId: 'level_0', start: [7, 4], end: [13, 4], height: 2.7, thickness: 0.16 },
+      w_ce: { id: 'w_ce', type: 'wall', parentId: 'level_0', start: [13, 4], end: [13, 14], height: 2.7, thickness: 0.16 },
+      w_es: { id: 'w_es', type: 'wall', parentId: 'level_0', start: [13, 14], end: [20, 14], height: 2.7, thickness: 0.16 },
+      w_e: { id: 'w_e', type: 'wall', parentId: 'level_0', start: [20, 14], end: [20, 0], height: 2.7, thickness: 0.16 },
+      // Exterior door/window headers on both outer walls to verify header-free linesets
+      hdr_west: {
+        id: 'hdr_west',
+        type: 'structural:beam',
+        parentId: 'level_0',
+        name: 'Header ((2) 2x8 Built-Up Header) over West Window',
+        start: [0, 1.5],
+        end: [0, 5.5],
+        widthIn: 3.5,
+        depthIn: 7.25,
+        elevationY: 2.25,
+      },
+      hdr_east: {
+        id: 'hdr_east',
+        type: 'structural:beam',
+        parentId: 'level_0',
+        name: 'Header ((2) 2x8 Built-Up Header) over East Door',
+        start: [20, 1.5],
+        end: [20, 5.5],
+        widthIn: 3.5,
+        depthIn: 7.25,
+        elevationY: 2.25,
+      },
+      // West Wing rooms (~1,650 sqft conditioned)
+      r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[0, 0], [7, 0], [7, 5], [0, 5]] },
+      r_kit: { id: 'r_kit', type: 'zone', name: 'Kitchen', parentId: 'level_0', polygon: [[0, 5], [4, 5], [4, 9], [0, 9]] },
+      r_laun: { id: 'r_laun', type: 'zone', name: 'Laundry', parentId: 'level_0', polygon: [[4, 5], [7, 5], [7, 9], [4, 9]] },
+      r_bed1: { id: 'r_bed1', type: 'zone', name: 'Bedroom 1', parentId: 'level_0', polygon: [[0, 9], [7, 9], [7, 14], [0, 14]] },
+      r_foyer: { id: 'r_foyer', type: 'zone', name: 'Hallway', parentId: 'level_0', polygon: [[7, 0], [11.5, 0], [11.5, 4], [7, 4]] },
+      // East Wing rooms
+      r_off: { id: 'r_off', type: 'zone', name: 'Office', parentId: 'level_0', polygon: [[13, 0], [20, 0], [20, 4.5], [13, 4.5]] },
+      r_mbed: {
+        id: 'r_mbed',
+        type: 'zone',
+        name: 'Master Bedroom',
+        parentId: 'level_0',
+        polygon: includeEastGarage ? [[13, 4.5], [20, 4.5], [20, 10], [13, 10]] : [[13, 4.5], [18, 4.5], [18, 9], [13, 9]],
+      },
+      r_mbath: { id: 'r_mbath', type: 'zone', name: 'Master Bath', parentId: 'level_0', polygon: [[13, 10], [16.5, 10], [16.5, 14], [13, 14]] },
+      // Open courtyard exterior zones
+      r_lanai: { id: 'r_lanai', type: 'zone', name: 'Lanai', parentId: 'level_0', polygon: [[7, 4], [13, 4], [13, 9], [7, 9]] },
+      r_pool: { id: 'r_pool', type: 'zone', name: 'Pool', parentId: 'level_0', polygon: [[7, 9], [13, 9], [13, 14], [7, 14]] },
+    }
+    if (includeEastGarage) {
+      nodes.r_gar2 = {
+        id: 'r_gar2',
+        type: 'zone',
+        name: 'Garage 2',
+        parentId: 'level_0',
+        polygon: [[16.5, 10], [20, 10], [20, 14], [16.5, 14]],
+      }
+    }
+    if (includePitchedRoof) {
+      nodes.roof_0 = {
+        id: 'roof_0',
+        type: 'roof-segment',
+        parentId: 'level_0',
+        position: [10, 2.7, 7],
+        width: 20,
+        depth: 14,
+        pitch: 6 / 12,
+        roofType: 'gable',
+      }
+    } else {
+      nodes.roof_flat = {
+        id: 'roof_flat',
+        type: 'roof-segment',
+        parentId: 'level_0',
+        position: [10, 2.7, 7],
+        width: 20,
+        depth: 14,
+        pitch: 0,
+        roofType: 'flat',
+      }
+    }
+    return nodes
+  }
+
+  test('DUAL-WING-01: Concave U-shaped courtyard / >5-Ton residential split auto-zones into 2 independent systems (<=5T each, 0 courtyard crossings, 0 audit findings)', () => {
+    const scene = buildLargeCourtyardResidence({ includeEastGarage: true, includePitchedRoof: true })
+    const plan = planHvacAutoPopulate(scene, {
+      levelId: 'level_0',
+      systemType: 'split-heat-pump',
+      plenumLocation: 'attic',
+      climateZone: '4A',
+      includeErv: true,
+      includeExhaustFans: true,
+    })
+
+    const ahus = plan.equipment.filter((e) => e.equipmentKind === 'air-handler')
+    const condensers = plan.equipment.filter((e) => e.equipmentKind === 'heat-pump-condenser')
+    const ervs = plan.equipment.filter((e) => e.equipmentKind === 'erv-ventilator')
+    const supplyTrunks = plan.ductRuns.filter((d) => d.system === 'supply-trunk')
+    const returnTrunks = plan.ductRuns.filter((d) => d.system === 'return-trunk')
+    const linesets = plan.ductRuns.filter((d) => d.system === 'refrigerant-lineset')
+    const condensates = plan.ductRuns.filter((d) => d.system === 'condensate-drain')
+    const thermostats = plan.terminals.filter((t) => t.terminalKind === 'smart-thermostat')
+
+    expect(ahus.length).toBe(2)
+    expect(condensers.length).toBe(2)
+    expect(ervs.length).toBe(1)
+    expect(supplyTrunks.length).toBe(2)
+    expect(returnTrunks.length).toBe(2)
+    expect(linesets.length).toBe(2)
+    expect(condensates.length).toBe(2)
+    expect(thermostats.length).toBe(2)
+
+    // Both residential units strictly <= 5.0 Tons (ACCA Manual S ceiling)
+    for (const eq of [...ahus, ...condensers]) {
+      expect(eq.coolingTons).toBeLessThanOrEqual(5.0)
+      expect(eq.coolingTons).toBeGreaterThanOrEqual(1.5)
+    }
+
+    // Opposite exterior walls: one condenser outside West wall (x < 0), one outside East wall (x > 20)
+    const condXs = condensers.map((c) => c.position[0]).sort((a, b) => a - b)
+    expect(condXs[0]!).toBeLessThan(0)
+    expect(condXs[1]!).toBeGreaterThan(20)
+
+    // Zero <letters>:<non-space> persisted node names (XTRADE-21)
+    for (const n of [...plan.equipment, ...plan.plenums, ...plan.terminals, ...plan.ductRuns]) {
+      expect(/[A-Za-z]:\S/.test(n.name)).toBe(false)
+    }
+
+    // Zero ducts crossing the open courtyard void
+    const walls = extractWallSegments(scene, 'level_0')
+    const rooms = extractRoomPolygons(scene, 'level_0')
+    const fp = (x: number, z: number) => isPointInsideBuildingFootprint(x, z, walls, rooms)
+    for (const d of plan.ductRuns) {
+      if (d.system === 'supply-trunk' || d.system === 'supply-branch' || d.system === 'return-trunk') {
+        expect(pathCrossesOutdoorVoid(d.path, fp, 0.45)).toBe(false)
+      }
+    }
+
+    const audit = auditSceneHvac(materialize(scene, plan), { climateZone: '4A' })
+    expect(audit.errorCount).toBe(0)
+    expect(audit.warningCount).toBe(0)
+  })
+
+  test('DUAL-WING-02: Standard single-wing <=5-Ton home remains strictly 1 air handler + 1 condenser', () => {
+    const compactHome: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', height: 2.7 },
+      w1: { id: 'w1', type: 'wall', parentId: 'level_0', start: [0, 0], end: [12, 0], height: 2.7, thickness: 0.16 },
+      w2: { id: 'w2', type: 'wall', parentId: 'level_0', start: [12, 0], end: [12, 9], height: 2.7, thickness: 0.16 },
+      w3: { id: 'w3', type: 'wall', parentId: 'level_0', start: [12, 9], end: [0, 9], height: 2.7, thickness: 0.16 },
+      w4: { id: 'w4', type: 'wall', parentId: 'level_0', start: [0, 9], end: [0, 0], height: 2.7, thickness: 0.16 },
+      r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[0, 0], [6, 0], [6, 5], [0, 5]] },
+      r_kit: { id: 'r_kit', type: 'zone', name: 'Kitchen', parentId: 'level_0', polygon: [[6, 0], [12, 0], [12, 4], [6, 4]] },
+      r_bed1: { id: 'r_bed1', type: 'zone', name: 'Bedroom 1', parentId: 'level_0', polygon: [[0, 5], [5, 5], [5, 9], [0, 9]] },
+      r_bed2: { id: 'r_bed2', type: 'zone', name: 'Bedroom 2', parentId: 'level_0', polygon: [[5, 5], [8, 5], [8, 9], [5, 9]] },
+      r_util: { id: 'r_util', type: 'zone', name: 'Utility', parentId: 'level_0', polygon: [[8, 4], [12, 4], [12, 9], [8, 9]] },
+    }
+    const plan = planHvacAutoPopulate(compactHome, {
+      levelId: 'level_0',
+      systemType: 'split-heat-pump',
+      plenumLocation: 'attic',
+      climateZone: '4A',
+    })
+    expect(plan.equipment.filter((e) => e.equipmentKind === 'air-handler').length).toBe(1)
+    expect(plan.equipment.filter((e) => e.equipmentKind === 'heat-pump-condenser').length).toBe(1)
+    expect(plan.ductRuns.filter((d) => d.system === 'supply-trunk').length).toBe(1)
+    expect(plan.terminals.filter((t) => t.terminalKind === 'smart-thermostat').length).toBe(1)
+    const audit = auditSceneHvac(materialize(compactHome, plan), { climateZone: '4A' })
+    expect(audit.errorCount).toBe(0)
+  })
+
+  test('DUAL-WING-03: Dual-wing mini-split-multizone places 2 outdoor condensers on opposite wings with header-free, courtyard-free linesets and 0 audit errors', () => {
+    const scene = buildLargeCourtyardResidence({ includeEastGarage: true, includePitchedRoof: true })
+    const plan = planHvacAutoPopulate(scene, {
+      levelId: 'level_0',
+      systemType: 'mini-split-multizone',
+      plenumLocation: 'attic',
+      climateZone: '4A',
+      includeErv: true,
+      includeExhaustFans: true,
+    })
+
+    const msOutdoors = plan.equipment.filter((e) => e.equipmentKind === 'mini-split-outdoor')
+    const msHeads = plan.terminals.filter((t) => t.terminalKind === 'mini-split-wall-head')
+    const thermostats = plan.terminals.filter((t) => t.terminalKind === 'smart-thermostat')
+    const linesets = plan.ductRuns.filter((d) => d.system === 'refrigerant-lineset')
+
+    expect(msOutdoors.length).toBe(2)
+    expect(plan.plenums.length).toBe(0)
+    expect(msHeads.length).toBeGreaterThanOrEqual(4)
+    expect(thermostats.length).toBe(2)
+    expect(linesets.length).toBe(msHeads.length)
+
+    for (const outdoor of msOutdoors) {
+      expect(outdoor.coolingTons).toBeLessThanOrEqual(5.0)
+      expect(outdoor.electricalDemand?.breakerAmps).toBeGreaterThanOrEqual(15)
+    }
+
+    // Opposite exterior walls: one west (< 0), one east (> 20)
+    const condXs = msOutdoors.map((c) => c.position[0]).sort((a, b) => a - b)
+    expect(condXs[0]!).toBeLessThan(0)
+    expect(condXs[1]!).toBeGreaterThan(20)
+
+    // Zero courtyard crossings on interior segments of mini-split linesets
+    const walls = extractWallSegments(scene, 'level_0')
+    const rooms = extractRoomPolygons(scene, 'level_0')
+    const fp = (x: number, z: number) => isPointInsideBuildingFootprint(x, z, walls, rooms)
+    for (const run of linesets) {
+      const interiorPts = run.path.filter((p) => p[0] > 0.1 && p[0] < 19.9)
+      if (interiorPts.length >= 2) {
+        expect(pathCrossesOutdoorVoid(interiorPts, fp, 0.45)).toBe(false)
+      }
+    }
+
+    const audit = auditSceneHvac(materialize(scene, plan), { climateZone: '4A' })
+    expect(audit.errorCount).toBe(0)
+  })
+
+  test('DUAL-WING-04: Hybrid ducted West Wing AHU + ductless East Wing Mini-Split (explicit & automatic compact flat-roof wing) passes audit + electrical coordination', () => {
+    // 1. Explicit hybrid via secondaryWingSystem: 'mini-split'
+    const explicitScene = buildLargeCourtyardResidence({ includeEastGarage: true, includePitchedRoof: true })
+    const explicitPlan = planHvacAutoPopulate(explicitScene, {
+      levelId: 'level_0',
+      systemType: 'split-heat-pump',
+      secondaryWingSystem: 'mini-split',
+      plenumLocation: 'attic',
+      climateZone: '4A',
+      includeErv: true,
+      includeExhaustFans: true,
+    })
+
+    expect(explicitPlan.equipment.filter((e) => e.equipmentKind === 'air-handler').length).toBe(1)
+    expect(explicitPlan.equipment.filter((e) => e.equipmentKind === 'heat-pump-condenser').length).toBe(1)
+    expect(explicitPlan.equipment.filter((e) => e.equipmentKind === 'mini-split-outdoor').length).toBe(1)
+    expect(explicitPlan.terminals.filter((t) => t.terminalKind === 'mini-split-wall-head').length).toBeGreaterThanOrEqual(2)
+    expect(explicitPlan.terminals.filter((t) => t.terminalKind === 'smart-thermostat').length).toBe(2)
+
+    const explicitMat = materialize(explicitScene, explicitPlan)
+    const explicitAudit = auditSceneHvac(explicitMat, { climateZone: '4A' })
+    expect(explicitAudit.errorCount).toBe(0)
+    expect(explicitAudit.warningCount).toBe(0)
+
+    const ahuId = explicitPlan.equipment.find((e) => e.equipmentKind === 'air-handler')!.id
+    const condId = explicitPlan.equipment.find((e) => e.equipmentKind === 'heat-pump-condenser')!.id
+    const msId = explicitPlan.equipment.find((e) => e.equipmentKind === 'mini-split-outdoor')!.id
+    const coord = buildHvacElectricalCoordination(explicitMat)
+    expect(coord.some((c) => c.sourceNodeId === ahuId && c.breakerAmps >= 30 && c.voltage === 240)).toBe(true)
+    expect(coord.some((c) => c.sourceNodeId === condId && c.breakerAmps >= 20 && c.voltage === 240)).toBe(true)
+    expect(coord.some((c) => c.sourceNodeId === msId && c.breakerAmps >= 15 && c.voltage === 240)).toBe(true)
+
+    // 2. Automatic hybrid when smaller East Wing is compact (<=2.0T) with NO dedicated mech room & NO attic roof
+    const autoHybridScene = buildLargeCourtyardResidence({ includeEastGarage: false, includePitchedRoof: false })
+    const autoHybridPlan = planHvacAutoPopulate(autoHybridScene, {
+      levelId: 'level_0',
+      systemType: 'split-heat-pump',
+      plenumLocation: 'attic',
+      climateZone: '4A',
+      includeErv: true,
+      includeExhaustFans: true,
+    })
+    expect(autoHybridPlan.equipment.filter((e) => e.equipmentKind === 'air-handler').length).toBe(1)
+    expect(autoHybridPlan.equipment.filter((e) => e.equipmentKind === 'heat-pump-condenser').length).toBe(1)
+    expect(autoHybridPlan.equipment.filter((e) => e.equipmentKind === 'mini-split-outdoor').length).toBe(1)
+    expect(autoHybridPlan.terminals.filter((t) => t.terminalKind === 'mini-split-wall-head').length).toBeGreaterThanOrEqual(2)
+
+    const autoAudit = auditSceneHvac(materialize(autoHybridScene, autoHybridPlan), { climateZone: '4A' })
+    expect(autoAudit.errorCount).toBe(0)
+    expect(autoAudit.warningCount).toBe(0)
+  })
+
+  test('DUAL-WING-05: 4-sided hip roof >5-Ton dual-wing keeps all attic supply/return trunks & plenums >= 0.14m below sloping hip rafters (full duct width) and places condensers >= 2.4m from entry doors', () => {
+    const hipDualScene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', level: 0, height: 2.55 },
+      level_1: { id: 'level_1', type: 'level', level: 1, height: 2.55 },
+      w_n: { id: 'w_n', type: 'wall', parentId: 'level_0', start: [-8, -9], end: [8, -9], height: 2.55, thickness: 0.16 },
+      w_e: { id: 'w_e', type: 'wall', parentId: 'level_0', start: [8, -9], end: [8, 9], height: 2.55, thickness: 0.16 },
+      w_s: { id: 'w_s', type: 'wall', parentId: 'level_0', start: [8, 9], end: [-8, 9], height: 2.55, thickness: 0.16 },
+      w_w: { id: 'w_w', type: 'wall', parentId: 'level_0', start: [-8, 9], end: [-8, -9], height: 2.55, thickness: 0.16 },
+      // Front entry door on South wall at world (0, 9) and rear door on North wall at (3.5, -9)
+      door_front: {
+        id: 'door_front',
+        type: 'door',
+        name: 'Front Entry Door',
+        parentId: 'w_s',
+        position: [8, 1.05, 0],
+      },
+      door_rear: {
+        id: 'door_rear',
+        type: 'door',
+        name: 'Rear Door',
+        parentId: 'w_n',
+        position: [11.5, 1.05, 0],
+      },
+      // 4-sided hip roof covering the footprint (steeply sloping hip eaves on all 4 sides)
+      roof_wrap: { id: 'roof_wrap', type: 'roof', parentId: 'level_1', position: [0, 0, 0], rotation: 0 },
+      rseg_hip: {
+        id: 'rseg_hip',
+        type: 'roof-segment',
+        parentId: 'roof_wrap',
+        position: [0, 0, 0],
+        width: 16,
+        depth: 18,
+        pitch: 32,
+        roofType: 'hip',
+        wallHeight: 0.4,
+      },
+      // >5-Ton multi-room floor plan (~3,100 sqft)
+      r_liv: { id: 'r_liv', type: 'zone', name: 'Living Room', parentId: 'level_0', polygon: [[-8, 1], [1.5, 1], [1.5, 9], [-8, 9]] },
+      r_din: { id: 'r_din', type: 'zone', name: 'Dining Room', parentId: 'level_0', polygon: [[1.5, 1], [8, 1], [8, 9], [1.5, 9]] },
+      r_kit: { id: 'r_kit', type: 'zone', name: 'Kitchen', parentId: 'level_0', polygon: [[1.5, -4], [8, -4], [8, 1], [1.5, 1]] },
+      r_laun: { id: 'r_laun', type: 'zone', name: 'Laundry', parentId: 'level_0', polygon: [[-3, 0.5], [0, 0.5], [0, 4], [-3, 4]] },
+      r_bed1: { id: 'r_bed1', type: 'zone', name: 'Bedroom 1', parentId: 'level_0', polygon: [[-8, -9], [0.5, -9], [0.5, -1], [-8, -1]] },
+      r_bed2: { id: 'r_bed2', type: 'zone', name: 'Bedroom 2', parentId: 'level_0', polygon: [[0.5, -9], [8, -9], [8, -4], [0.5, -4]] },
+      r_bath: { id: 'r_bath', type: 'zone', name: 'Bathroom', parentId: 'level_0', polygon: [[-8, -1], [-3, -1], [-3, 1], [-8, 1]] },
+    }
+
+    const plan = planHvacAutoPopulate(hipDualScene, {
+      levelId: 'level_0',
+      systemType: 'split-heat-pump',
+      plenumLocation: 'attic',
+      climateZone: '2A',
+      includeErv: true,
+      includeExhaustFans: true,
+    })
+
+    const condensers = plan.equipment.filter((e) => e.equipmentKind === 'heat-pump-condenser')
+    expect(condensers.length).toBe(2)
+
+    // Both condensers strictly >= 2.4m from every exterior entry door
+    const doorCoords: Array<readonly [number, number]> = [
+      [0, 9],
+      [3.5, -9],
+    ]
+    for (const cond of condensers) {
+      for (const [dx, dz] of doorCoords) {
+        expect(Math.hypot(cond.position[0] - dx, cond.position[2] - dz)).toBeGreaterThanOrEqual(2.4)
+      }
+    }
+
+    // Every attic supply & return trunk clears sloping hip rafters across its full 4-corner width by >= 0.14m
+    const roof = buildAtticRoofEnvelope(hipDualScene, 'level_0', { minX: -8, maxX: 8, minZ: -9, maxZ: 9 }, 2.55)
+    for (const d of plan.ductRuns) {
+      if (d.system !== 'supply-trunk' && d.system !== 'return-trunk') continue
+      const halfH = ((d.shape === 'rectangular' ? d.width : d.diameter) * 0.0254) / 2
+      const halfV = ((d.shape === 'rectangular' ? d.height : d.diameter) * 0.0254) / 2
+      expect(pathClearOfRoof(d.path, roof, halfV, 0.14, halfH)).toBe(true)
+    }
+    for (const pl of plan.plenums) {
+      if (pl.position[1] <= 2.55) continue
+      const halfW = (pl.widthIn * 0.0254) / 2
+      const topY = pl.position[1] + (pl.heightM ?? 0.3)
+      expect(topY).toBeLessThanOrEqual(minRoofYOverFootprint(roof, pl.position[0], pl.position[2], halfW, 0.3) - 0.1 + 1e-4)
+    }
+
+    const audit = auditSceneHvac(materialize(hipDualScene, plan), { climateZone: '2A' })
+    expect(audit.errorCount).toBe(0)
+    expect(audit.warningCount).toBe(0)
+  })
+
+  test('DUAL-WING-06: Flat-roofed / lower-story dual-wing keeps all supply/return trunks, branches, and plenums strictly below flat-roof ceiling joists (topY <= levelH - 0.15)', () => {
+    const flatScene = buildLargeCourtyardResidence({ includeEastGarage: true, includePitchedRoof: false })
+    // Add an upper walled story above West Wing (matching a 2-story U-shaped residence with a flat-roofed central bar)
+    flatScene.level_1 = { id: 'level_1', type: 'level', level: 1, height: 2.7 }
+    flatScene.u_w1 = { id: 'u_w1', type: 'wall', parentId: 'level_1', start: [0, 0], end: [7, 0], height: 2.7, thickness: 0.16 }
+    flatScene.u_w2 = { id: 'u_w2', type: 'wall', parentId: 'level_1', start: [7, 0], end: [7, 6], height: 2.7, thickness: 0.16 }
+    flatScene.u_w3 = { id: 'u_w3', type: 'wall', parentId: 'level_1', start: [7, 6], end: [0, 6], height: 2.7, thickness: 0.16 }
+    flatScene.u_w4 = { id: 'u_w4', type: 'wall', parentId: 'level_1', start: [0, 6], end: [0, 0], height: 2.7, thickness: 0.16 }
+
+    const plan = planHvacAutoPopulate(flatScene, {
+      levelId: 'level_0',
+      systemType: 'split-heat-pump',
+      plenumLocation: 'attic',
+      climateZone: '4A',
+    })
+
+    const levelH = 2.7
+    // Every plenum, supply trunk, return trunk, and supply branch stays strictly below the flat-roof ceiling joist band
+    for (const pl of plan.plenums) {
+      const topY = pl.position[1] + (pl.heightM ?? 0.3) / 2
+      expect(topY).toBeLessThanOrEqual(levelH - 0.15)
+    }
+    for (const d of plan.ductRuns) {
+      if (d.system !== 'supply-trunk' && d.system !== 'return-trunk' && d.system !== 'supply-branch') continue
+      const halfV = ((d.shape === 'rectangular' ? d.height : d.diameter) * 0.0254) / 2
+      const maxTopY = Math.max(...d.path.map((p) => p[1])) + halfV
+      expect(maxTopY).toBeLessThanOrEqual(levelH - 0.15)
+    }
+
+    const audit = auditSceneHvac(materialize(flatScene, plan), { climateZone: '4A' })
+    expect(audit.errorCount).toBe(0)
+    expect(audit.warningCount).toBe(0)
   })
 })
