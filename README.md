@@ -21,9 +21,9 @@ Watch the full two-story Aymeric House finished-to-cutaway walkthrough (Structur
 
 ## Walkthrough Video (Recorded Live in Pascal Editor)
 
-![Live Pascal Editor Walkthrough: One-Click IMC / ACCA Manual J Auto-Populate on a Two-Bedroom House, Priority #3 3D Duct Routing Around Plumbing DWV, Interactive 3D Air Handler & Joist-Bay Cutaway, Live Manual J Schedule, Cross-Trade Electrical Power Handoff, Priced BOM with IECC Insulation, and IMC Audit](./assets/demo-walkthrough.gif)
+![Live Pascal Editor Walkthrough: One-Click IMC / ACCA Manual J Auto-Populate on a Two-Bedroom House, Priority #3 3D Duct Routing Around Plumbing DWV, Interactive 3D Air Handler & Joist-Bay Cutaway, Live Manual J Schedule, Cross-Trade Electrical Power Handoff, Priced BOM with IECC Insulation, and IMC Audit](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-walkthrough.gif)
 
-**[Watch Full 720p HD Narrated Walkthrough Video Recorded in Pascal Editor (`assets/demo-walkthrough.mp4`)](./assets/demo-walkthrough.mp4)**
+**[Watch Full 720p HD Narrated Walkthrough Video Recorded in Pascal Editor (`assets/demo-walkthrough.mp4`)](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-walkthrough.mp4)**
 
 1. **One-Click IMC / Manual J-D-S Auto-Populate & Catalog Placement**: Scans every room and exterior wall across all 14 ASHRAE Climate Zones (`1A` through `7`) to compute room-by-room heating and sensible/latent cooling BTU/h, select equipment tonnage (`SEER2` / `HSPF2`), A2L refrigerant linesets (`R-454B`, `R-32`, `R-410A`), continuous ASHRAE 62.2 ERV ventilation, bath exhaust fans, and vented kitchen range hoods, and drop in 26 live equipment, plenum, and terminal kinds directly from the HVAC rail.
 2. **4-Trade Priority #3 Legal-Cavity Routing, Automatic Dual-Wing Zoning & 2D Floorplan**: Routes color-coded 3D rectangular trunks, R-8 flex/rigid branches, return drops, ERV fresh-air ducts, header-safe bath and kitchen range-hood exhaust runs, grounded exterior-wall copper refrigerant linesets, and gravity-sloped 3/4" PVC condensate drains via [`@kruschdev/pascal-mep-kernel`](https://github.com/kruschdev/pascal-mep-kernel) while yielding around Structural beams/columns, 3D door/window headers, and Priority #2 Plumbing DWV pipes. Concave U-shaped courtyard houses and >5-Ton residences automatically split into independent dual-wing systems (`<= 5 Ton` each) with zero ducts bridging open courtyards. Toggle any of the 8 mechanical layers live or switch to the color-matched 2D HVAC floorplan schematic.
@@ -33,13 +33,13 @@ Watch the full two-story Aymeric House finished-to-cutaway walkthrough (Structur
 
 ## Showcase Gallery
 
-![4-Panel 3D Air Handler, Plenum & Joist-Bay Cutaway + Commercial Packaged RTU Showcase](./assets/demo-air-handler-cutaway.png)
+![4-Panel 3D Air Handler, Plenum & Joist-Bay Cutaway + Commercial Packaged RTU Showcase](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-air-handler-cutaway.png)
 
-![Live Pascal Editor HVAC Rail and 3D Priority #3 Duct Routing: Color-Coded Supply Trunk, R-8 Branches, Return Plenum, ASHRAE 62.2 ERV, Exhaust, Refrigerant Lineset, and Condensate Drain](./assets/demo-3d-duct-routing.png)
+![Live Pascal Editor HVAC Rail and 3D Priority #3 Duct Routing: Color-Coded Supply Trunk, R-8 Branches, Return Plenum, ASHRAE 62.2 ERV, Exhaust, Refrigerant Lineset, and Condensate Drain](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-3d-duct-routing.png)
 
-![Split-Pane Pascal Editor 3D Viewport and Live Populated ACCA Manual J Room Load & Ductwork Summary Schedule](./assets/demo-hvac-schedule.png)
+![Split-Pane Pascal Editor 3D Viewport and Live Populated ACCA Manual J Room Load & Ductwork Summary Schedule](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-hvac-schedule.png)
 
-![42 Clean-Room MIT HVAC CAD Material Models (.glb): Heat Pumps, Condensing Furnaces, Commercial RTUs, Multi-Zone Mini-Splits, ERVs, Plenums, Motorized Zone Dampers, Registers, Smart Thermostats, Duct Fittings, Linesets, Condensate Traps, and 3D Air Handler Cutaways](./assets/cad-material-catalog.png)
+![42 Clean-Room MIT HVAC CAD Material Models (.glb): Heat Pumps, Condensing Furnaces, Commercial RTUs, Multi-Zone Mini-Splits, ERVs, Plenums, Motorized Zone Dampers, Registers, Smart Thermostats, Duct Fittings, Linesets, Condensate Traps, and 3D Air Handler Cutaways](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/cad-material-catalog.png)
 
 ### 42-Model Clean-Room MIT CAD Library (6 Categories)
 

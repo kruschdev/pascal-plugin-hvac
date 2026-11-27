@@ -6,14 +6,14 @@ Ready-to-share narrated video, high-resolution screenshots, 42-model 3D CAD cont
 
 | Asset | Resolution / Format | Best Use |
 |---|---|---|
-| [`assets/social-preview.png`](../assets/social-preview.png) | `1280 x 640` PNG | GitHub Social Preview, OpenGraph card, LinkedIn/X link banner |
-| [`assets/demo-walkthrough.mp4`](../assets/demo-walkthrough.mp4) | `1280 x 720` H.264 MP4 (`87.0s`, narrated 48 kHz AAC + `+faststart`) | X video post, LinkedIn native video, YouTube, GitHub Release |
-| [`assets/demo-walkthrough.gif`](../assets/demo-walkthrough.gif) | `640px` palette-optimized GIF | README preview, Reddit, Discord, Slack |
-| [`assets/demo-3d-duct-routing.png`](../assets/demo-3d-duct-routing.png) | `1440 x 810` PNG | Live Pascal Editor 3D HVAC routing, Manual J summary & Duct/Mechanical Layer rail |
-| [`assets/demo-air-handler-cutaway.png`](../assets/demo-air-handler-cutaway.png) | `1920 x 760` PNG | 4-panel 3D Air Handler, Plenum & Joist-Bay Cutaway + Commercial Packaged RTU showcase |
-| [`assets/demo-hvac-schedule.png`](../assets/demo-hvac-schedule.png) | `1440 x 810` PNG | Live split-pane 3D house + populated ACCA Manual J room load & ductwork schedule |
-| [`assets/cad-material-catalog.png`](../assets/cad-material-catalog.png) | `1820 x 1780` PNG | Complete 42-model clean-room MIT HVAC CAD catalog contact sheet (6x7 studio grid) |
-| [`assets/screenshots/`](../assets/screenshots) | `1440 x 810` PNGs (9 shots) | Full step-by-step live editor capture set (Before Auto-Populate, 3D Routing, 2D Floorplan, Open/Closed Cutaway, Manual J, Loads & Power/Gas, Priced BOM + IECC, IMC Audit Pass) |
+| [`assets/social-preview.png`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/social-preview.png) | `1280 x 640` PNG | GitHub Social Preview, OpenGraph card, LinkedIn/X link banner |
+| [`assets/demo-walkthrough.mp4`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-walkthrough.mp4) | `1280 x 720` H.264 MP4 (`87.0s`, narrated 48 kHz AAC + `+faststart`) | X video post, LinkedIn native video, YouTube, GitHub Release |
+| [`assets/demo-walkthrough.gif`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-walkthrough.gif) | `640px` palette-optimized GIF | README preview, Reddit, Discord, Slack |
+| [`assets/demo-3d-duct-routing.png`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-3d-duct-routing.png) | `1440 x 810` PNG | Live Pascal Editor 3D HVAC routing, Manual J summary & Duct/Mechanical Layer rail |
+| [`assets/demo-air-handler-cutaway.png`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-air-handler-cutaway.png) | `1920 x 760` PNG | 4-panel 3D Air Handler, Plenum & Joist-Bay Cutaway + Commercial Packaged RTU showcase |
+| [`assets/demo-hvac-schedule.png`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/demo-hvac-schedule.png) | `1440 x 810` PNG | Live split-pane 3D house + populated ACCA Manual J room load & ductwork schedule |
+| [`assets/cad-material-catalog.png`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/cad-material-catalog.png) | `1820 x 1780` PNG | Complete 42-model clean-room MIT HVAC CAD catalog contact sheet (6x7 studio grid) |
+| [`assets/screenshots/`](https://github.com/kruschdev/pascal-plugin-hvac/releases/download/v0.2.0/hvac-screenshots-v0.2.0.tar.gz) | `1440 x 810` PNGs (9 shots) | Full step-by-step live editor capture set (Before Auto-Populate, 3D Routing, 2D Floorplan, Open/Closed Cutaway, Manual J, Loads & Power/Gas, Priced BOM + IECC, IMC Audit Pass) |
 | [`docs/WALKTHROUGH-SCRIPT.md`](./WALKTHROUGH-SCRIPT.md) | Markdown Beat Sheet | Timed `87.0s` chapter-by-chapter narration script & TTS input text |
 | [`scripts/add-voiceover.sh`](../scripts/add-voiceover.sh) | Bash (`gemini-api tts` + `ffmpeg`) | One-command Gemini TTS synthesis (`gemini-3.8-flash-tts`) and loudnorm AAC muxing into `assets/demo-walkthrough.mp4` |
 

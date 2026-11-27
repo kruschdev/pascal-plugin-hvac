@@ -59,7 +59,7 @@ const DuctShape = z.enum(['rectangular', 'round'])
 export const hvacAgentTools: PluginAgentTools = {
   pluginId: 'krusch:hvac',
   apiVersion: 1,
-  version: '0.1.0',
+  version: '0.2.0',
   instructions:
     'HVAC holds Priority #3 MEP right-of-way (1. Structural -> 2. Plumbing -> 3. HVAC -> 4. Electrical). HVAC ductwork yields around Structural beams/columns, Plumbing DWV gravity pipes/stacks, and NEC 110.26(E) Dedicated Electrical Space above panels. Every powered HVAC unit automatically publishes an `electricalDemand` payload so Electrical adds its breakers and 3D power runs, and gas furnaces publish `gasBtuh` for Plumbing IFGC gas sizing.',
   skills: [
