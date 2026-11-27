@@ -1,3 +1,5 @@
+'use client'
+
 /**
  * Isolated Zustand UI state store for `krusch:hvac`.
  * Never mutates or extends Pascal's `useScene`, `useEditor`, or `useViewer` stores.

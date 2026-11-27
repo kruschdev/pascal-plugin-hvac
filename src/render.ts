@@ -10,6 +10,7 @@ import { hvacPlenumRenderDefinition } from './nodes/plenum'
 import { hvacTerminalRenderDefinition } from './nodes/terminal'
 
 export const HVAC_PLUGIN_ID = 'krusch:hvac' as const
+export const HVAC_SCHEDULE_VIEW_ID = 'krusch:hvac:schedule' as const
 
 export const hvacRenderPlugin: Plugin = {
   id: HVAC_PLUGIN_ID,

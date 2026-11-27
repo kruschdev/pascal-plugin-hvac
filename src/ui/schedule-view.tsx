@@ -1,3 +1,5 @@
+'use client'
+
 /**
  * Full-pane EditorHostView (`krusch:hvac:schedule`) that opens beside the 3D/2D scene:
  * 6 Tabs: Manual J & Airflow | Loads & Power/Gas | IMC / IECC Audit | Framing & Soffits | Priced BOM & Insulation | 3D Air Handler Cutaway.

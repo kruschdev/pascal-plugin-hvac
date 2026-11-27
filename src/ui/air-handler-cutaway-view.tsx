@@ -1,3 +1,5 @@
+'use client'
+
 /**
  * Interactive 3D Air Handler, Supply/Return Plenum & Joist-Bay Ductwork Cutaway (`src/ui/air-handler-cutaway-view.tsx`).
  * Persists a single WebGLRenderer, Scene, Camera, and orbit angle across scene edits, swapping only

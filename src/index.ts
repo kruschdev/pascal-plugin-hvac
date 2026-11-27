@@ -20,8 +20,7 @@ import {
 } from './nodes/parametrics'
 import { hvacPlenumRenderDefinition } from './nodes/plenum'
 import { hvacTerminalRenderDefinition } from './nodes/terminal'
-import { HVAC_PLUGIN_ID, hvacRenderPlugin } from './render'
-import { HVAC_SCHEDULE_VIEW_ID } from './ui/hvac-panel'
+import { HVAC_PLUGIN_ID, HVAC_SCHEDULE_VIEW_ID, hvacRenderPlugin } from './render'
 
 export const hvacInspectorExtensions: InspectorExtension[] = [
   {
@@ -137,11 +136,11 @@ export const hvacChatExtension: PluginChatExtension = {
 
 export {
   HVAC_PLUGIN_ID,
+  HVAC_SCHEDULE_VIEW_ID,
   hvacRenderPlugin,
   HvacEquipmentNode,
   HvacPlenumNode,
   HvacTerminalNode,
   HvacDuctRunNode,
 } from './render'
-export { HVAC_SCHEDULE_VIEW_ID } from './ui/hvac-panel'
 export * from './imc'

@@ -1,3 +1,5 @@
+'use client'
+
 /**
  * InspectorExtension card for `hvac:*` nodes:
  * Shows live NOT TO CODE / COMPLIANT status, ACCA Manual D velocity/friction,
