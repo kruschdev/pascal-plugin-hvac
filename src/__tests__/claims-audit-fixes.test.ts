@@ -601,15 +601,23 @@ describe('Claims-vs-Reality Audit Fix Regression Suite (HVC-01..HVC-08)', () => 
     }
 
     // 5. 42/42 docs/CAD-CATALOG.md slug parity + zero em-dashes in docs/README/UI
+    // Note: binary `.glb` exports under `assets/cad/` were moved out of git to GitHub Release
+    // assets in v0.2.0 (`.gitignore` excludes `assets/`); verify them when exported locally via
+    // `bun run export:cad`, while always enforcing 42/42 catalog + docs parity in CI.
     const rootDir = path.resolve(import.meta.dir, '../..')
     const cadCatalogMd = fs.readFileSync(path.join(rootDir, 'docs', 'CAD-CATALOG.md'), 'utf8')
     const imcRefMd = fs.readFileSync(path.join(rootDir, 'docs', 'IMC-REFERENCE.md'), 'utf8')
     const readmeMd = fs.readFileSync(path.join(rootDir, 'README.md'), 'utf8')
     const schedViewTsx = fs.readFileSync(path.join(rootDir, 'src', 'ui', 'schedule-view.tsx'), 'utf8')
+    const exportedCadDir = path.join(rootDir, 'assets', 'cad')
+    const hasExportedCadDir = fs.existsSync(exportedCadDir)
 
+    expect(HVAC_CAD_CATALOG).toHaveLength(42)
     for (const part of HVAC_CAD_CATALOG) {
       expect(cadCatalogMd).toContain(`\`${part.id}\``)
-      expect(fs.existsSync(path.join(rootDir, 'assets', 'cad', `${part.id}.glb`))).toBe(true)
+      if (hasExportedCadDir) {
+        expect(fs.existsSync(path.join(exportedCadDir, `${part.id}.glb`))).toBe(true)
+      }
     }
     expect(cadCatalogMd).not.toContain('—')
     expect(imcRefMd).not.toContain('—')
