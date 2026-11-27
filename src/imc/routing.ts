@@ -11,6 +11,39 @@
  */
 
 import {
+  type BuildingAnatomy,
+  type CanonicalWall,
+  type CavityBand,
+  type CavityRouteResult,
+  type SceneNodeLike as KernelSceneNodeLike,
+  type LegalCavityGraph,
+  type LevelFootprintModel,
+  type OccupancyObstacle,
+  type OrientedPrismY,
+  TradeOccupancyGrid,
+  compileBuildingAnatomy,
+  compileLegalCavityGraph,
+  compileLevelFootprint,
+  compileLevelRoofShell,
+  compareLevelsVertically as kernelCompareLevelsVertically,
+  countPathElbows as kernelCountPathElbows,
+  distancePointToSegment2D as kernelDistancePointToSegment2D,
+  extractBaseRoomPolygons,
+  extractLevelOpeningPrisms,
+  extractNodeYawRad,
+  extractTradeOccupancyObstacles,
+  isHighestWalledLevelInBuilding,
+  pointInPolygon2D as kernelPointInPolygon2D,
+  polygonAreaAndCentroid as kernelPolygonAreaAndCentroid,
+  polylineLengthM as kernelPolylineLengthM,
+  resolveLevelBuildingId as kernelResolveLevelBuildingId,
+  resolveLevelHeightM as kernelResolveLevelHeightM,
+  resolveLowerWalledLevelsSummary,
+  routeInLegalCavities,
+  segmentIntersectsAabb3,
+  segmentIntersectsOrientedPrismY,
+} from '@kruschdev/pascal-mep-kernel'
+import {
   type DuctFramingClearance,
   type SceneNodeLike,
   type Vec3,
@@ -19,7 +52,8 @@ import {
   extractHvacFramingContext,
   resolveNodeLevelId,
 } from './framing-interop'
-import { type DuctShape, INCHES_TO_METERS, METERS_TO_FEET, SQM_TO_SQFT, round2 } from './tables'
+import { IMC_RULE_THRESHOLDS } from './rules'
+import { type DuctShape, METERS_TO_FEET, SQM_TO_SQFT, round2 } from './tables'
 
 export type Aabb3 = {
   minX: number
@@ -36,6 +70,7 @@ export type HvacObstacle = {
   category: 'structural' | 'plumbing' | 'electrical-dedicated-space' | 'electrical-working-space'
   label: string
   box: Aabb3
+  prism?: OrientedPrismY
 }
 
 export type DuctClashMargin = number | { horizontal: number; vertical: number }
@@ -77,33 +112,11 @@ export type RoomPolygon2D = {
 }
 
 export function polylineLengthM(path: ReadonlyArray<Vec3>): number {
-  let total = 0
-  for (let i = 1; i < path.length; i++) {
-    const a = path[i - 1]!
-    const b = path[i]!
-    total += Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2])
-  }
-  return total
+  return kernelPolylineLengthM(path)
 }
 
 export function countPathElbows(path: ReadonlyArray<Vec3>): { elbows90: number; elbows45: number } {
-  let elbows90 = 0
-  let elbows45 = 0
-  for (let i = 1; i < path.length - 1; i++) {
-    const a = path[i - 1]!
-    const b = path[i]!
-    const c = path[i + 1]!
-    const v1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]] as const
-    const v2 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]] as const
-    const l1 = Math.hypot(v1[0], v1[1], v1[2])
-    const l2 = Math.hypot(v2[0], v2[1], v2[2])
-    if (l1 < 1e-4 || l2 < 1e-4) continue
-    const dot = Math.max(-1, Math.min(1, (v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]) / (l1 * l2)))
-    const deg = (Math.acos(dot) * 180) / Math.PI
-    if (deg >= 68) elbows90 += 1
-    else if (deg >= 25) elbows45 += 1
-  }
-  return { elbows90, elbows45 }
+  return kernelCountPathElbows(path)
 }
 
 const wallCache = new WeakMap<Readonly<Record<string, SceneNodeLike>>, Map<string, WallSegment2D[]>>()
@@ -188,39 +201,15 @@ export function pointInPolygon2D(
   pz: number,
   polygon: ReadonlyArray<readonly [number, number]>,
 ): boolean {
-  if (polygon.length < 3) return false
-  let inside = false
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const [xi, zi] = polygon[i]!
-    const [xj, zj] = polygon[j]!
-    const intersects = zi > pz !== zj > pz && px < ((xj - xi) * (pz - zi)) / (zj - zi + 1e-12) + xi
-    if (intersects) inside = !inside
-  }
-  return inside
+  return kernelPointInPolygon2D(px, pz, polygon)
 }
 
 export function polygonAreaAndCentroid(
   polygon: ReadonlyArray<readonly [number, number]>,
 ): { areaSqm: number; centroid: readonly [number, number] } {
   if (polygon.length < 3) return { areaSqm: 0, centroid: [0, 0] }
-  let signed = 0
-  let cx = 0
-  let cz = 0
-  for (let i = 0; i < polygon.length; i++) {
-    const [x0, z0] = polygon[i]!
-    const [x1, z1] = polygon[(i + 1) % polygon.length]!
-    const cross = x0 * z1 - x1 * z0
-    signed += cross
-    cx += (x0 + x1) * cross
-    cz += (z0 + z1) * cross
-  }
-  const area = Math.abs(signed) * 0.5
-  if (area < 1e-4) {
-    const avgX = polygon.reduce((s, p) => s + p[0], 0) / polygon.length
-    const avgZ = polygon.reduce((s, p) => s + p[1], 0) / polygon.length
-    return { areaSqm: 0, centroid: [avgX, avgZ] }
-  }
-  return { areaSqm: area, centroid: [cx / (3 * signed), cz / (3 * signed)] }
+  const { areaSqM, centroid } = kernelPolygonAreaAndCentroid(polygon)
+  return { areaSqm: areaSqM < 1e-4 ? 0 : areaSqM, centroid }
 }
 
 const roomPolyCache = new WeakMap<
@@ -241,27 +230,24 @@ export function extractRoomPolygons(
   const cached = byLevel.get(key)
   if (cached) return cached
 
-  const rooms: RoomPolygon2D[] = []
-  for (const n of Object.values(nodes)) {
-    if ((n.type !== 'zone' && n.type !== 'room') || !belongsToLevel(nodes, n, levelId)) continue
-    const rawPoly = Array.isArray(n.polygon) ? n.polygon : null
-    if (!rawPoly || rawPoly.length < 3) continue
-    const poly = rawPoly.map((p) => [Number(p[0]), Number(p[1])] as const)
-    const { areaSqm, centroid } = polygonAreaAndCentroid(poly)
-    const label = typeof n.name === 'string' && n.name.trim() ? n.name.trim() : n.id
-    const rawCat = typeof n.category === 'string' ? n.category.trim() : ''
-    const fromCat = rawCat ? classifyHvacRoomName(rawCat) : 'other'
-    const category = fromCat !== 'other' ? fromCat : classifyHvacRoomName(label)
-    rooms.push({
-      id: n.id,
-      name: label,
+  const baseRooms = extractBaseRoomPolygons(
+    nodes as Readonly<Record<string, KernelSceneNodeLike>>,
+    levelId,
+  )
+  const rooms: RoomPolygon2D[] = baseRooms.map((r) => {
+    const fromCat = r.rawCategory ? classifyHvacRoomName(r.rawCategory) : 'other'
+    const category = fromCat !== 'other' ? fromCat : classifyHvacRoomName(r.name)
+    const areaSqm = r.areaSqM < 1e-4 ? 0 : r.areaSqM
+    return {
+      id: r.id,
+      name: r.name,
       category,
-      polygon: poly,
-      centroid,
+      polygon: r.polygon,
+      centroid: r.centroid,
       areaSqm: round2(areaSqm),
       areaSqft: round2(areaSqm * SQM_TO_SQFT),
-    })
-  }
+    }
+  })
   byLevel.set(key, rooms)
   return rooms
 }
@@ -270,24 +256,11 @@ export function resolveLevelHeightM(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   levelId: string | null = null,
 ): number {
-  let maxExplicitWallH = 0
-  for (const n of Object.values(nodes)) {
-    if (n.type !== 'wall' || !belongsToLevel(nodes, n, levelId)) continue
-    if (typeof n.height === 'number' && Number.isFinite(n.height) && n.height > 1.5) {
-      if (n.height > maxExplicitWallH) maxExplicitWallH = n.height
-    }
-  }
-  // Align with Structural roof-deck resolution: tallest explicit wall (> 1.5m) wins first
-  // so perimeter walls match the true physical roof deck even when level.height differs;
-  // never average short interior partitions with tall perimeter walls.
-  if (maxExplicitWallH > 0) return Math.max(2.2, maxExplicitWallH)
-  const lvl = levelId ? nodes[levelId] : Object.values(nodes).find((n) => n.type === 'level')
-  const explicitLevelH =
-    typeof lvl?.height === 'number' && Number.isFinite(lvl.height) && lvl.height > 1.5
-      ? lvl.height
-      : null
-  if (explicitLevelH !== null) return Math.max(2.2, explicitLevelH)
-  return 2.7
+  return kernelResolveLevelHeightM(
+    nodes as Readonly<Record<string, KernelSceneNodeLike>>,
+    levelId,
+    { minClampM: 2.2 },
+  )
 }
 
 export type XzBounds2D = {
@@ -301,41 +274,22 @@ export function resolveLevelBuildingId(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   lvl: SceneNodeLike | undefined,
 ): string | null {
-  if (!lvl) return null
-  if (typeof lvl.parentId === 'string' && nodes[lvl.parentId]?.type === 'building') {
-    return lvl.parentId
-  }
-  for (const n of Object.values(nodes)) {
-    if (n.type === 'building' && Array.isArray(n.children) && n.children.includes(lvl.id)) {
-      return n.id
-    }
-  }
-  return typeof lvl.parentId === 'string' ? lvl.parentId : null
+  return kernelResolveLevelBuildingId(
+    nodes as Readonly<Record<string, KernelSceneNodeLike>>,
+    lvl as KernelSceneNodeLike | undefined,
+  )
 }
 
 /**
  * Compare two sibling levels vertically.
- * Prioritizes Pascal's storey ordinal (`level` / `levelSortOrder`) before `elevation` / `baseElevation`
+ * Prioritizes Pascal's storey ordinal (`level`) before `elevation` / `baseElevation`
  * because every Pascal level carries `baseElevation: 0` by default (additive offset above stacked base).
  */
 export function compareLevelsVertically(a: SceneNodeLike | undefined, b: SceneNodeLike | undefined): number {
-  const primary = (l: SceneNodeLike | undefined): number => {
-    if (!l) return 0
-    if (typeof l.level === 'number' && Number.isFinite(l.level)) return l.level
-    if (typeof l.levelSortOrder === 'number' && Number.isFinite(l.levelSortOrder)) return l.levelSortOrder
-    if (typeof l.elevation === 'number' && Number.isFinite(l.elevation)) return l.elevation
-    if (typeof l.baseElevation === 'number' && Number.isFinite(l.baseElevation)) return l.baseElevation
-    return 0
-  }
-  const secondary = (l: SceneNodeLike | undefined): number => {
-    if (!l) return 0
-    if (typeof l.elevation === 'number' && Number.isFinite(l.elevation)) return l.elevation
-    if (typeof l.baseElevation === 'number' && Number.isFinite(l.baseElevation)) return l.baseElevation
-    return 0
-  }
-  const dp = primary(a) - primary(b)
-  if (Math.abs(dp) > 1e-6) return dp
-  return secondary(a) - secondary(b)
+  return kernelCompareLevelsVertically(
+    a as KernelSceneNodeLike | undefined,
+    b as KernelSceneNodeLike | undefined,
+  )
 }
 
 export type LowerWalledLevelsInfo = {
@@ -356,53 +310,32 @@ export function resolveLowerWalledLevels(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   levelId: string | null,
 ): LowerWalledLevelsInfo {
-  const empty: LowerWalledLevelsInfo = {
-    cumulativeBelowHeightM: 0,
-    lowerLevelIds: [],
-    groundLevelId: null,
-    groundWalls: [],
-    groundRooms: [],
-    allLowerWalls: [],
+  const summary = resolveLowerWalledLevelsSummary(
+    nodes as Readonly<Record<string, KernelSceneNodeLike>>,
+    levelId,
+  )
+  if (summary.lowerLevelIds.length === 0 || !summary.groundLevelId) {
+    return {
+      cumulativeBelowHeightM: 0,
+      lowerLevelIds: [],
+      groundLevelId: null,
+      groundWalls: [],
+      groundRooms: [],
+      allLowerWalls: [],
+    }
   }
-  if (!levelId) return empty
-  const curLvl = nodes[levelId]
-  if (!curLvl || curLvl.type !== 'level') return empty
 
-  const all = Object.values(nodes)
-  const curBldg = resolveLevelBuildingId(nodes, curLvl)
-  const siblingLower = all
-    .filter((o) => {
-      if (o.type !== 'level' || o.id === curLvl.id) return false
-      const oBldg = resolveLevelBuildingId(nodes, o)
-      if (curBldg && oBldg && curBldg !== oBldg) return false
-      if (compareLevelsVertically(o, curLvl) >= 0) return false
-      // Exclude below-grade basements from elevating ground/upper floors above grade
-      const isBasement =
-        (typeof o.level === 'number' && o.level < 0) ||
-        (typeof o.baseElevation === 'number' && o.baseElevation < -0.5) ||
-        (typeof o.elevation === 'number' && o.elevation < -0.5)
-      if (isBasement) return false
-      return all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
-    })
-    .sort((a, b) => compareLevelsVertically(a, b))
-
-  if (siblingLower.length === 0) return empty
-
-  let cumulativeBelowHeightM = 0
-  const lowerLevelIds: string[] = []
+  const lowerLevelIds = [...summary.lowerLevelIds]
   const allLowerWalls: WallSegment2D[] = []
-  for (const lower of siblingLower) {
-    lowerLevelIds.push(lower.id)
-    cumulativeBelowHeightM += resolveLevelHeightM(nodes, lower.id)
-    allLowerWalls.push(...extractWallSegments(nodes, lower.id))
+  for (const lid of lowerLevelIds) {
+    allLowerWalls.push(...extractWallSegments(nodes, lid))
   }
-  const groundLevelId = siblingLower[0]!.id
   return {
-    cumulativeBelowHeightM: round2(cumulativeBelowHeightM),
+    cumulativeBelowHeightM: round2(summary.cumulativeBelowHeightM),
     lowerLevelIds,
-    groundLevelId,
-    groundWalls: extractWallSegments(nodes, groundLevelId),
-    groundRooms: extractRoomPolygons(nodes, groundLevelId),
+    groundLevelId: summary.groundLevelId,
+    groundWalls: extractWallSegments(nodes, summary.groundLevelId),
+    groundRooms: extractRoomPolygons(nodes, summary.groundLevelId),
     allLowerWalls,
   }
 }
@@ -418,52 +351,66 @@ export function distancePointToSegment2D(
   const dx = bx - ax
   const dz = bz - az
   const lenSq = dx * dx + dz * dz
+  const dist = kernelDistancePointToSegment2D(px, pz, ax, az, bx, bz)
   if (lenSq < 1e-10) {
-    return { dist: Math.hypot(px - ax, pz - az), t: 0, closestX: ax, closestZ: az }
+    return { dist, t: 0, closestX: ax, closestZ: az }
   }
   const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lenSq))
-  const closestX = ax + dx * t
-  const closestZ = az + dz * t
-  return { dist: Math.hypot(px - closestX, pz - closestZ), t, closestX, closestZ }
+  return { dist, t, closestX: ax + dx * t, closestZ: az + dz * t }
 }
 
-// 8 ray directions (4 near-cardinal + 4 near-diagonal) with tiny angular jitter so rays never
-// run collinearly along axis-aligned wall segments.
-const ENCLOSURE_RAYS: ReadonlyArray<readonly [number, number]> = [
-  [Math.cos(0.0017), Math.sin(0.0017)],
-  [Math.cos(Math.PI / 4 + 0.0019), Math.sin(Math.PI / 4 + 0.0019)],
-  [Math.cos(Math.PI / 2 + 0.0023), Math.sin(Math.PI / 2 + 0.0023)],
-  [Math.cos((3 * Math.PI) / 4 + 0.0029), Math.sin((3 * Math.PI) / 4 + 0.0029)],
-  [Math.cos(Math.PI + 0.0031), Math.sin(Math.PI + 0.0031)],
-  [Math.cos((5 * Math.PI) / 4 + 0.0037), Math.sin((5 * Math.PI) / 4 + 0.0037)],
-  [Math.cos((3 * Math.PI) / 2 + 0.0041), Math.sin((3 * Math.PI) / 2 + 0.0041)],
-  [Math.cos((7 * Math.PI) / 4 + 0.0043), Math.sin((7 * Math.PI) / 4 + 0.0043)],
-]
+const wallFootprintModelCache = new WeakMap<
+  ReadonlyArray<WallSegment2D>,
+  { len: number; model: LevelFootprintModel }
+>()
 
-function rayHitsSegment2D(
-  ox: number,
-  oz: number,
-  rdx: number,
-  rdz: number,
-  ax: number,
-  az: number,
-  bx: number,
-  bz: number,
-  extM = 0.05,
-): boolean {
-  const sdx = bx - ax
-  const sdz = bz - az
-  const len = Math.hypot(sdx, sdz)
-  if (len < 1e-6) return false
-  const padT = extM / len
-  const denom = rdx * sdz - rdz * sdx
-  if (Math.abs(denom) < 1e-10) return false
-  const qx = ax - ox
-  const qz = az - oz
-  const t = (qx * sdz - qz * sdx) / denom
-  if (t < -1e-4) return false
-  const u = (qx * rdz - qz * rdx) / denom
-  return u >= -padT && u <= 1 + padT
+const roomPolygonPartitionCache = new WeakMap<
+  ReadonlyArray<RoomPolygon2D>,
+  {
+    len: number
+    interiorPolygons: readonly (readonly [number, number])[][]
+    outdoorPolygons: readonly (readonly [number, number])[][]
+  }
+>()
+
+function getFootprintModelForWalls(walls: ReadonlyArray<WallSegment2D>): LevelFootprintModel {
+  const cached = wallFootprintModelCache.get(walls)
+  if (cached && cached.len === walls.length) return cached.model
+  const canonicalWalls: CanonicalWall[] = walls.map((w) => ({
+    id: w.id,
+    levelId: null,
+    start: w.start,
+    end: w.end,
+    lengthM: w.lengthM,
+    ux: w.ux,
+    uz: w.uz,
+    nx: w.nx,
+    nz: w.nz,
+    heightM: w.heightM,
+    thicknessM: w.thicknessM,
+    visible: true,
+    openings: [],
+  }))
+  const model = compileLevelFootprint({}, null, canonicalWalls)
+  wallFootprintModelCache.set(walls, { len: walls.length, model })
+  return model
+}
+
+function getPartitionedRoomPolygons(rooms: ReadonlyArray<RoomPolygon2D>): {
+  interiorPolygons: readonly (readonly [number, number])[][]
+  outdoorPolygons: readonly (readonly [number, number])[][]
+} {
+  const cached = roomPolygonPartitionCache.get(rooms)
+  if (cached && cached.len === rooms.length) return cached
+  const interiorPolygons: (readonly [number, number])[][] = []
+  const outdoorPolygons: (readonly [number, number])[][] = []
+  for (const r of rooms) {
+    if (r.category === 'exterior') outdoorPolygons.push(r.polygon as (readonly [number, number])[])
+    else interiorPolygons.push(r.polygon as (readonly [number, number])[])
+  }
+  const entry = { len: rooms.length, interiorPolygons, outdoorPolygons }
+  roomPolygonPartitionCache.set(rooms, entry)
+  return entry
 }
 
 /**
@@ -476,31 +423,14 @@ export function isPointStrictlyInsideBuilding(
   walls: ReadonlyArray<WallSegment2D>,
   rooms: ReadonlyArray<RoomPolygon2D>,
 ): boolean {
-  let inInteriorRoom = false
-  let inExteriorRoom = false
-  for (const r of rooms) {
-    if (!pointInPolygon2D(x, z, r.polygon)) continue
-    if (r.category === 'exterior') inExteriorRoom = true
-    else inInteriorRoom = true
-  }
-  if (inInteriorRoom) return true
-  if (inExteriorRoom) return false
-
-  if (walls.length >= 3) {
-    for (const [rdx, rdz] of ENCLOSURE_RAYS) {
-      let hit = false
-      for (const w of walls) {
-        if (rayHitsSegment2D(x, z, rdx, rdz, w.start[0], w.start[1], w.end[0], w.end[1], 0.05)) {
-          hit = true
-          break
-        }
-      }
-      if (!hit) return false
-    }
-    return true
-  }
-
-  return rooms.length === 0
+  const model = getFootprintModelForWalls(walls)
+  const { interiorPolygons, outdoorPolygons } = getPartitionedRoomPolygons(rooms)
+  return model.isPointInside(x, z, {
+    precedence: 'room-first',
+    wallToleranceM: 0,
+    interiorPolygons,
+    outdoorPolygons,
+  })
 }
 
 /**
@@ -516,37 +446,14 @@ export function isPointInsideBuildingFootprint(
   rooms: ReadonlyArray<RoomPolygon2D>,
   wallProximityM = 0.45,
 ): boolean {
-  let inInteriorRoom = false
-  let inExteriorRoom = false
-  for (const r of rooms) {
-    if (!pointInPolygon2D(x, z, r.polygon)) continue
-    if (r.category === 'exterior') inExteriorRoom = true
-    else inInteriorRoom = true
-  }
-  if (inInteriorRoom) return true
-  if (inExteriorRoom) return false
-
-  if (walls.length >= 3) {
-    if (wallProximityM > 0) {
-      for (const w of walls) {
-        const { dist } = distancePointToSegment2D(x, z, w.start[0], w.start[1], w.end[0], w.end[1])
-        if (dist <= wallProximityM) return true
-      }
-    }
-    for (const [rdx, rdz] of ENCLOSURE_RAYS) {
-      let hit = false
-      for (const w of walls) {
-        if (rayHitsSegment2D(x, z, rdx, rdz, w.start[0], w.start[1], w.end[0], w.end[1], 0.05)) {
-          hit = true
-          break
-        }
-      }
-      if (!hit) return false
-    }
-    return true
-  }
-
-  return rooms.length === 0
+  const model = getFootprintModelForWalls(walls)
+  const { interiorPolygons, outdoorPolygons } = getPartitionedRoomPolygons(rooms)
+  return model.isPointInside(x, z, {
+    precedence: 'room-first',
+    wallToleranceM: wallProximityM,
+    interiorPolygons,
+    outdoorPolygons,
+  })
 }
 
 /**
@@ -701,12 +608,16 @@ export type AtticRoofEnvelope = {
   halfSpan: number
   bounds: XzBounds2D
   hasRoofAbove: boolean
+  isFlatRoof: boolean
+  ridgeY: number
+  eaveY: number
   roofYAt: (x: number, z: number) => number
 }
 
 /**
- * Compute the pitched attic roof plane `roofYAt(x, z)` matching structural gable geometry
- * (and tightening to any explicit `roof-segment` nodes on the target level).
+ * Compute the pitched attic roof plane `roofYAt(x, z)` via `@kruschdev/pascal-mep-kernel`'s
+ * `compileLevelRoofShell` (full cycle-safe nested `roof` parent transforms + 7 roof types,
+ * tightened to explicit `roof-segment` nodes on the target or adopted wall-less roof level).
  */
 export function buildAtticRoofEnvelope(
   nodes: Readonly<Record<string, SceneNodeLike>>,
@@ -714,173 +625,28 @@ export function buildAtticRoofEnvelope(
   bounds: XzBounds2D,
   wallH: number,
 ): AtticRoofEnvelope {
-  const all = Object.values(nodes)
-  const levels = all.filter((n) => n.type === 'level')
-  const curLvl = levelId ? nodes[levelId] : levels[0]
-  const curBuildingId = resolveLevelBuildingId(nodes, curLvl)
-  const hasRoofAbove = !levels.some((o) => {
-    if (!curLvl || o.id === curLvl.id) return false
-    const oBldg = resolveLevelBuildingId(nodes, o)
-    if (curBuildingId && oBldg && curBuildingId !== oBldg) return false
-    return compareLevelsVertically(o, curLvl) > 0 && all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
+  const kernelNodes = nodes as Readonly<Record<string, KernelSceneNodeLike>>
+  const shell = compileLevelRoofShell(kernelNodes, levelId, wallH, {
+    wallBounds: bounds,
+    clampOverhangToEave: true,
+    footprintPadM: 0.15,
   })
-
-  const assembly = all.find((n) => n.type === 'structural:assembly' && belongsToLevel(nodes, n, levelId))
-  const pitchRiseOver12 =
-    typeof assembly?.roofPitchRise === 'number' && Number.isFinite(assembly.roofPitchRise) && assembly.roofPitchRise > 0
-      ? assembly.roofPitchRise
-      : 6
+  const hasRoofAbove = isHighestWalledLevelInBuilding(kernelNodes, levelId)
+  const pitchRiseOver12 = shell.fallbackPitchRiseOver12 > 0 ? shell.fallbackPitchRiseOver12 : 6
 
   const spanX = Math.max(0.5, bounds.maxX - bounds.minX)
   const spanZ = Math.max(0.5, bounds.maxZ - bounds.minZ)
   const ridgeAlongX = spanX >= spanZ
   const halfSpan = (ridgeAlongX ? spanZ : spanX) / 2
   const center = ridgeAlongX ? (bounds.minZ + bounds.maxZ) / 2 : (bounds.minX + bounds.maxX) / 2
-
-  type ExplicitRoofSeg = {
-    cx: number
-    cz: number
-    cosR: number
-    sinR: number
-    effW: number
-    effD: number
-    width: number
-    depth: number
-    overhangM: number
-    eaveY: number
-    pitchRad: number
-    slopeTan: number
-    roofType: string
-  }
-  const unwalledUpperLevelIds = new Set<string>()
-  if (hasRoofAbove && curLvl) {
-    for (const o of levels) {
-      if (o.id === curLvl.id) continue
-      const oBldg = resolveLevelBuildingId(nodes, o)
-      if (curBuildingId && oBldg && curBuildingId !== oBldg) continue
-      const oHasWalls = all.some((w) => w.type === 'wall' && belongsToLevel(nodes, w, o.id))
-      if (!oHasWalls && compareLevelsVertically(o, curLvl) >= 0) {
-        unwalledUpperLevelIds.add(o.id)
-      }
-    }
-  }
-  const explicitSegs: ExplicitRoofSeg[] = []
-  for (const n of all) {
-    if (n.type !== 'roof-segment' || n.visible === false) continue
-    let inScope = belongsToLevel(nodes, n, levelId)
-    if (!inScope && unwalledUpperLevelIds.size > 0) {
-      for (const uid of unwalledUpperLevelIds) {
-        if (belongsToLevel(nodes, n, uid)) {
-          inScope = true
-          break
-        }
-      }
-    }
-    if (!inScope) continue
-    let wx = Array.isArray(n.position) ? Number(n.position[0] ?? 0) : 0
-    let wy = Array.isArray(n.position) ? Number(n.position[1] ?? 0) : 0
-    let wz = Array.isArray(n.position) ? Number(n.position[2] ?? 0) : 0
-    let rot = typeof n.rotation === 'number' ? n.rotation : 0
-    const parent = n.parentId ? nodes[n.parentId] : undefined
-    if (parent && parent.type === 'roof') {
-      const pRot = typeof parent.rotation === 'number' ? parent.rotation : 0
-      const pc = Math.cos(pRot)
-      const ps = Math.sin(pRot)
-      const px = Array.isArray(parent.position) ? Number(parent.position[0] ?? 0) : 0
-      const py = Array.isArray(parent.position) ? Number(parent.position[1] ?? 0) : 0
-      const pz = Array.isArray(parent.position) ? Number(parent.position[2] ?? 0) : 0
-      const rx = wx * pc + wz * ps
-      const rz = -wx * ps + wz * pc
-      wx = px + rx
-      wy = py + wy
-      wz = pz + rz
-      rot += pRot
-    }
-    const width = typeof n.width === 'number' && n.width > 0.2 ? n.width : 6
-    const depth = typeof n.depth === 'number' && n.depth > 0.2 ? n.depth : 6
-    const roofType = typeof n.roofType === 'string' ? n.roofType : 'gable'
-    const rawPitch = typeof n.pitch === 'number' && Number.isFinite(n.pitch) ? n.pitch : 26.57
-    const pitchRad =
-      rawPitch <= 0
-        ? 0
-        : rawPitch > 1.4
-          ? (Math.min(65, rawPitch) * Math.PI) / 180
-          : Math.min((65 * Math.PI) / 180, rawPitch)
-    const overhangM = typeof n.overhang === 'number' && n.overhang >= 0 ? n.overhang : 0.35
-    const segWallH = typeof n.wallHeight === 'number' && Number.isFinite(n.wallHeight) ? n.wallHeight : 0
-    const eaveY = wy > 0.05 ? wy + segWallH : wallH + segWallH
-    const swapAxes = (roofType === 'hip' || roofType === 'dutch' || roofType === 'mansard') && width < depth
-    const effYaw = swapAxes ? rot + Math.PI / 2 : rot
-    const effW = swapAxes ? depth : width
-    const effD = swapAxes ? width : depth
-    explicitSegs.push({
-      cx: wx,
-      cz: wz,
-      cosR: Math.cos(effYaw),
-      sinR: Math.sin(effYaw),
-      effW,
-      effD,
-      width,
-      depth,
-      overhangM,
-      eaveY,
-      pitchRad,
-      slopeTan: roofType === 'flat' || pitchRad <= 0.008 ? 0 : Math.tan(pitchRad),
-      roofType,
-    })
-  }
+  const eaveY =
+    shell.segments.length > 0 ? Math.min(...shell.segments.map((s) => s.eaveY)) : wallH
 
   const roofYAt = (x: number, z: number): number => {
     const distFromRidge = Math.abs((ridgeAlongX ? z : x) - center)
-    const riseM = Math.max(0, halfSpan - distFromRidge) * (pitchRiseOver12 / 12)
-    const fallbackY = wallH + riseM
-    if (explicitSegs.length > 0) {
-      let bestSegY: number | null = null
-      for (const seg of explicitSegs) {
-        const dx = x - seg.cx
-        const dz = z - seg.cz
-        const lx = dx * seg.cosR - dz * seg.sinR
-        const lz = dx * seg.sinR + dz * seg.cosR
-        let sy: number
-        if (seg.roofType === 'conical') {
-          const r = Math.min(seg.width, seg.depth) / 2
-          const dist = Math.hypot(lx, lz)
-          if (dist > r + seg.overhangM + 0.15) continue
-          sy = seg.eaveY + Math.max(0, r - dist) * seg.slopeTan
-        } else {
-          const padX =
-            seg.roofType === 'hip' || seg.roofType === 'dutch' || seg.roofType === 'mansard'
-              ? seg.overhangM + 0.15
-              : 0.15
-          if (Math.abs(lx) > seg.effW / 2 + padX || Math.abs(lz) > seg.effD / 2 + seg.overhangM + 0.15) {
-            continue
-          }
-          if (seg.roofType === 'flat' || seg.pitchRad <= 0.008) {
-            sy = seg.eaveY
-          } else if (seg.roofType === 'shed') {
-            sy = seg.eaveY + Math.max(0, seg.effD / 2 - lz) * seg.slopeTan
-          } else if (seg.roofType === 'hip' || seg.roofType === 'dutch') {
-            const halfW = seg.effW / 2
-            const halfD = seg.effD / 2
-            const hipRise = seg.roofType === 'dutch' ? Math.min(halfD * seg.slopeTan, halfD * 1.35) : halfD * seg.slopeTan
-            const effTan = hipRise / Math.max(0.1, halfD)
-            const dMin = Math.min(halfW - Math.abs(lx), halfD - Math.abs(lz))
-            sy = seg.eaveY + Math.min(hipRise, Math.max(0, dMin) * effTan)
-          } else if (seg.roofType === 'mansard') {
-            const halfW = seg.effW / 2
-            const halfD = seg.effD / 2
-            const inset = Math.min(seg.effW, seg.effD) * 0.18
-            const manRise = Math.min(2.2, Math.max(0.25, inset * seg.slopeTan))
-            const dMin = Math.min(halfW - Math.abs(lx), halfD - Math.abs(lz))
-            sy = seg.eaveY + Math.min(manRise, Math.max(0, dMin) * (manRise / Math.max(0.1, inset)))
-          } else {
-            sy = seg.eaveY + Math.max(0, seg.effD / 2 - Math.abs(lz)) * seg.slopeTan
-          }
-        }
-        if (bestSegY === null || sy > bestSegY) bestSegY = sy
-      }
-      if (bestSegY !== null) return Math.min(fallbackY, bestSegY)
-    }
+    const fallbackY = wallH + Math.max(0, halfSpan - distFromRidge) * (pitchRiseOver12 / 12)
+    const explicitY = shell.roofSurfaceY(x, z)
+    if (explicitY !== null) return Math.min(fallbackY, explicitY)
     return fallbackY
   }
 
@@ -892,6 +658,9 @@ export function buildAtticRoofEnvelope(
     halfSpan,
     bounds,
     hasRoofAbove,
+    isFlatRoof: shell.isFlatRoof,
+    ridgeY: shell.maxRidgeY,
+    eaveY,
     roofYAt,
   }
 }
@@ -967,31 +736,25 @@ export function pathClearOfRoof(
   return true
 }
 
-function parseNominalIn(raw: unknown): number {
-  if (typeof raw === 'number' && raw > 0) return raw
-  if (typeof raw !== 'string') return 2
-  const cleaned = raw.replace(/"/g, '').trim()
-  if (cleaned.includes('-')) {
-    const [whole, frac] = cleaned.split('-')
-    const [num, den] = (frac ?? '').split('/')
-    if (whole && num && den) return Number(whole) + Number(num) / Number(den)
-  }
-  if (cleaned.includes('/')) {
-    const [num, den] = cleaned.split('/')
-    if (num && den) return Number(num) / Number(den)
-  }
-  const n = Number(cleaned)
-  return Number.isFinite(n) && n > 0 ? n : 2
-}
-
 const obstacleCache = new WeakMap<
   Readonly<Record<string, SceneNodeLike>>,
   Map<string, HvacObstacle[]>
 >()
 
+function mapOccupancyCategory(
+  kind: OccupancyObstacle['kind'],
+  trade: OccupancyObstacle['trade'],
+): HvacObstacle['category'] {
+  if (kind === 'electrical-dedicated-space') return 'electrical-dedicated-space'
+  if (kind === 'electrical-working-space') return 'electrical-working-space'
+  if (trade === 'structural') return 'structural'
+  return 'plumbing'
+}
+
 /**
  * Extract Priority #1 Structural obstacles, Priority #2 Plumbing obstacles (`plumbing:pipe-run`,
- * `plumbing:equipment`, `plumbing:manifold`), AND NEC 110.26(E) Dedicated Electrical Space columns.
+ * `plumbing:equipment`, `plumbing:manifold`), AND NEC 110.26(A)/(E) Electrical Space prisms
+ * via `@kruschdev/pascal-mep-kernel`'s `extractTradeOccupancyObstacles`.
  * WeakMap-memoized per scene nodes object reference.
  */
 export function extractHvacObstacles(
@@ -1007,283 +770,120 @@ export function extractHvacObstacles(
   const cached = byLevel.get(key)
   if (cached) return cached
 
+  const rawObstacles = extractTradeOccupancyObstacles(
+    nodes as Readonly<Record<string, KernelSceneNodeLike>>,
+    levelId,
+    {
+      forTrade: 'hvac',
+      includeElectricalWorkingSpace: true,
+    },
+  )
+
   const obstacles: HvacObstacle[] = []
-  const levelH = resolveLevelHeightM(nodes, levelId)
+  for (const obs of rawObstacles) {
+    const category = mapOccupancyCategory(obs.kind, obs.trade)
 
-  const pushBeamSubBoxes = (
-    id: string,
-    label: string,
-    sx: number,
-    sz: number,
-    ex: number,
-    ez: number,
-    w: number,
-    y: number,
-    h: number,
-  ) => {
-    const dx = Math.abs(ex - sx)
-    const dz = Math.abs(ez - sz)
-    const isDiagonal = dx > 0.2 && dz > 0.2
-    const steps = isDiagonal ? Math.min(8, Math.max(3, Math.ceil(Math.hypot(dx, dz) / 0.5))) : 1
-    for (let s = 0; s < steps; s++) {
-      const t0 = s / steps
-      const t1 = (s + 1) / steps
-      const x0 = sx + (ex - sx) * t0
-      const z0 = sz + (ez - sz) * t0
-      const x1 = sx + (ex - sx) * t1
-      const z1 = sz + (ez - sz) * t1
-      obstacles.push({
-        id: steps === 1 ? id : `${id}:seg${s}`,
-        nodeId: id,
-        category: 'structural',
-        label,
-        box: {
-          minX: Math.min(x0, x1) - w / 2,
-          maxX: Math.max(x0, x1) + w / 2,
-          minY: y - h / 2,
-          maxY: y + h / 2,
-          minZ: Math.min(z0, z1) - w / 2,
-          maxZ: Math.max(z0, z1) + w / 2,
-        },
-      })
-    }
-  }
-
-  const readYaw = (rotation: unknown): number =>
-    typeof rotation === 'number'
-      ? rotation
-      : Array.isArray(rotation) && typeof rotation[1] === 'number'
-        ? rotation[1]
-        : 0
-
-  for (const n of Object.values(nodes)) {
-    if (!belongsToLevel(nodes, n, levelId)) continue
-    const pos =
-      Array.isArray(n.position) && n.position.length >= 3
-        ? ([Number(n.position[0]), Number(n.position[1]), Number(n.position[2])] as Vec3)
-        : null
-
-    // 1. Structural (Priority #1)
-    if (n.type === 'structural:column' && pos) {
-      const w = (typeof n.widthIn === 'number' ? n.widthIn : 5.5) * INCHES_TO_METERS
-      const d = (typeof n.depthIn === 'number' ? n.depthIn : 5.5) * INCHES_TO_METERS
-      const h = typeof n.heightM === 'number' ? n.heightM : levelH
-      const rot = readYaw(n.rotation)
-      const cosR = Math.abs(Math.cos(rot))
-      const sinR = Math.abs(Math.sin(rot))
-      const halfX = (w * cosR + d * sinR) / 2
-      const halfZ = (w * sinR + d * cosR) / 2
-      obstacles.push({
-        id: n.id,
-        nodeId: n.id,
-        category: 'structural',
-        label: `Structural column (${n.name ?? n.id})`,
-        box: { minX: pos[0] - halfX, maxX: pos[0] + halfX, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - halfZ, maxZ: pos[2] + halfZ },
-      })
-    } else if (n.type === 'structural:beam' && Array.isArray(n.start) && Array.isArray(n.end)) {
-      const sx = Number(n.start[0])
-      const sz = Number(n.start.length >= 3 ? n.start[2] : n.start[1])
-      const ex = Number(n.end[0])
-      const ez = Number(n.end.length >= 3 ? n.end[2] : n.end[1])
-      const w = (typeof n.widthIn === 'number' ? n.widthIn : 3.5) * INCHES_TO_METERS
-      const h = (typeof n.depthIn === 'number' ? n.depthIn : 11.875) * INCHES_TO_METERS
-      const y =
-        typeof n.elevationY === 'number'
-          ? Number(n.elevationY)
-          : typeof n.elevation === 'number'
-            ? Number(n.elevation)
-            : n.start.length >= 3
-              ? Number(n.start[1])
-              : levelH - h / 2
-      pushBeamSubBoxes(n.id, `Structural beam (${n.name ?? n.id})`, sx, sz, ex, ez, w, y, h)
-    } else if (n.type === 'column' && pos) {
-      const w = typeof n.width === 'number' ? n.width : 0.25
-      const d = typeof n.depth === 'number' ? n.depth : 0.25
-      const h = typeof n.height === 'number' ? n.height : levelH
-      const rot = readYaw(n.rotation)
-      const cosR = Math.abs(Math.cos(rot))
-      const sinR = Math.abs(Math.sin(rot))
-      const halfX = (w * cosR + d * sinR) / 2
-      const halfZ = (w * sinR + d * cosR) / 2
-      obstacles.push({
-        id: n.id,
-        nodeId: n.id,
-        category: 'structural',
-        label: `Column (${n.name ?? n.id})`,
-        box: { minX: pos[0] - halfX, maxX: pos[0] + halfX, minY: pos[1], maxY: pos[1] + h, minZ: pos[2] - halfZ, maxZ: pos[2] + halfZ },
-      })
-    } else if (n.type === 'beam' && Array.isArray(n.start) && Array.isArray(n.end)) {
-      const sx = Number(n.start[0])
-      const sz = Number(n.start[1])
-      const ex = Number(n.end[0])
-      const ez = Number(n.end[1])
-      const w = typeof n.width === 'number' ? n.width : 0.2
-      const h = typeof n.height === 'number' ? n.height : 0.3
-      const y = typeof n.elevation === 'number' ? Number(n.elevation) : levelH - h / 2
-      pushBeamSubBoxes(n.id, `Beam (${n.name ?? n.id})`, sx, sz, ex, ez, w, y, h)
-    } else if (n.type === 'plumbing:pipe-run' && Array.isArray(n.path) && n.path.length >= 2) {
-      // 2. Plumbing (Priority #2 — gravity DWV & supply right-of-way)
-      // Subdivide diagonal segments into tighter sub-AABBs so angled runs never cast phantom boxes.
-      const diamIn = parseNominalIn(n.nominalSize)
-      const r = Math.max(0.02, (diamIn * INCHES_TO_METERS) / 2)
-      for (let i = 1; i < n.path.length; i++) {
-        const a = n.path[i - 1]!
-        const b = n.path[i]!
-        const dx = Math.abs(b[0] - a[0])
-        const dz = Math.abs(b[2] - a[2])
-        const isDiagonal = dx > 0.2 && dz > 0.2
-        const steps = isDiagonal ? Math.min(8, Math.max(3, Math.ceil(Math.hypot(dx, dz) / 0.45))) : 1
+    // Subdivide diagonal structural beams along their exact OrientedPrismY centerline into tight
+    // sub-AABBs (`<id>:seg<n>`, deduplicated by `nodeId`) for backwards-compatibility (BUG-06 / HVC-05).
+    if (obs.kind === 'structural-beam' && obs.prism) {
+      const p = obs.prism
+      const len = p.lxMax - p.lxMin
+      const sx = p.centerX + p.lxMin * p.cos
+      const sz = p.centerZ + p.lxMin * p.sin
+      const ex = p.centerX + p.lxMax * p.cos
+      const ez = p.centerZ + p.lxMax * p.sin
+      const dx = Math.abs(ex - sx)
+      const dz = Math.abs(ez - sz)
+      if (dx > 0.2 && dz > 0.2) {
+        const halfW = (p.lzMax - p.lzMin) / 2
+        const steps = Math.min(8, Math.max(3, Math.ceil(len / 0.5)))
         for (let s = 0; s < steps; s++) {
           const t0 = s / steps
           const t1 = (s + 1) / steps
-          const p0: Vec3 = [a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0, a[2] + (b[2] - a[2]) * t0]
-          const p1: Vec3 = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1, a[2] + (b[2] - a[2]) * t1]
+          const x0 = sx + (ex - sx) * t0
+          const z0 = sz + (ez - sz) * t0
+          const x1 = sx + (ex - sx) * t1
+          const z1 = sz + (ez - sz) * t1
           obstacles.push({
-            id: steps === 1 ? `${n.id}:seg${i - 1}` : `${n.id}:seg${i - 1}_${s}`,
-            nodeId: n.id,
-            category: 'plumbing',
-            label: `Plumbing ${String(n.nominalSize ?? '2"')} ${String(n.system ?? 'pipe')} (${n.id})`,
+            id: `${obs.nodeId}:seg${s}`,
+            nodeId: obs.nodeId,
+            category,
+            label: obs.label,
             box: {
-              minX: Math.min(p0[0], p1[0]) - r,
-              maxX: Math.max(p0[0], p1[0]) + r,
-              minY: Math.min(p0[1], p1[1]) - r,
-              maxY: Math.max(p0[1], p1[1]) + r,
-              minZ: Math.min(p0[2], p1[2]) - r,
-              maxZ: Math.max(p0[2], p1[2]) + r,
+              minX: Math.min(x0, x1) - halfW,
+              maxX: Math.max(x0, x1) + halfW,
+              minY: p.yMin,
+              maxY: p.yMax,
+              minZ: Math.min(z0, z1) - halfW,
+              maxZ: Math.max(z0, z1) + halfW,
             },
           })
         }
+        continue
       }
-    } else if (n.type === 'plumbing:manifold' && pos) {
-      // Center-anchored wall-mounted manifold (0.48m x 0.70m x 0.48m)
-      const halfW = 0.24
-      obstacles.push({
-        id: n.id,
-        nodeId: n.id,
-        category: 'plumbing',
-        label: `Plumbing manifold (${n.name ?? n.id})`,
-        box: {
-          minX: pos[0] - halfW,
-          maxX: pos[0] + halfW,
-          minY: pos[1] - 0.35,
-          maxY: pos[1] + 0.35,
-          minZ: pos[2] - halfW,
-          maxZ: pos[2] + halfW,
-        },
-      })
-    } else if (n.type === 'plumbing:equipment' && pos) {
-      const eqKind = typeof n.equipmentKind === 'string' ? n.equipmentKind : ''
-      const isCompact =
-        eqKind === 'expansion-tank' ||
-        eqKind === 'sump-pump' ||
-        eqKind === 'main-shutoff-prv' ||
-        eqKind === 'gas-meter'
-      const isTankless = eqKind.startsWith('water-heater-tankless')
-      const w = isCompact ? 0.32 : isTankless ? 0.45 : 0.6
-      const d = isCompact ? 0.32 : isTankless ? 0.3 : 0.6
-      const h = isCompact ? 0.45 : isTankless ? 0.65 : 1.55
-      const rot = readYaw(n.rotation)
-      const cosR = Math.abs(Math.cos(rot))
-      const sinR = Math.abs(Math.sin(rot))
-      const halfX = (w * cosR + d * sinR) / 2
-      const halfZ = (w * sinR + d * cosR) / 2
-      obstacles.push({
-        id: n.id,
-        nodeId: n.id,
-        category: 'plumbing',
-        label: `Plumbing equipment (${n.name ?? n.id})`,
-        box: {
-          minX: pos[0] - halfX,
-          maxX: pos[0] + halfX,
-          minY: pos[1],
-          maxY: pos[1] + h,
-          minZ: pos[2] - halfZ,
-          maxZ: pos[2] + halfZ,
-        },
-      })
-    } else if (n.type === 'electrical:panel' && pos) {
-      // NEC 110.26(E)(1)(a): Dedicated electrical space from floor (minY = 0) to 6 ft above panel
-      const w = typeof n.width === 'number' ? n.width : 0.42
-      const d = typeof n.depth === 'number' ? n.depth : 0.16
-      const rot = readYaw(n.rotation)
-      const cosR = Math.abs(Math.cos(rot))
-      const sinR = Math.abs(Math.sin(rot))
-      const halfX = (w * cosR + d * sinR) / 2 + 0.03
-      const halfZ = (w * sinR + d * cosR) / 2 + 0.03
-      const panelTopY = pos[1] + (typeof n.height === 'number' ? n.height / 2 : 0.46)
-      obstacles.push({
-        id: n.id,
-        nodeId: n.id,
-        category: 'electrical-dedicated-space',
-        label: `NEC 110.26(E) Dedicated Space (${n.name ?? n.id})`,
-        box: {
-          minX: pos[0] - halfX,
-          maxX: pos[0] + halfX,
-          minY: 0,
-          maxY: Math.max(levelH + 0.6, panelTopY + 1.83),
-          minZ: pos[2] - halfZ,
-          maxZ: pos[2] + halfZ,
-        },
-      })
-      // NEC 110.26(A): 36" (0.914m) deep x 30" (0.762m) wide x 78" (1.981m) tall working space in front of panel
-      const fx = Math.sin(rot)
-      const fz = Math.cos(rot)
-      const tx = Math.cos(rot)
-      const tz = -Math.sin(rot)
-      const wsDepth = 0.914
-      const wsHalfW = Math.max(0.762, w) / 2
-      const fcX = pos[0] + fx * (d / 2)
-      const fcZ = pos[2] + fz * (d / 2)
-      const farX = fcX + fx * wsDepth
-      const farZ = fcZ + fz * wsDepth
-      const c0x = fcX - tx * wsHalfW
-      const c1x = fcX + tx * wsHalfW
-      const c2x = farX - tx * wsHalfW
-      const c3x = farX + tx * wsHalfW
-      const c0z = fcZ - tz * wsHalfW
-      const c1z = fcZ + tz * wsHalfW
-      const c2z = farZ - tz * wsHalfW
-      const c3z = farZ + tz * wsHalfW
-      obstacles.push({
-        id: `${n.id}:working-space`,
-        nodeId: n.id,
-        category: 'electrical-working-space',
-        label: `NEC 110.26(A) Working Space (${n.name ?? n.id})`,
-        box: {
-          minX: Math.min(c0x, c1x, c2x, c3x),
-          maxX: Math.max(c0x, c1x, c2x, c3x),
-          minY: 0,
-          maxY: Math.max(1.981, panelTopY),
-          minZ: Math.min(c0z, c1z, c2z, c3z),
-          maxZ: Math.max(c0z, c1z, c2z, c3z),
-        },
-      })
-    } else if (n.type === 'electrical:transformer' && pos) {
-      // NEC 110.26(E): Dry-type transformer footprint & overhead dedicated space
-      const w = typeof n.width === 'number' ? n.width : 0.76
-      const d = typeof n.depth === 'number' ? n.depth : 0.64
-      const rot = readYaw(n.rotation)
-      const cosR = Math.abs(Math.cos(rot))
-      const sinR = Math.abs(Math.sin(rot))
-      const halfX = (w * cosR + d * sinR) / 2 + 0.03
-      const halfZ = (w * sinR + d * cosR) / 2 + 0.03
-      const topY = pos[1] + (typeof n.height === 'number' ? n.height : 0.95)
-      obstacles.push({
-        id: n.id,
-        nodeId: n.id,
-        category: 'electrical-dedicated-space',
-        label: `NEC 110.26(E) Dedicated Space (${n.name ?? n.id})`,
-        box: {
-          minX: pos[0] - halfX,
-          maxX: pos[0] + halfX,
-          minY: 0,
-          maxY: Math.max(levelH + 0.6, topY + 1.83),
-          minZ: pos[2] - halfZ,
-          maxZ: pos[2] + halfZ,
-        },
-      })
     }
+
+    // Preserve HVAC's exact equipment envelope defaults for compact expansion tanks and
+    // tankless water heaters (XT-13 / REAL-HVC-01 backwards-compatibility).
+    if (obs.kind === 'plumbing-equipment') {
+      const src = nodes[obs.nodeId]
+      const eqKind = typeof src?.equipmentKind === 'string' ? src.equipmentKind : ''
+      const pos = Array.isArray(src?.position) && src.position.length >= 3 ? src.position : null
+      if (
+        pos &&
+        src &&
+        typeof src.width !== 'number' &&
+        typeof src.depth !== 'number' &&
+        typeof src.height !== 'number' &&
+        (eqKind === 'expansion-tank' || eqKind.startsWith('water-heater-tankless'))
+      ) {
+        const isTankless = eqKind.startsWith('water-heater-tankless')
+        const w = isTankless ? 0.45 : 0.32
+        const d = isTankless ? 0.3 : 0.32
+        const h = isTankless ? 0.65 : 0.45
+        const rot = extractNodeYawRad(src.rotation)
+        const cosR = Math.abs(Math.cos(rot))
+        const sinR = Math.abs(Math.sin(rot))
+        const halfX = (w * cosR + d * sinR) / 2
+        const halfZ = (w * sinR + d * cosR) / 2
+        const px = Number(pos[0])
+        const py = Number(pos[1])
+        const pz = Number(pos[2])
+        obstacles.push({
+          id: obs.id,
+          nodeId: obs.nodeId,
+          category,
+          label: obs.label,
+          box: {
+            minX: px - halfX,
+            maxX: px + halfX,
+            minY: py,
+            maxY: py + h,
+            minZ: pz - halfZ,
+            maxZ: pz + halfZ,
+          },
+        })
+        continue
+      }
+    }
+
+    obstacles.push({
+      id: obs.id,
+      nodeId: obs.nodeId,
+      category,
+      label: obs.label,
+      box: {
+        minX: obs.aabb.minX,
+        minY: obs.aabb.minY,
+        minZ: obs.aabb.minZ,
+        maxX: obs.aabb.maxX,
+        maxY: obs.aabb.maxY,
+        maxZ: obs.aabb.maxZ,
+      },
+      ...(obs.prism ? { prism: obs.prism } : {}),
+    })
   }
+
   byLevel.set(key, obstacles)
   return obstacles
 }
@@ -1294,29 +894,7 @@ export function segmentIntersectsAabb(
   box: Aabb3,
   margin: number | readonly [number, number, number] = 0.03,
 ): boolean {
-  const [mx, my, mz] = typeof margin === 'number' ? [margin, margin, margin] : margin
-  const mins = [box.minX - mx, box.minY - my, box.minZ - mz] as const
-  const maxs = [box.maxX + mx, box.maxY + my, box.maxZ + mz] as const
-  const dirs = [b[0] - a[0], b[1] - a[1], b[2] - a[2]] as const
-  const starts = [a[0], a[1], a[2]] as const
-
-  let tMin = 0
-  let tMax = 1
-  for (let axis = 0; axis < 3; axis++) {
-    const d = dirs[axis]!
-    const s = starts[axis]!
-    if (Math.abs(d) < 1e-8) {
-      if (s < mins[axis]! || s > maxs[axis]!) return false
-    } else {
-      let t1 = (mins[axis]! - s) / d
-      let t2 = (maxs[axis]! - s) / d
-      if (t1 > t2) [t1, t2] = [t2, t1]
-      tMin = Math.max(tMin, t1)
-      tMax = Math.min(tMax, t2)
-      if (tMin > tMax) return false
-    }
-  }
-  return true
+  return segmentIntersectsAabb3(a, b, box, margin)
 }
 
 export function detectHvacClashes(
@@ -1336,7 +914,10 @@ export function detectHvacClashes(
     for (const obs of obstacles) {
       const obsKey = obs.nodeId ?? obs.id
       if (seen.has(obsKey)) continue
-      if (segmentIntersectsAabb(a, b, obs.box, margin3)) {
+      const hit = obs.prism
+        ? segmentIntersectsOrientedPrismY(a, b, obs.prism, margin3)
+        : segmentIntersectsAabb(a, b, obs.box, margin3)
+      if (hit) {
         seen.add(obsKey)
         hits.push(obs)
       }
@@ -1357,10 +938,277 @@ function cleanPath(pts: Vec3[]): Vec3[] {
   return out
 }
 
+export type HvacLegalCavityContext = {
+  readonly anatomy: BuildingAnatomy
+  readonly levelId: string | null
+  readonly occupancy: TradeOccupancyGrid
+  readonly graphCache: Map<string, LegalCavityGraph>
+  readonly outdoorPolygons?: readonly (readonly (readonly [number, number])[])[]
+  readonly interiorPolygons?: readonly (readonly (readonly [number, number])[])[]
+}
+
+/**
+ * Extract all 3D door & window opening keepout prisms on a building level via
+ * `@kruschdev/pascal-mep-kernel`'s `compileBuildingAnatomy` + `extractLevelOpeningPrisms`.
+ */
+export function extractHvacOpeningPrisms(
+  nodes: Readonly<Record<string, SceneNodeLike>>,
+  levelId: string | null = null,
+) {
+  const anatomy = compileBuildingAnatomy(nodes as Readonly<Record<string, KernelSceneNodeLike>>)
+  return extractLevelOpeningPrisms(anatomy.getWalls(levelId))
+}
+
+/**
+ * Compile (or reuse) a shared Layer 2 `HvacLegalCavityContext` holding WeakMap-cached
+ * `BuildingAnatomy`, a mutable `TradeOccupancyGrid` for cross-trade & dual-wing reservation,
+ * and a per-context `LegalCavityGraph` cache (`INV-MEP-06`, `INV-MEP-07`).
+ */
+export function createHvacLegalCavityContext(
+  nodes: Readonly<Record<string, SceneNodeLike>>,
+  levelId: string | null = null,
+  opts: {
+    readonly anatomy?: BuildingAnatomy
+    readonly occupancy?: TradeOccupancyGrid
+    readonly rooms?: ReadonlyArray<RoomPolygon2D>
+  } = {},
+): HvacLegalCavityContext {
+  const kernelNodes = nodes as Readonly<Record<string, KernelSceneNodeLike>>
+  const anatomy = opts.anatomy ?? compileBuildingAnatomy(kernelNodes)
+  const occupancy =
+    opts.occupancy ??
+    anatomy.createOccupancyGrid(levelId, {
+      forTrade: 'hvac',
+      includeElectricalWorkingSpace: true,
+    })
+  const rooms = opts.rooms ?? extractRoomPolygons(nodes, levelId)
+  const { interiorPolygons, outdoorPolygons } = getPartitionedRoomPolygons(rooms)
+  return {
+    anatomy,
+    levelId,
+    occupancy,
+    graphCache: new Map<string, LegalCavityGraph>(),
+    ...(outdoorPolygons.length > 0 ? { outdoorPolygons } : {}),
+    ...(interiorPolygons.length > 0 ? { interiorPolygons } : {}),
+  }
+}
+
+export type RouteHvacViaLegalCavityParams = {
+  /** Scene nodes (used to compile `BuildingAnatomy` when `cavityContext`/`anatomy` is omitted). */
+  nodes?: Readonly<Record<string, SceneNodeLike>>
+  levelId?: string | null
+  /** Optional pre-compiled Layer 2 context for zero-recompilation multi-run batching & reservations. */
+  cavityContext?: HvacLegalCavityContext
+  anatomy?: BuildingAnatomy
+  graph?: LegalCavityGraph
+  occupancy?: TradeOccupancyGrid
+  from: Vec3
+  to: Vec3
+  /** Routing physics mode: `'orthogonal'` for HVAC ducts/linesets, `'gravity-slope'` for condensate drains. */
+  mode?: 'orthogonal' | 'gravity-slope'
+  ductHalfSpanM?: DuctClashMargin
+  clearanceM?: number
+  plenumLocation?: 'attic' | 'conditioned-soffit' | 'crawlspace' | 'basement'
+  allowedBands?: readonly CavityBand[]
+  atticElevationM?: number
+  flatSoffitMarginM?: number
+  roofClearanceM?: number
+  minSlopeInPerFt?: number
+  preferWallFollowing?: boolean
+  reserveOnCommit?: boolean
+  runId?: string
+  ignoreObstacleNodeIds?: ReadonlySet<string>
+  extraObstacles?: ReadonlyArray<HvacObstacle>
+  outdoorPolygons?: readonly (readonly (readonly [number, number])[])[]
+  interiorPolygons?: readonly (readonly (readonly [number, number])[])[]
+}
+
+/**
+ * Layer 2 — Route an HVAC duct, exhaust, refrigerant lineset (`mode: 'orthogonal'`) or
+ * gravity-sloped condensate drain (`mode: 'gravity-slope'`) through legal building cavities
+ * compiled via `compileLegalCavityGraph` + `routeInLegalCavities` (`trade: 'hvac'`),
+ * backed by `TradeOccupancyGrid` (`INV-MEP-06`, `INV-MEP-07`).
+ */
+export function routeHvacViaLegalCavity(params: RouteHvacViaLegalCavityParams): CavityRouteResult {
+  const mode = params.mode ?? 'orthogonal'
+  const levelId = params.levelId !== undefined ? params.levelId : (params.cavityContext?.levelId ?? null)
+  const kernelNodes = params.nodes as Readonly<Record<string, KernelSceneNodeLike>> | undefined
+
+  const anatomy =
+    params.anatomy ??
+    params.cavityContext?.anatomy ??
+    (kernelNodes ? compileBuildingAnatomy(kernelNodes) : compileBuildingAnatomy({}))
+
+  const baseOccupancy =
+    params.occupancy ??
+    params.cavityContext?.occupancy ??
+    anatomy.createOccupancyGrid(levelId, {
+      forTrade: 'hvac',
+      includeElectricalWorkingSpace: true,
+    })
+
+  let effectiveOccupancy = baseOccupancy
+  if (params.extraObstacles && params.extraObstacles.length > 0) {
+    const existingKeys = new Set<string>()
+    for (const obs of baseOccupancy.obstacles) {
+      existingKeys.add(obs.id)
+      existingKeys.add(obs.nodeId)
+    }
+    const missing = params.extraObstacles.filter(
+      (o) => !existingKeys.has(o.id) && !(o.nodeId && existingKeys.has(o.nodeId)),
+    )
+    if (missing.length > 0) {
+      effectiveOccupancy = new TradeOccupancyGrid(baseOccupancy.obstacles)
+      for (const obs of missing) {
+        effectiveOccupancy.reserveBox({
+          id: obs.id,
+          nodeId: obs.nodeId ?? obs.id,
+          trade: obs.category === 'plumbing' ? 'plumbing' : obs.category === 'structural' ? 'structural' : 'electrical',
+          kind:
+            obs.category === 'electrical-dedicated-space'
+              ? 'electrical-dedicated-space'
+              : obs.category === 'electrical-working-space'
+                ? 'electrical-working-space'
+                : obs.category === 'plumbing'
+                  ? 'plumbing-equipment'
+                  : 'structural-beam',
+          aabb: obs.box,
+          ...(obs.prism ? { prism: obs.prism } : {}),
+          label: obs.label,
+        })
+      }
+    }
+  }
+
+  const defaultHalf = mode === 'gravity-slope' ? 0.02 : 0.08
+  const halfXZ =
+    params.ductHalfSpanM === undefined
+      ? defaultHalf
+      : typeof params.ductHalfSpanM === 'number'
+        ? params.ductHalfSpanM
+        : params.ductHalfSpanM.horizontal
+  const halfY =
+    params.ductHalfSpanM === undefined
+      ? defaultHalf
+      : typeof params.ductHalfSpanM === 'number'
+        ? params.ductHalfSpanM
+        : params.ductHalfSpanM.vertical
+  const clearanceM = params.clearanceM ?? 0.02
+  const roofClearanceM = params.roofClearanceM ?? (mode === 'gravity-slope' ? 0.06 : 0.14)
+
+  let outdoorPolygons = params.outdoorPolygons ?? params.cavityContext?.outdoorPolygons
+  let interiorPolygons = params.interiorPolygons ?? params.cavityContext?.interiorPolygons
+  if (!outdoorPolygons && !interiorPolygons && params.nodes) {
+    const rooms = extractRoomPolygons(params.nodes, levelId)
+    const part = getPartitionedRoomPolygons(rooms)
+    if (part.outdoorPolygons.length > 0) outdoorPolygons = part.outdoorPolygons
+    if (part.interiorPolygons.length > 0) interiorPolygons = part.interiorPolygons
+  }
+
+  const includeSubFloorLayer =
+    mode === 'gravity-slope' ||
+    params.plenumLocation === 'crawlspace' ||
+    params.plenumLocation === 'basement' ||
+    params.from[1] < 0 ||
+    params.to[1] < 0
+
+  let graph = params.graph
+  if (!graph) {
+    const cache = params.cavityContext?.graphCache
+    const cacheKey = `${round2(halfXZ)}|${round2(halfY)}|${params.atticElevationM !== undefined ? round2(params.atticElevationM) : 'auto'}|${params.flatSoffitMarginM !== undefined ? round2(params.flatSoffitMarginM) : 'auto'}|${round2(roofClearanceM)}|${includeSubFloorLayer ? 1 : 0}`
+    graph = cache?.get(cacheKey)
+    if (!graph) {
+      graph = compileLegalCavityGraph(anatomy, levelId, {
+        roofClearanceM,
+        halfY,
+        halfXZ,
+        ...(params.atticElevationM !== undefined ? { atticElevationM: params.atticElevationM } : {}),
+        ...(params.flatSoffitMarginM !== undefined ? { flatSoffitMarginM: params.flatSoffitMarginM } : {}),
+        includeSubFloorLayer,
+        ...(outdoorPolygons ? { outdoorPolygons } : {}),
+        ...(interiorPolygons ? { interiorPolygons } : {}),
+      })
+      cache?.set(cacheKey, graph)
+    }
+  }
+
+  const levelH = graph.levelHeightM
+  let allowedBands: readonly CavityBand[]
+  if (params.allowedBands && params.allowedBands.length > 0) {
+    allowedBands = params.allowedBands
+  } else if (mode === 'gravity-slope') {
+    allowedBands =
+      params.from[1] >= levelH - 0.1
+        ? (['attic', 'overhead-plenum', 'top-plate', 'mid-wall', 'under-sill'] as const)
+        : (['overhead-plenum', 'mid-wall', 'under-sill', 'under-slab', 'crawlspace'] as const)
+  } else if (params.plenumLocation === 'crawlspace' || params.plenumLocation === 'basement') {
+    allowedBands = graph.bandsPresent.has('under-slab') || graph.bandsPresent.has('crawlspace')
+      ? (['under-slab', 'crawlspace'] as const)
+      : (['under-slab', 'crawlspace', 'under-sill', 'mid-wall'] as const)
+  } else if (params.plenumLocation === 'conditioned-soffit') {
+    allowedBands = graph.bandsPresent.has('overhead-plenum')
+      ? (['overhead-plenum'] as const)
+      : (['overhead-plenum', 'top-plate', 'mid-wall'] as const)
+  } else if (graph.atticY !== null) {
+    allowedBands = graph.bandsPresent.has('attic') || graph.bandsPresent.has('overhead-plenum')
+      ? (['attic', 'overhead-plenum'] as const)
+      : (['attic', 'overhead-plenum', 'top-plate', 'mid-wall'] as const)
+  } else {
+    allowedBands = graph.bandsPresent.has('overhead-plenum')
+      ? (['overhead-plenum'] as const)
+      : (['overhead-plenum', 'top-plate', 'mid-wall'] as const)
+  }
+
+  const minSlopeInPerFt =
+    mode === 'gravity-slope'
+      ? Math.max(
+          IMC_RULE_THRESHOLDS.condensateMinSlopePlacementInPerFt,
+          params.minSlopeInPerFt ?? 0.25,
+        )
+      : undefined
+
+  const result = routeInLegalCavities({
+    anatomy,
+    graph,
+    occupancy: effectiveOccupancy,
+    request: {
+      trade: 'hvac',
+      from: params.from,
+      to: params.to,
+      halfXZ,
+      halfY,
+      clearanceM,
+      allowedBands,
+      mode,
+      ...(minSlopeInPerFt !== undefined ? { minSlopeInPerFt } : {}),
+      roofClearanceM,
+      ...(params.preferWallFollowing !== undefined ? { preferWallFollowing: params.preferWallFollowing } : {}),
+      reserveOnCommit: params.reserveOnCommit === true,
+      ...(params.runId !== undefined ? { runId: params.runId } : {}),
+      ...(params.ignoreObstacleNodeIds ? { ignoreObstacleNodeIds: params.ignoreObstacleNodeIds } : {}),
+    },
+  })
+
+  if (params.reserveOnCommit === true && effectiveOccupancy !== baseOccupancy && result.path.length >= 2) {
+    baseOccupancy.reserveRun({
+      runId: params.runId ?? `hvac-cavity-${Date.now()}`,
+      trade: 'hvac',
+      path: result.path,
+      halfXZ,
+      halfY,
+      clearanceM,
+    })
+  }
+
+  return result
+}
+
 /**
  * Route an HVAC duct, exhaust run, or refrigerant lineset in the target plenum plane (`attic` / `crawlspace` / `basement`),
  * automatically detouring around Priority #1 Structural, Priority #2 Plumbing, and NEC 110.26(E) panel columns,
  * while staying within `xzBounds` (when provided) and strictly beneath `roofEnvelope` (when routing in an attic).
+ * When `cavityContext` is supplied, also evaluates Layer 2 legal-cavity routing (`routeHvacViaLegalCavity`)
+ * and prefers it whenever it eliminates structural, plumbing, courtyard, or roof clashes.
  */
 export function routeHvacDuctRun(params: {
   from: Vec3
@@ -1374,6 +1222,10 @@ export function routeHvacDuctRun(params: {
   roofEnvelope?: AtticRoofEnvelope
   footprintContains?: (x: number, z: number) => boolean
   interiorCorridorSpines?: { xs?: ReadonlyArray<number>; zs?: ReadonlyArray<number> }
+  cavityContext?: HvacLegalCavityContext
+  plenumLocation?: 'attic' | 'conditioned-soffit' | 'crawlspace' | 'basement'
+  reserveOnCommit?: boolean
+  runId?: string
 }): {
   path: Vec3[]
   lengthFt: number
@@ -1392,6 +1244,10 @@ export function routeHvacDuctRun(params: {
     roofEnvelope,
     footprintContains,
     interiorCorridorSpines,
+    cavityContext,
+    plenumLocation,
+    reserveOnCommit,
+    runId,
   } = params
 
   const ductHalfH = typeof ductHalfSpanM === 'number' ? ductHalfSpanM : ductHalfSpanM.horizontal
@@ -1749,7 +1605,7 @@ export function routeHvacDuctRun(params: {
   if (!isDone()) {
     // When primary crosses a concave outdoor void (e.g. U-shaped courtyard or L-notch),
     // immediately try the alternative L-bend AND 2-bend / 3-bend interior wing corridor spines first!
-    if (footprintContains && !bestFootprintOk) {
+    if (!isDone() && footprintContains && !bestFootprintOk) {
       const baseY = clampY(plenumY)
       const spineYs = dedupYs([
         plenumY,
@@ -2079,6 +1935,86 @@ export function routeHvacDuctRun(params: {
         }
       }
     }
+
+    // Layer 2 Legal-Space-First Cavity Rescue: invoked when structured high-plenum sweeps still have
+    // structural, plumbing, courtyard, or roof clashes (`INV-MEP-06`, `INV-MEP-07`).
+    if (!isDone() && cavityContext) {
+      const lvlH = cavityContext.anatomy.getLevelHeightM(cavityContext.levelId)
+      const effPlenumLoc: 'attic' | 'conditioned-soffit' | 'crawlspace' | 'basement' =
+        plenumLocation === 'crawlspace' || plenumLocation === 'basement'
+          ? plenumLocation
+          : plenumY < -0.05
+            ? 'crawlspace'
+            : (maxPlenumY !== undefined && maxPlenumY <= lvlH + 0.05) || plenumLocation === 'conditioned-soffit'
+              ? 'conditioned-soffit'
+              : 'attic'
+      const targetCavityY = clampY(plenumY)
+      const flatSoffitMarginM =
+        effPlenumLoc === 'conditioned-soffit' && targetCavityY < lvlH && targetCavityY > 0.5
+          ? Math.max(0.08, Math.ceil((lvlH - targetCavityY) * 1000) / 1000)
+          : maxPlenumY !== undefined && maxPlenumY < lvlH && maxPlenumY > 0.5
+            ? Math.max(0.08, Math.ceil((lvlH - maxPlenumY) * 1000) / 1000)
+            : undefined
+      const atticElevationM =
+        effPlenumLoc === 'attic' && targetCavityY > lvlH + 0.05 ? targetCavityY : undefined
+
+      const cavityRes = routeHvacViaLegalCavity({
+        cavityContext,
+        from,
+        to,
+        mode: 'orthogonal',
+        ductHalfSpanM,
+        clearanceM: 0.02,
+        plenumLocation: effPlenumLoc,
+        atticElevationM,
+        flatSoffitMarginM,
+        roofClearanceM: roofClearMarginM,
+        reserveOnCommit: false,
+        extraObstacles: localObstacles,
+      })
+
+      if (cavityRes.path.length >= 2) {
+        const withinMaxY = (pts: ReadonlyArray<Vec3>): boolean =>
+          maxPlenumY === undefined ||
+          pts.every((p, idx) => idx === 0 || idx === pts.length - 1 || p[1] <= maxPlenumY + 1e-4)
+
+        const rawCavity = cleanPath([...cavityRes.path])
+        if (withinMaxY(rawCavity)) {
+          tryCandidate(rawCavity)
+        }
+        if (!isDone() && hasPitchedRoof) {
+          const stepped = stepUnderRoof(rawCavity, clampY(plenumY))
+          if (withinMaxY(stepped)) tryCandidate(stepped)
+        }
+        if (!isDone() && (xzBounds || maxPlenumY !== undefined)) {
+          const clamped = cleanPath(
+            rawCavity.map((p, idx) => {
+              if (idx === 0 || idx === rawCavity.length - 1) return p
+              const cx = xzBounds ? Math.max(xzBounds.minX, Math.min(xzBounds.maxX, p[0])) : p[0]
+              const cy = maxPlenumY !== undefined ? Math.min(maxPlenumY, p[1]) : p[1]
+              const cz = xzBounds ? Math.max(xzBounds.minZ, Math.min(xzBounds.maxZ, p[2])) : p[2]
+              return [cx, cy, cz] as Vec3
+            }),
+          )
+          tryCandidate(clamped)
+          if (!isDone() && hasPitchedRoof) {
+            const steppedClamped = stepUnderRoof(clamped, clampY(plenumY))
+            if (withinMaxY(steppedClamped)) tryCandidate(steppedClamped)
+          }
+        }
+      }
+    }
+  }
+
+  if (reserveOnCommit === true && cavityContext && bestPath.length >= 2) {
+    cavityContext.occupancy.reserveRun({
+      runId: runId ?? `hvac-duct-${Math.round(from[0] * 100)}_${Math.round(to[0] * 100)}`,
+      trade: 'hvac',
+      path: bestPath,
+      halfXZ: ductHalfH,
+      halfY: ductHalfV,
+      clearanceM: 0.02,
+    })
   }
 
   return {
@@ -2129,6 +2065,9 @@ export function routeCondensateDrain(params: {
   roofEnvelope?: AtticRoofEnvelope
   slopeInPerFt?: number
   footprintContains?: (x: number, z: number) => boolean
+  cavityContext?: HvacLegalCavityContext
+  reserveOnCommit?: boolean
+  runId?: string
 }): {
   path: Vec3[]
   slopeInPerFt: number
@@ -2136,10 +2075,21 @@ export function routeCondensateDrain(params: {
   detoured: boolean
   clashes: HvacObstacle[]
 } {
-  const { from, to, obstacles = [], xzBounds, roofEnvelope, footprintContains } = params
+  const {
+    from,
+    to,
+    obstacles = [],
+    xzBounds,
+    roofEnvelope,
+    footprintContains,
+    cavityContext,
+    reserveOnCommit,
+    runId,
+  } = params
+  const minPlacementSlope = IMC_RULE_THRESHOLDS.condensateMinSlopePlacementInPerFt
   const slopeInPerFt =
     typeof params.slopeInPerFt === 'number' && Number.isFinite(params.slopeInPerFt)
-      ? Math.max(0.13, Math.min(1.0, params.slopeInPerFt))
+      ? Math.max(Math.max(0.13, minPlacementSlope), Math.min(1.0, params.slopeInPerFt))
       : 0.25
   const slopeRatio = slopeInPerFt / 12
   const isAtticStart = from[1] >= 2.2
@@ -2275,6 +2225,55 @@ export function routeCondensateDrain(params: {
     bestRoofOk && bestInBounds && bestFootprintOk && clashes.length <= irreducibleEndpointClashes
 
   if (!isDone()) {
+    // Layer 2 gravity-slope legal-cavity candidate (`mode: 'gravity-slope'`, IMC 307.2.1)
+    if (cavityContext) {
+      const cavityCond = routeHvacViaLegalCavity({
+        cavityContext,
+        from,
+        to,
+        mode: 'gravity-slope',
+        ductHalfSpanM: 0.02,
+        clearanceM: 0.02,
+        minSlopeInPerFt: slopeInPerFt,
+        roofClearanceM: 0.06,
+        reserveOnCommit: false,
+        extraObstacles: localObstacles,
+      })
+      if (cavityCond.path.length >= 2) {
+        const cand = cleanPath([...cavityCond.path])
+        const candInBounds = withinXzBounds(cand)
+        if (!xzBounds || candInBounds) {
+          const candFootprintOk = isFootprintOk(cand)
+          const candRoofOk = isRoofOk(cand)
+          const c = checkClashes(cand)
+          const better =
+            (!bestInBounds && candInBounds) ||
+            (candInBounds === bestInBounds && !bestFootprintOk && candFootprintOk) ||
+            (candInBounds === bestInBounds && candFootprintOk === bestFootprintOk && !bestRoofOk && candRoofOk) ||
+            (candInBounds === bestInBounds &&
+              candFootprintOk === bestFootprintOk &&
+              candRoofOk === bestRoofOk &&
+              c.length < clashes.length)
+          if (better) {
+            const slopeCheck = measureCondensateSlope(cand)
+            if (
+              !slopeCheck.hasUphillSegment &&
+              (slopeCheck.horizontalDistFt < 1.0 || slopeCheck.overallSlopeInPerFt >= minPlacementSlope)
+            ) {
+              best = cand
+              clashes = c
+              bestRoofOk = candRoofOk
+              bestInBounds = candInBounds
+              bestFootprintOk = candFootprintOk
+              detoured = true
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!isDone()) {
     const waypointSets: Array<ReadonlyArray<readonly [number, number]>> = [
       [
         [from[0], to[2]],
@@ -2384,7 +2383,7 @@ export function routeCondensateDrain(params: {
             c.length < clashes.length)
         if (better) {
           const slopeCheck = measureCondensateSlope(cand)
-          if (!slopeCheck.hasUphillSegment && (slopeCheck.horizontalDistFt < 1.0 || slopeCheck.overallSlopeInPerFt >= 0.125)) {
+          if (!slopeCheck.hasUphillSegment && (slopeCheck.horizontalDistFt < 1.0 || slopeCheck.overallSlopeInPerFt >= minPlacementSlope)) {
             best = cand
             clashes = c
             bestRoofOk = candRoofOk
@@ -2397,6 +2396,17 @@ export function routeCondensateDrain(params: {
       }
       if (isDone()) break
     }
+  }
+
+  if (reserveOnCommit === true && cavityContext && best.length >= 2) {
+    cavityContext.occupancy.reserveRun({
+      runId: runId ?? `hvac-condensate-${Math.round(from[0] * 100)}_${Math.round(to[0] * 100)}`,
+      trade: 'hvac',
+      path: best,
+      halfXZ: 0.02,
+      halfY: 0.02,
+      clearanceM: 0.02,
+    })
   }
 
   return {

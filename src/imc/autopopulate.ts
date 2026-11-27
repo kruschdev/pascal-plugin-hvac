@@ -15,6 +15,15 @@
  */
 
 import {
+  type SceneNodeLike as KernelSceneNodeLike,
+  type TaggedOpeningPrism,
+  TradeOccupancyGrid,
+  compileBuildingAnatomy,
+  evaluatePlacementCandidate,
+  extractLevelOpeningPrisms,
+  segmentIntersectsOrientedPrismY,
+} from '@kruschdev/pascal-mep-kernel'
+import {
   type ElectricalPowerDemand,
   type SceneNodeLike,
   type Vec3,
@@ -25,10 +34,13 @@ import {
 import {
   type AtticRoofEnvelope,
   type DuctClashMargin,
+  type HvacLegalCavityContext,
   type HvacObstacle,
   type RoomPolygon2D,
+  type WallSegment2D,
   type XzBounds2D,
   buildAtticRoofEnvelope,
+  createHvacLegalCavityContext,
   detectHvacClashes,
   distancePointToSegment2D,
   extractHvacObstacles,
@@ -46,6 +58,15 @@ import {
   safeRoofCorridorHalfWidth,
   segmentCrossesOutdoorVoid,
 } from './routing'
+import {
+  IECC_ATTIC_DUCT_INSULATION_RULE,
+  IMC_CONDENSER_DOOR_CLEARANCE_RULE,
+  IMC_CONDENSER_SIBLING_CLEARANCE_RULE,
+  IMC_CONDENSER_WINDOW_PLUMBING_CLEARANCE_RULE,
+  IMC_PROHIBITED_RETURN_CATEGORIES,
+  IMC_PROHIBITED_RETURN_ZONES_RULE,
+  IMC_RULE_THRESHOLDS,
+} from './rules'
 import {
   calculateAshrae622Ventilation,
   calculateManualJLoad,
@@ -1143,6 +1164,477 @@ function plannedSpecsToObstacles(
 }
 
 /**
+ * Reserve planned HVAC equipment, plenums, and duct/lineset runs directly on the shared
+ * Layer 2 `TradeOccupancyGrid` so Dual-Wing Zone 2 & ERV legal-cavity routing avoids Zone 1
+ * by construction (`INV-MEP-07`).
+ */
+function reservePlannedSpecsOnOccupancy(
+  occupancy: TradeOccupancyGrid,
+  eqList: ReadonlyArray<PlannedHvacEquipmentSpec>,
+  plList: ReadonlyArray<PlannedHvacPlenumSpec>,
+  ductList: ReadonlyArray<PlannedHvacDuctRunSpec>,
+): void {
+  for (const eq of eqList) {
+    const spec = HVAC_EQUIPMENT_SPECS[eq.equipmentKind]
+    const w = spec?.dimensionsM[0] ?? 0.64
+    const h = eq.heightM ?? spec?.dimensionsM[1] ?? 1.4
+    const d = spec?.dimensionsM[2] ?? 0.64
+    const halfX = (eq.orientation === 'horizontal' ? 1.32 : w) / 2 + 0.04
+    const halfZ = (eq.orientation === 'horizontal' ? 0.56 : d) / 2 + 0.04
+    occupancy.reserveBox({
+      id: `zone_occ_${eq.id}`,
+      nodeId: eq.id,
+      trade: 'hvac',
+      kind: 'hvac-equipment',
+      label: `Existing HVAC Equipment (${eq.name})`,
+      aabb: {
+        minX: eq.position[0] - halfX,
+        maxX: eq.position[0] + halfX,
+        minY: eq.position[1],
+        maxY: eq.position[1] + h,
+        minZ: eq.position[2] - halfZ,
+        maxZ: eq.position[2] + halfZ,
+      },
+    })
+  }
+  for (const pl of plList) {
+    const halfW = Math.max(0.18, (pl.widthIn * INCHES_TO_METERS) / 2)
+    const halfH = Math.max(0.12, (pl.heightM ?? pl.heightIn * INCHES_TO_METERS) / 2)
+    const halfD = Math.max(0.18, (pl.depthIn * INCHES_TO_METERS) / 2)
+    occupancy.reserveBox({
+      id: `zone_occ_${pl.id}`,
+      nodeId: pl.id,
+      trade: 'hvac',
+      kind: 'hvac-plenum',
+      label: `Existing HVAC Plenum (${pl.name})`,
+      aabb: {
+        minX: pl.position[0] - halfW,
+        maxX: pl.position[0] + halfW,
+        minY: pl.position[1] - halfH,
+        maxY: pl.position[1] + halfH,
+        minZ: pl.position[2] - halfD,
+        maxZ: pl.position[2] + halfD,
+      },
+    })
+  }
+  for (const d of ductList) {
+    if (d.path.length < 2) continue
+    const halfXZ =
+      d.shape === 'rectangular'
+        ? Math.max(0.06, (d.width * INCHES_TO_METERS) / 2)
+        : Math.max(0.03, (d.diameter * INCHES_TO_METERS) / 2)
+    const halfY =
+      d.shape === 'rectangular'
+        ? Math.max(0.05, (d.height * INCHES_TO_METERS) / 2)
+        : Math.max(0.03, (d.diameter * INCHES_TO_METERS) / 2)
+    occupancy.reserveRun({
+      runId: d.id,
+      trade: 'hvac',
+      path: d.path,
+      halfXZ,
+      halfY,
+      clearanceM: 0.02,
+      label: `Existing HVAC Duct (${d.name})`,
+    })
+  }
+}
+
+type HeaderSafeExhaustCandidate = {
+  readonly point: Vec3
+  readonly interiorBack: Vec3
+  readonly dist: number
+  readonly interiorPathClear: boolean
+  readonly headerHits: number
+  readonly openingHits: number
+  readonly totalObsHits: number
+  readonly dropped: boolean
+}
+
+function countPathOpeningHits(
+  path: ReadonlyArray<Vec3>,
+  openingPrisms: readonly TaggedOpeningPrism[],
+  pad: Vec3,
+): number {
+  if (openingPrisms.length === 0 || path.length < 2) return 0
+  let hits = 0
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1]!
+    const b = path[i]!
+    for (let j = 0; j < openingPrisms.length; j++) {
+      if (segmentIntersectsOrientedPrismY(a, b, openingPrisms[j]!, pad)) {
+        hits += 1
+        break
+      }
+    }
+  }
+  return hits
+}
+
+/**
+ * Build header-safe and opening-safe exterior wall cap termination candidates for kitchen range
+ * hoods (`IMC 505.4`) and bath exhaust fans (`IMC 403.3 / 501.3`).
+ *
+ * Explicitly checks each candidate wall penetration against structural header beams
+ * (`category === 'structural'` with `box.minY >= 1.8`) AND 3D window/door opening prisms
+ * (`extractLevelOpeningPrisms`), generating lateral-past-header shifts AND drop-under-header
+ * elevations (`header.box.minY - ductHalfV - 0.04`, clamped `>= 2.05m`) so exhaust ducts never
+ * penetrate LVL window headers on 1st floors beneath 2nd stories (`hasRoofAbove === false`).
+ */
+function buildHeaderSafeExteriorExhaustTargets(params: {
+  origin: readonly [number, number]
+  desiredExitY: number
+  ductHalfSpan: number
+  walls: ReadonlyArray<WallSegment2D>
+  rawRooms: ReadonlyArray<RoomPolygon2D>
+  obstacles: ReadonlyArray<HvacObstacle>
+  openingPrisms: readonly TaggedOpeningPrism[]
+  bounds: { minX: number; maxX: number; minZ: number; maxZ: number }
+  indoorBounds: XzBounds2D
+  wallMinX: number
+  wallMaxX: number
+  wallMinZ: number
+  wallMaxZ: number
+  clampExteriorExitY: (wx: number, wz: number, desiredY: number, halfSpan: number) => number
+  footprintContains?: (x: number, z: number) => boolean
+}): HeaderSafeExhaustCandidate[] {
+  const {
+    origin,
+    desiredExitY,
+    ductHalfSpan,
+    walls,
+    rawRooms,
+    obstacles,
+    openingPrisms,
+    bounds,
+    indoorBounds,
+    wallMinX,
+    wallMaxX,
+    wallMinZ,
+    wallMaxZ,
+    clampExteriorExitY,
+    footprintContains,
+  } = params
+
+  const structuralHeaders = obstacles.filter((o) => o.category === 'structural' && o.box.minY >= 1.8)
+  const wallById = new Map<string, WallSegment2D>()
+  for (const w of walls) wallById.set(w.id, w)
+  const openingPad: Vec3 = [ductHalfSpan + 0.04, ductHalfSpan + 0.04, ductHalfSpan + 0.04]
+  const candidates: HeaderSafeExhaustCandidate[] = []
+
+  const addCandidate = (
+    px: number,
+    y: number,
+    pz: number,
+    bx: number,
+    bz: number,
+    interiorPathClear: boolean,
+    dropped: boolean,
+  ): void => {
+    const pt: Vec3 = [round2(px), round2(y), round2(pz)]
+    if (
+      candidates.some(
+        (c) =>
+          Math.abs(c.point[0] - pt[0]) < 0.05 &&
+          Math.abs(c.point[1] - pt[1]) < 0.05 &&
+          Math.abs(c.point[2] - pt[2]) < 0.05,
+      )
+    ) {
+      return
+    }
+    const back: Vec3 = [
+      clampToSpan(bx, indoorBounds.minX, indoorBounds.maxX),
+      round2(y),
+      clampToSpan(bz, indoorBounds.minZ, indoorBounds.maxZ),
+    ]
+    const seg: readonly Vec3[] = [back, pt]
+    const headerHits = detectHvacClashes(seg, structuralHeaders, ductHalfSpan).length
+    const openingHits = countPathOpeningHits(seg, openingPrisms, openingPad)
+    const totalObsHits = detectHvacClashes(seg, obstacles, ductHalfSpan).length
+    candidates.push({
+      point: pt,
+      interiorBack: back,
+      dist: Math.hypot(pt[0] - origin[0], pt[2] - origin[1]),
+      interiorPathClear,
+      headerHits,
+      openingHits,
+      totalObsHits,
+      dropped,
+    })
+  }
+
+  if (walls.length > 0) {
+    const wallSnaps = findNearestExteriorWallPoints({
+      origin,
+      walls,
+      rooms: rawRooms,
+      outwardOffsetM: 0.1,
+      cornerInsetM: 0.35,
+      extraOffsetsM: [0.85, -0.85, 1.7, -1.7, 2.6, -2.6, 3.6, -3.6],
+    })
+
+    for (const snap of wallSnaps) {
+      const baseY = clampExteriorExitY(snap.point[0], snap.point[1], desiredExitY, ductHalfSpan)
+      addCandidate(
+        snap.point[0],
+        baseY,
+        snap.point[1],
+        snap.interiorBack[0],
+        snap.interiorBack[1],
+        snap.interiorPathClear,
+        false,
+      )
+
+      const backPt: Vec3 = [
+        clampToSpan(snap.interiorBack[0], indoorBounds.minX, indoorBounds.maxX),
+        baseY,
+        clampToSpan(snap.interiorBack[1], indoorBounds.minZ, indoorBounds.maxZ),
+      ]
+      const exitPt: Vec3 = [snap.point[0], baseY, snap.point[1]]
+      const hitHeaders = detectHvacClashes([backPt, exitPt], structuralHeaders, ductHalfSpan)
+      const hitOpenings = openingPrisms.filter((op) =>
+        segmentIntersectsOrientedPrismY(backPt, exitPt, op, openingPad),
+      )
+
+      // Option A: Drop strictly underneath the blocking LVL/structural header (clamped >= 2.05m),
+      // automatically checked against opening prisms so we never drop into window glazing.
+      if (hitHeaders.length > 0) {
+        const lowestHeaderMinY = Math.min(...hitHeaders.map((h) => h.box.minY))
+        const droppedY = Math.floor((lowestHeaderMinY - ductHalfSpan - 0.04) * 100) / 100
+        if (droppedY >= 2.05) {
+          addCandidate(
+            snap.point[0],
+            droppedY,
+            snap.point[1],
+            snap.interiorBack[0],
+            snap.interiorBack[1],
+            snap.interiorPathClear,
+            true,
+          )
+        }
+      }
+
+      // Option B: Shift laterally along the same exterior wall cleanly past blocking headers/openings.
+      const hostWall = wallById.get(snap.wallId)
+      if (hostWall && (hitHeaders.length > 0 || hitOpenings.length > 0)) {
+        const inset = Math.min(0.35, hostWall.lengthM * 0.25)
+        const backOffset = hostWall.thicknessM / 2 + 0.14
+        const [outNx, outNz] = snap.outwardNormal
+        const lateralPad = ductHalfSpan + 0.16
+
+        const tryWallU = (u: number): void => {
+          if (u < inset || u > hostWall.lengthM - inset) return
+          const cx = hostWall.start[0] + hostWall.ux * u
+          const cz = hostWall.start[1] + hostWall.uz * u
+          const px = round2(cx + outNx * 0.1)
+          const pz = round2(cz + outNz * 0.1)
+          const bx = round2(cx - outNx * backOffset)
+          const bz = round2(cz - outNz * backOffset)
+          const ey = clampExteriorExitY(px, pz, desiredExitY, ductHalfSpan)
+          const pathClear =
+            !footprintContains ||
+            !segmentCrossesOutdoorVoid([origin[0], 0, origin[1]], [bx, 0, bz], footprintContains, 0.5)
+          addCandidate(px, ey, pz, bx, bz, pathClear, false)
+        }
+
+        for (const h of hitHeaders) {
+          const corners: readonly (readonly [number, number])[] = [
+            [h.box.minX, h.box.minZ],
+            [h.box.maxX, h.box.minZ],
+            [h.box.maxX, h.box.maxZ],
+            [h.box.minX, h.box.maxZ],
+          ]
+          let uMin = Infinity
+          let uMax = -Infinity
+          for (const [cx, cz] of corners) {
+            const u = (cx - hostWall.start[0]) * hostWall.ux + (cz - hostWall.start[1]) * hostWall.uz
+            if (u < uMin) uMin = u
+            if (u > uMax) uMax = u
+          }
+          if (Number.isFinite(uMin) && Number.isFinite(uMax)) {
+            tryWallU(uMin - lateralPad)
+            tryWallU(uMax + lateralPad)
+          }
+        }
+
+        for (const op of hitOpenings) {
+          const localCorners: readonly (readonly [number, number])[] = [
+            [op.lxMin, op.lzMin],
+            [op.lxMax, op.lzMin],
+            [op.lxMax, op.lzMax],
+            [op.lxMin, op.lzMax],
+          ]
+          let uMin = Infinity
+          let uMax = -Infinity
+          for (const [lx, lz] of localCorners) {
+            const wx = op.centerX + lx * op.cos - lz * op.sin
+            const wz = op.centerZ + lx * op.sin + lz * op.cos
+            const u = (wx - hostWall.start[0]) * hostWall.ux + (wz - hostWall.start[1]) * hostWall.uz
+            if (u < uMin) uMin = u
+            if (u > uMax) uMax = u
+          }
+          if (Number.isFinite(uMin) && Number.isFinite(uMax)) {
+            tryWallU(uMin - lateralPad)
+            tryWallU(uMax + lateralPad)
+          }
+        }
+      }
+    }
+  }
+
+  if (candidates.length === 0) {
+    const cx = clampToSpan(origin[0], wallMinX, wallMaxX)
+    const cz = clampToSpan(origin[1], wallMinZ, wallMaxZ)
+    const fallbacks: ReadonlyArray<readonly [number, number, number, number]> = [
+      [cx, round2(bounds.minZ - 0.1), cx, round2(bounds.minZ + 0.18)],
+      [cx, round2(bounds.maxZ + 0.1), cx, round2(bounds.maxZ - 0.18)],
+      [round2(bounds.minX - 0.1), cz, round2(bounds.minX + 0.18), cz],
+      [round2(bounds.maxX + 0.1), cz, round2(bounds.maxX - 0.18), cz],
+    ]
+    for (const [px, pz, bx, bz] of fallbacks) {
+      const ey = clampExteriorExitY(px, pz, desiredExitY, ductHalfSpan)
+      addCandidate(px, ey, pz, bx, bz, true, false)
+      const hitHeaders = detectHvacClashes([[bx, ey, bz], [px, ey, pz]], structuralHeaders, ductHalfSpan)
+      if (hitHeaders.length > 0) {
+        const lowestHeaderMinY = Math.min(...hitHeaders.map((h) => h.box.minY))
+        const droppedY = Math.floor((lowestHeaderMinY - ductHalfSpan - 0.04) * 100) / 100
+        if (droppedY >= 2.05) {
+          addCandidate(px, droppedY, pz, bx, bz, true, true)
+        }
+      }
+    }
+  }
+
+  const tierOf = (c: HeaderSafeExhaustCandidate): number => {
+    if (c.headerHits === 0 && c.openingHits === 0 && c.totalObsHits === 0) return 0
+    if (c.headerHits === 0 && c.openingHits === 0) return 1
+    if (c.headerHits === 0) return 2
+    return 3
+  }
+
+  candidates.sort((a, b) => {
+    const ta = tierOf(a)
+    const tb = tierOf(b)
+    if (ta !== tb) return ta - tb
+    if (a.interiorPathClear !== b.interiorPathClear) return a.interiorPathClear ? -1 : 1
+    const effDistA = a.dist + (a.dropped ? 0.35 : 0)
+    const effDistB = b.dist + (b.dropped ? 0.35 : 0)
+    return effDistA - effDistB
+  })
+
+  return candidates
+}
+
+function routeHeaderSafeExhaustRun(params: {
+  from: Vec3
+  targets: ReadonlyArray<HeaderSafeExhaustCandidate>
+  plenumY: number
+  maxPlenumY?: number
+  ductHalfSpan: number
+  obstacles: ReadonlyArray<HvacObstacle>
+  openingPrisms: readonly TaggedOpeningPrism[]
+  indoorBounds: XzBounds2D
+  roofEnvelope?: AtticRoofEnvelope
+  footprintContains?: (x: number, z: number) => boolean
+  interiorCorridorSpines?: { xs?: ReadonlyArray<number>; zs?: ReadonlyArray<number> }
+  cavityContext?: HvacLegalCavityContext
+  plenumLocation?: 'attic' | 'conditioned-soffit' | 'crawlspace' | 'basement'
+}): { path: Vec3[]; clashes: HvacObstacle[]; openingHits: number } {
+  const {
+    from,
+    targets,
+    plenumY,
+    maxPlenumY,
+    ductHalfSpan,
+    obstacles,
+    openingPrisms,
+    indoorBounds,
+    roofEnvelope,
+    footprintContains,
+    interiorCorridorSpines,
+    cavityContext,
+    plenumLocation,
+  } = params
+  const openingPad: Vec3 = [ductHalfSpan + 0.04, ductHalfSpan + 0.04, ductHalfSpan + 0.04]
+
+  const evalCandidate = (cand: HeaderSafeExhaustCandidate) => {
+    const effPlenumY = cand.dropped ? Math.min(plenumY, cand.point[1]) : plenumY
+    const effMaxY =
+      cand.dropped
+        ? maxPlenumY !== undefined
+          ? Math.min(maxPlenumY, cand.point[1])
+          : cand.point[1]
+        : maxPlenumY
+
+    // Approach perpendicular to the exterior wall via `interiorBack -> point` so the duct
+    // never clips an adjacent LVL header or window opening diagonally.
+    const inner = routeHvacDuctRun({
+      from,
+      to: cand.interiorBack,
+      plenumY: effPlenumY,
+      maxPlenumY: effMaxY,
+      ductHalfSpanM: ductHalfSpan,
+      allowDiagonalBranch: false,
+      obstacles,
+      xzBounds: indoorBounds,
+      roofEnvelope,
+      footprintContains,
+      interiorCorridorSpines,
+      cavityContext,
+      plenumLocation,
+    })
+    const stubPath: Vec3[] = [...inner.path]
+    const last = stubPath[stubPath.length - 1]
+    if (!last || Math.hypot(cand.point[0] - last[0], cand.point[1] - last[1], cand.point[2] - last[2]) > 0.01) {
+      stubPath.push(cand.point)
+    }
+    let bestLocal = {
+      path: stubPath,
+      clashes: detectHvacClashes(stubPath, obstacles, ductHalfSpan),
+      openingHits: countPathOpeningHits(stubPath, openingPrisms, openingPad),
+    }
+
+    if (bestLocal.clashes.length > 0 || bestLocal.openingHits > 0) {
+      const direct = routeHvacDuctRun({
+        from,
+        to: cand.point,
+        plenumY: effPlenumY,
+        maxPlenumY: effMaxY,
+        ductHalfSpanM: ductHalfSpan,
+        allowDiagonalBranch: false,
+        obstacles,
+        roofEnvelope,
+        footprintContains,
+        interiorCorridorSpines,
+        cavityContext,
+        plenumLocation,
+      })
+      const directOpeningHits = countPathOpeningHits(direct.path, openingPrisms, openingPad)
+      if (
+        direct.clashes.length < bestLocal.clashes.length ||
+        (direct.clashes.length === bestLocal.clashes.length && directOpeningHits < bestLocal.openingHits)
+      ) {
+        bestLocal = { path: direct.path, clashes: direct.clashes, openingHits: directOpeningHits }
+      }
+    }
+    return bestLocal
+  }
+
+  let best = evalCandidate(targets[0]!)
+  const maxChecks = Math.min(targets.length, 14)
+  for (let i = 1; i < maxChecks; i++) {
+    if (best.clashes.length === 0 && best.openingHits === 0) break
+    const cand = evalCandidate(targets[i]!)
+    if (
+      cand.clashes.length < best.clashes.length ||
+      (cand.clashes.length === best.clashes.length && cand.openingHits < best.openingHits)
+    ) {
+      best = cand
+    }
+  }
+  return best
+}
+
+/**
  * Generate a complete IMC / ACCA Manual J-D-S HVAC layout plan from live Pascal geometry.
  */
 export function planHvacAutoPopulate(
@@ -1169,6 +1661,17 @@ export function planHvacAutoPopulate(
   const rawRooms = extractRoomPolygons(nodes, levelId)
   const levelH = resolveLevelHeightM(nodes, levelId)
   const obstacles = extractHvacObstacles(nodes, levelId)
+  const anatomy = compileBuildingAnatomy(nodes as Readonly<Record<string, KernelSceneNodeLike>>)
+  const levelOpeningPrisms = extractLevelOpeningPrisms(anatomy.getWalls(levelId))
+  const levelOccupancy = anatomy.createOccupancyGrid(levelId, {
+    forTrade: 'hvac',
+    includeElectricalWorkingSpace: true,
+  })
+  const cavityContext = createHvacLegalCavityContext(nodes, levelId, {
+    anatomy,
+    occupancy: levelOccupancy,
+    rooms: rawRooms,
+  })
   const framingCtx = extractHvacFramingContext(nodes, levelId)
   const ceilingJoistClearM = framingCtx.framingPresent
     ? round2(Math.max(0.18, Math.min(0.42, framingCtx.joistDepthIn * INCHES_TO_METERS)))
@@ -1381,7 +1884,9 @@ export function planHvacAutoPopulate(
   if (isUpperStory && lowerLevels.groundLevelId) outdoorOpeningLevels.add(lowerLevels.groundLevelId)
   const exteriorDoorPoints = extractWallOpeningPoints('door', outdoorOpeningLevels)
   const exteriorWindowPoints = extractWallOpeningPoints('window', outdoorOpeningLevels)
-  const MIN_DOOR_CLEARANCE_M = 2.4
+  const MIN_DOOR_CLEARANCE_M = IMC_RULE_THRESHOLDS.condenserDoorClearanceM
+  const MIN_WIN_PLUMB_CLEARANCE_M = IMC_RULE_THRESHOLDS.condenserWindowPlumbingClearanceM
+  const MIN_SIBLING_CONDENSER_M = IMC_RULE_THRESHOLDS.condenserSiblingClearanceM
   const minDistToDoors = (cx: number, cz: number): number => {
     let best = Infinity
     for (const d of exteriorDoorPoints) {
@@ -1405,12 +1910,22 @@ export function planHvacAutoPopulate(
     return best
   }
 
-  const prohibitedReturnCats = new Set(['bathroom', 'garage', 'kitchen', 'utility', 'closet', 'exterior', 'attic'])
+  const prohibitedReturnCats = IMC_PROHIBITED_RETURN_CATEGORIES
   const prohibitedReturnRooms = rooms.filter((r) => prohibitedReturnCats.has(r.category) && r.category !== 'attic')
   const prohibitedReturnPolygons = prohibitedReturnRooms.map((r) => r.polygon)
 
+  // Single-source IECC R403.3.1 conservative placement check (`levelH + 0.05 - 0.07 = levelH - 0.02`, INV-MEP-08)
   const effectiveDuctR = (path: ReadonlyArray<Vec3>): number =>
-    path.some((p) => p[1] > levelH - 0.02) ? Math.max(ductR, zoneMeta.ieccAtticDuctR) : ductR
+    path.some(
+      (p) =>
+        !evaluatePlacementCandidate(
+          [IECC_ATTIC_DUCT_INSULATION_RULE],
+          { kind: 'supply-trunk', pos: p, ceilingHeightM: levelH },
+          'placement',
+        ).legal,
+    )
+      ? Math.max(ductR, zoneMeta.ieccAtticDuctR)
+      : ductR
 
   // Evaluate Dual-Wing / >5-Ton residential multi-system zoning (split systems & multi-zone mini-splits)
   const dualPartition = shouldSplitIntoDualWingSystems({
@@ -1963,10 +2478,71 @@ export function planHvacAutoPopulate(
           : round2(Math.PI / 2)
       : 0
 
-    // Place outdoor condenser on an exterior wall outside the building footprint, maintaining >= 1.2m
-    // ignition-source clearance from fuel-gas equipment and >= 1.5m from any sibling zone condenser.
-    const isClearOfPlacedCondensers = (cx: number, cz: number): boolean =>
-      placedOutdoorPositions.every(([ox, oz]) => Math.hypot(cx - ox, cz - oz) >= 1.5)
+    // Place outdoor condenser on an exterior wall outside the building footprint, maintaining
+    // declarative IMC 304 / M1403 clearances (>= 2.4m from entry doors, >= 1.2m from windows &
+    // fuel-gas/plumbing equipment, >= 1.5m from sibling zone condensers).
+    const minDistToPlacedCondensers = (cx: number, cz: number): number => {
+      let best = Infinity
+      for (const [ox, oz] of placedOutdoorPositions) {
+        const dist = Math.hypot(cx - ox, cz - oz)
+        if (dist < best) best = dist
+      }
+      return best
+    }
+    const evaluateCondenserClearance = (
+      cx: number,
+      cz: number,
+      plumbingDistM: number,
+    ): { doorClear: boolean; plumbClear: boolean; sibClear: boolean; winClear: boolean } => {
+      const doorDist = minDistToDoors(cx, cz)
+      const winDist = minDistToWindows(cx, cz)
+      const sibDist = minDistToPlacedCondensers(cx, cz)
+      const doorClear = evaluatePlacementCandidate(
+        [IMC_CONDENSER_DOOR_CLEARANCE_RULE],
+        {
+          kind: 'outdoor-condenser',
+          role: 'outdoor-condenser',
+          pos: [cx, gradeY, cz],
+          nearFixtures: Number.isFinite(doorDist) ? [{ kind: 'door', horizontalDistM: doorDist }] : [],
+        },
+        'placement',
+      ).legal
+      const plumbClear = evaluatePlacementCandidate(
+        [IMC_CONDENSER_WINDOW_PLUMBING_CLEARANCE_RULE],
+        {
+          kind: 'outdoor-condenser',
+          role: 'outdoor-condenser',
+          pos: [cx, gradeY, cz],
+          nearFixtures: Number.isFinite(plumbingDistM)
+            ? [{ kind: 'plumbing', horizontalDistM: plumbingDistM }]
+            : [],
+        },
+        'placement',
+      ).legal
+      const winClear = evaluatePlacementCandidate(
+        [IMC_CONDENSER_WINDOW_PLUMBING_CLEARANCE_RULE],
+        {
+          kind: 'outdoor-condenser',
+          role: 'outdoor-condenser',
+          pos: [cx, gradeY, cz],
+          nearFixtures: Number.isFinite(winDist) ? [{ kind: 'window', horizontalDistM: winDist }] : [],
+        },
+        'placement',
+      ).legal
+      const sibClear = evaluatePlacementCandidate(
+        [IMC_CONDENSER_SIBLING_CLEARANCE_RULE],
+        {
+          kind: 'outdoor-condenser',
+          role: 'outdoor-condenser',
+          pos: [cx, gradeY, cz],
+          nearFixtures: Number.isFinite(sibDist)
+            ? [{ kind: 'sibling-condenser', horizontalDistM: sibDist }]
+            : [],
+        },
+        'placement',
+      ).legal
+      return { doorClear, plumbClear, sibClear, winClear }
+    }
 
     let outdoorSide: OutdoorSide
     let outdoorX: number
@@ -1998,15 +2574,16 @@ export function planHvacAutoPopulate(
           return Math.abs(oc - wallCoord) <= 1.5
         })
         const isClear = (v: number): boolean => {
-          const okPlumb = relevant.every((o) => {
+          let minPlumbDist = Infinity
+          for (const o of relevant) {
             const ov = axis === 'z' ? (o.box.minZ + o.box.maxZ) / 2 : (o.box.minX + o.box.maxX) / 2
-            return Math.abs(v - ov) >= 1.2
-          })
+            const d = Math.abs(v - ov)
+            if (d < minPlumbDist) minPlumbDist = d
+          }
           const cx = axis === 'z' ? fixedCoord : v
           const cz = axis === 'z' ? v : fixedCoord
-          const okSib = isClearOfPlacedCondensers(cx, cz)
-          const okDoor = minDistToDoors(cx, cz) >= MIN_DOOR_CLEARANCE_M
-          return okPlumb && okSib && okDoor
+          const clr = evaluateCondenserClearance(cx, cz, minPlumbDist)
+          return clr.plumbClear && clr.sibClear && clr.doorClear
         }
         const primary = clampToSpan(baseCoord, safeLo, safeHi)
         if (isClear(primary)) return primary
@@ -2032,7 +2609,7 @@ export function planHvacAutoPopulate(
           const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
           const prefBonus = zone.preferredOutdoorSide === 'west' ? 45 : 0
           const doorBonus = minDistToDoors(x, z) >= MIN_DOOR_CLEARANCE_M ? 180 : -350
-          const winPenalty = minDistToWindows(x, z) < 1.2 ? -12 : 0
+          const winPenalty = minDistToWindows(x, z) < MIN_WIN_PLUMB_CLEARANCE_M ? -12 : 0
           return {
             side: 'west' as const,
             x,
@@ -2049,7 +2626,7 @@ export function planHvacAutoPopulate(
           const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
           const prefBonus = zone.preferredOutdoorSide === 'east' ? 45 : 0
           const doorBonus = minDistToDoors(x, z) >= MIN_DOOR_CLEARANCE_M ? 180 : -350
-          const winPenalty = minDistToWindows(x, z) < 1.2 ? -12 : 0
+          const winPenalty = minDistToWindows(x, z) < MIN_WIN_PLUMB_CLEARANCE_M ? -12 : 0
           return {
             side: 'east' as const,
             x,
@@ -2066,7 +2643,7 @@ export function planHvacAutoPopulate(
           const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
           const prefBonus = zone.preferredOutdoorSide === 'north' ? 45 : 0
           const doorBonus = minDistToDoors(x, z) >= MIN_DOOR_CLEARANCE_M ? 180 : -350
-          const winPenalty = minDistToWindows(x, z) < 1.2 ? -12 : 0
+          const winPenalty = minDistToWindows(x, z) < MIN_WIN_PLUMB_CLEARANCE_M ? -12 : 0
           return {
             side: 'north' as const,
             x,
@@ -2083,7 +2660,7 @@ export function planHvacAutoPopulate(
           const dist = Math.hypot(x - indoorPos[0], z - indoorPos[2])
           const prefBonus = zone.preferredOutdoorSide === 'south' ? 45 : 0
           const doorBonus = minDistToDoors(x, z) >= MIN_DOOR_CLEARANCE_M ? 180 : -350
-          const winPenalty = minDistToWindows(x, z) < 1.2 ? -12 : 0
+          const winPenalty = minDistToWindows(x, z) < MIN_WIN_PLUMB_CLEARANCE_M ? -12 : 0
           return {
             side: 'south' as const,
             x,
@@ -2118,14 +2695,14 @@ export function planHvacAutoPopulate(
         const evalCand = (v: number) => {
           const cx = axis === 'z' ? fixedCoord : v
           const cz = axis === 'z' ? v : fixedCoord
-          const plumbClear = extWallObstacles.every((o) => {
+          let minPlumbDist = Infinity
+          for (const o of extWallObstacles) {
             const ov = axis === 'z' ? (o.box.minZ + o.box.maxZ) / 2 : (o.box.minX + o.box.maxX) / 2
-            return Math.abs(v - ov) >= 1.2
-          })
-          const sibClear = isClearOfPlacedCondensers(cx, cz)
-          const doorClear = minDistToDoors(cx, cz) >= MIN_DOOR_CLEARANCE_M
+            const d = Math.abs(v - ov)
+            if (d < minPlumbDist) minPlumbDist = d
+          }
+          const { doorClear, plumbClear, sibClear, winClear } = evaluateCondenserClearance(cx, cz, minPlumbDist)
           const fpClear = !footprintContains || !footprintContains(cx, cz)
-          const winClear = minDistToWindows(cx, cz) >= 1.2
           const shiftPenalty = Math.abs(v - baseCoord) * 1.5
           const score =
             (fpClear ? 200 : -600) +
@@ -2185,7 +2762,7 @@ export function planHvacAutoPopulate(
             (picked.sibClear ? 140 : -240) +
             (picked.plumbClear ? 80 : -120) +
             (facadeHasDoor ? -35 : 0) +
-            (minDistToWindows(x, z) < 1.2 ? -15 : 0) +
+            (minDistToWindows(x, z) < MIN_WIN_PLUMB_CLEARANCE_M ? -15 : 0) +
             prefBonus +
             sideWallBonus +
             wingEdgeBonus -
@@ -2212,7 +2789,7 @@ export function planHvacAutoPopulate(
           (picked.sibClear ? 140 : -240) +
           (picked.plumbClear ? 80 : -120) +
           (facadeHasDoor ? -35 : 0) +
-          (minDistToWindows(x, z) < 1.2 ? -15 : 0) +
+          (minDistToWindows(x, z) < MIN_WIN_PLUMB_CLEARANCE_M ? -15 : 0) +
           prefBonus +
           wingEdgeBonus -
           dist * 3
@@ -2321,6 +2898,8 @@ export function planHvacAutoPopulate(
           roofEnvelope: atticRoof,
           footprintContains,
           interiorCorridorSpines: zSpines,
+          cavityContext,
+          plenumLocation,
         })
         const path = dedupPathPts([...innerRoute.path, exitPt, dropBottomPt, gradeCornerPt, linesetCondStubPt])
         const clashes = detectHvacClashes(path, obstacles, 0.03)
@@ -2557,6 +3136,7 @@ export function planHvacAutoPopulate(
         to: condExitTargets[0]!,
         obstacles: zObstacles,
         roofEnvelope: atticRoof,
+        cavityContext,
       })
       if (condRoute.clashes.length > 0) {
         outerCond: for (let cfi = 0; cfi < condFaces.length; cfi++) {
@@ -2567,6 +3147,7 @@ export function planHvacAutoPopulate(
               to: condExitTargets[cti]!,
               obstacles: zObstacles,
               roofEnvelope: atticRoof,
+              cavityContext,
             })
             if (cand.clashes.length < condRoute.clashes.length) {
               condRoute = cand
@@ -2722,6 +3303,7 @@ export function planHvacAutoPopulate(
         xzBounds: zIndoorBounds,
         slopeInPerFt: rtuCondSlopeInPerFt,
         footprintContains,
+        cavityContext,
       })
       if (rtuCondRoute.clashes.length > 0) {
         for (let ti = 1; ti < rtuCondTargetList.length; ti++) {
@@ -2732,6 +3314,7 @@ export function planHvacAutoPopulate(
             xzBounds: zIndoorBounds,
             slopeInPerFt: rtuCondSlopeInPerFt,
             footprintContains,
+            cavityContext,
           })
           if (cand.clashes.length < rtuCondRoute.clashes.length) {
             rtuCondRoute = cand
@@ -2907,6 +3490,7 @@ export function planHvacAutoPopulate(
           obstacles: zObstacles,
           roofEnvelope: atticRoof,
           footprintContains,
+          cavityContext,
         })
         for (let mi = 1; mi < mhTargets.length && bestMhCond.clashes.length > 0; mi++) {
           const cand = routeCondensateDrain({
@@ -2915,6 +3499,7 @@ export function planHvacAutoPopulate(
             obstacles: zObstacles,
             roofEnvelope: atticRoof,
             footprintContains,
+            cavityContext,
           })
           if (cand.clashes.length < bestMhCond.clashes.length) {
             bestMhCond = cand
@@ -3156,6 +3741,8 @@ export function planHvacAutoPopulate(
         roofEnvelope: atticRoof,
         footprintContains,
         interiorCorridorSpines: zSpines,
+        cavityContext,
+        plenumLocation,
       })
       if (trunkRoute.clashes.length > 0 && plenumLocation === 'attic') {
         for (const [dy, dx, dz] of [
@@ -3185,6 +3772,8 @@ export function planHvacAutoPopulate(
             roofEnvelope: atticRoof,
             footprintContains,
             interiorCorridorSpines: zSpines,
+            cavityContext,
+            plenumLocation,
           })
           if (cand.clashes.length < trunkRoute.clashes.length) {
             trunkRoute = cand
@@ -3282,6 +3871,8 @@ export function planHvacAutoPopulate(
             roofEnvelope: atticRoof,
             footprintContains,
             interiorCorridorSpines: zSpines,
+            cavityContext,
+            plenumLocation,
           })
           ductRuns.push({
             id: nextDuctId(),
@@ -3325,7 +3916,18 @@ export function planHvacAutoPopulate(
 
       // Central Return Grille + Return Trunk back to Return Plenum (IMC 601 / IMC 601.5 / IRC M1602.2)
       const eligibleReturnRooms = zRooms
-        .filter((r) => !prohibitedReturnCats.has(r.category))
+        .filter((r) =>
+          evaluatePlacementCandidate(
+            [IMC_PROHIBITED_RETURN_ZONES_RULE],
+            {
+              kind: 'return-grille',
+              pos: [r.centroid[0], Math.min(levelH - 0.04, 2.2), r.centroid[1]],
+              roomCategory: r.category,
+              ceilingHeightM: levelH,
+            },
+            'placement',
+          ).legal,
+        )
         .sort((a, b) => {
           const rank = (r: (typeof zRooms)[number]) => (r.category === 'hallway' ? 3 : r.category === 'living' ? 2 : 1)
           return rank(b) - rank(a)
@@ -3472,6 +4074,8 @@ export function planHvacAutoPopulate(
           roofEnvelope: atticRoof,
           footprintContains,
           interiorCorridorSpines: zSpines,
+          cavityContext,
+          plenumLocation,
         })
         const better =
           !chosenRetRoute ||
@@ -3571,15 +4175,14 @@ export function planHvacAutoPopulate(
       }
     }
 
-    // Feed this zone's generated equipment, plenums, and ducts into obstacles so the sibling wing & ERV never collide
+    // Feed this zone's generated equipment, plenums, and ducts into obstacles AND Layer 2
+    // TradeOccupancyGrid reservations so the sibling wing & ERV never collide (`INV-MEP-07`)
     if (zonePlans.length > 1 || includeErv) {
-      priorZoneObstacles.push(
-        ...plannedSpecsToObstacles(
-          equipment.slice(eqStartIdx),
-          plenums.slice(plStartIdx),
-          ductRuns.slice(ductStartIdx),
-        ),
-      )
+      const zoneEq = equipment.slice(eqStartIdx)
+      const zonePl = plenums.slice(plStartIdx)
+      const zoneDucts = ductRuns.slice(ductStartIdx)
+      priorZoneObstacles.push(...plannedSpecsToObstacles(zoneEq, zonePl, zoneDucts))
+      reservePlannedSpecsOnOccupancy(levelOccupancy, zoneEq, zonePl, zoneDucts)
     }
   }
 
@@ -3896,6 +4499,8 @@ export function planHvacAutoPopulate(
         roofEnvelope: atticRoof,
         footprintContains,
         interiorCorridorSpines,
+        cavityContext,
+        plenumLocation,
       })
       const fullPath: Vec3[] = [cand.intakePos]
       for (const p of inner.path) {
@@ -4005,75 +4610,43 @@ export function planHvacAutoPopulate(
           heightM: 0.18,
           electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'bath-exhaust-fan', occupancy }),
         })
-        const cFanX = clampToSpan(fanX, wallMinX, wallMaxX)
-        const cFanZ = clampToSpan(fanZ, wallMinZ, wallMaxZ)
-        const rawBathTargets: Vec3[] = []
-        if (walls.length > 0) {
-          const bathWallSnaps = findNearestExteriorWallPoints({
-            origin: [fanX, fanZ],
-            walls,
-            rooms: rawRooms,
-            outwardOffsetM: 0.1,
-            cornerInsetM: 0.35,
-            extraOffsetsM: [],
-          })
-          for (const snap of bathWallSnaps.slice(0, 4)) {
-            rawBathTargets.push([
-              snap.point[0],
-              clampExteriorExitY(snap.point[0], snap.point[1], exPlenumY, exHalfSpan),
-              snap.point[1],
-            ])
-          }
-        }
-        if (rawBathTargets.length === 0) {
-          rawBathTargets.push(
-            [cFanX, clampExteriorExitY(cFanX, bounds.minZ - 0.1, exPlenumY, exHalfSpan), round2(bounds.minZ - 0.1)],
-            [cFanX, clampExteriorExitY(cFanX, bounds.maxZ + 0.1, exPlenumY, exHalfSpan), round2(bounds.maxZ + 0.1)],
-            [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
-            [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cFanZ, exPlenumY, exHalfSpan), cFanZ],
-          )
-          rawBathTargets.sort(
-            (a, b) =>
-              Math.hypot(a[0] - fanX, a[2] - fanZ) - Math.hypot(b[0] - fanX, b[2] - fanZ),
-          )
-        }
+        const bathTargets = buildHeaderSafeExteriorExhaustTargets({
+          origin: [fanX, fanZ],
+          desiredExitY: exPlenumY,
+          ductHalfSpan: exHalfSpan,
+          walls,
+          rawRooms,
+          obstacles,
+          openingPrisms: levelOpeningPrisms,
+          bounds,
+          indoorBounds,
+          wallMinX,
+          wallMaxX,
+          wallMinZ,
+          wallMaxZ,
+          clampExteriorExitY,
+          footprintContains,
+        })
         const exRouteMaxY = exCappedBelowSlab
           ? exSoffitCapY
           : exMaxY !== undefined && exMaxY > 0
             ? exMaxY
             : undefined
-        let exRoute = routeHvacDuctRun({
+        const exRoute = routeHeaderSafeExhaustRun({
           from: fanPos,
-          to: rawBathTargets[0]!,
+          targets: bathTargets,
           plenumY: exPlenumY,
           maxPlenumY: exRouteMaxY,
-          ductHalfSpanM: exHalfSpan,
-          allowDiagonalBranch: false,
+          ductHalfSpan: exHalfSpan,
           obstacles,
+          openingPrisms: levelOpeningPrisms,
+          indoorBounds,
           roofEnvelope: atticRoof,
           footprintContains,
           interiorCorridorSpines,
+          cavityContext,
+          plenumLocation,
         })
-        if (exRoute.clashes.length > 0) {
-          for (let ei = 1; ei < rawBathTargets.length; ei++) {
-            const cand = routeHvacDuctRun({
-              from: fanPos,
-              to: rawBathTargets[ei]!,
-              plenumY: exPlenumY,
-              maxPlenumY: exRouteMaxY,
-              ductHalfSpanM: exHalfSpan,
-              allowDiagonalBranch: false,
-              obstacles,
-              roofEnvelope: atticRoof,
-              footprintContains,
-              interiorCorridorSpines,
-            })
-            if (cand.clashes.length < exRoute.clashes.length) {
-              exRoute = cand
-              if (cand.clashes.length === 0) break
-            }
-          }
-        }
         ductRuns.push({
           id: nextDuctId(),
           name: `${exSized.diameterIn}" Bath Exhaust Duct (${room.name})`,
@@ -4094,10 +4667,11 @@ export function planHvacAutoPopulate(
       } else if (room.category === 'kitchen') {
         const hoodId = nextEqId()
         const hoodCfm = Math.max(250, ventilation.kitchenExhaustCfm)
+        const hoodMaterial = IMC_RULE_THRESHOLDS.rangeHoodRequiredMaterial
         const hoodSized = sizeDuctForCfm({
           cfm: hoodCfm,
           shape: 'round',
-          material: 'galvanized-sheet',
+          material: hoodMaterial,
           occupancy,
         })
         const hoodDiam = Math.max(6, hoodSized.diameterIn)
@@ -4148,81 +4722,49 @@ export function planHvacAutoPopulate(
           electricalDemand: getHvacEquipmentElectricalDemand({ kind: 'range-hood', occupancy }),
         })
         const hoodFrom: Vec3 = [hoodPos[0], round2(hoodPos[1] + 0.25), hoodPos[2]]
-        const cHoodX = clampToSpan(hoodX, wallMinX, wallMaxX)
-        const cHoodZ = clampToSpan(hoodZ, wallMinZ, wallMaxZ)
-        const hoodTargets: Vec3[] = []
-        if (walls.length > 0) {
-          const hoodWallSnaps = findNearestExteriorWallPoints({
-            origin: [hoodX, hoodZ],
-            walls,
-            rooms: rawRooms,
-            outwardOffsetM: 0.1,
-            cornerInsetM: 0.35,
-            extraOffsetsM: [],
-          })
-          for (const snap of hoodWallSnaps.slice(0, 4)) {
-            hoodTargets.push([
-              snap.point[0],
-              clampExteriorExitY(snap.point[0], snap.point[1], hoodPlenumY, hoodHalfSpan),
-              snap.point[1],
-            ])
-          }
-        }
-        if (hoodTargets.length === 0) {
-          hoodTargets.push(
-            [cHoodX, clampExteriorExitY(cHoodX, bounds.minZ - 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.minZ - 0.1)],
-            [cHoodX, clampExteriorExitY(cHoodX, bounds.maxZ + 0.1, hoodPlenumY, hoodHalfSpan), round2(bounds.maxZ + 0.1)],
-            [round2(bounds.minX - 0.1), clampExteriorExitY(bounds.minX - 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
-            [round2(bounds.maxX + 0.1), clampExteriorExitY(bounds.maxX + 0.1, cHoodZ, hoodPlenumY, hoodHalfSpan), cHoodZ],
-          )
-          hoodTargets.sort(
-            (a, b) =>
-              Math.hypot(a[0] - hoodX, a[2] - hoodZ) - Math.hypot(b[0] - hoodX, b[2] - hoodZ),
-          )
-        }
+        const hoodTargets = buildHeaderSafeExteriorExhaustTargets({
+          origin: [hoodX, hoodZ],
+          desiredExitY: hoodPlenumY,
+          ductHalfSpan: hoodHalfSpan,
+          walls,
+          rawRooms,
+          obstacles,
+          openingPrisms: levelOpeningPrisms,
+          bounds,
+          indoorBounds,
+          wallMinX,
+          wallMaxX,
+          wallMinZ,
+          wallMaxZ,
+          clampExteriorExitY,
+          footprintContains,
+        })
         const hoodRouteMaxY = hoodCappedBelowSlab
           ? hoodSoffitCapY
           : hoodMaxY !== undefined && hoodMaxY > 0
             ? hoodMaxY
             : undefined
-        let hoodRoute = routeHvacDuctRun({
+        const hoodRoute = routeHeaderSafeExhaustRun({
           from: hoodFrom,
-          to: hoodTargets[0]!,
+          targets: hoodTargets,
           plenumY: hoodPlenumY,
           maxPlenumY: hoodRouteMaxY,
-          ductHalfSpanM: hoodHalfSpan,
-          allowDiagonalBranch: false,
+          ductHalfSpan: hoodHalfSpan,
           obstacles,
+          openingPrisms: levelOpeningPrisms,
+          indoorBounds,
           roofEnvelope: atticRoof,
           footprintContains,
           interiorCorridorSpines,
+          cavityContext,
+          plenumLocation,
         })
-        if (hoodRoute.clashes.length > 0) {
-          for (let hi = 1; hi < hoodTargets.length; hi++) {
-            const cand = routeHvacDuctRun({
-              from: hoodFrom,
-              to: hoodTargets[hi]!,
-              plenumY: hoodPlenumY,
-              maxPlenumY: hoodRouteMaxY,
-              ductHalfSpanM: hoodHalfSpan,
-              allowDiagonalBranch: false,
-              obstacles,
-              roofEnvelope: atticRoof,
-              footprintContains,
-              interiorCorridorSpines,
-            })
-            if (cand.clashes.length < hoodRoute.clashes.length) {
-              hoodRoute = cand
-              if (cand.clashes.length === 0) break
-            }
-          }
-        }
         ductRuns.push({
           id: nextDuctId(),
           name: `${hoodDiam}" Rigid Kitchen Range Hood Exhaust (IMC 505.4)`,
           system: 'exhaust-duct',
           shape: 'round',
-          material: 'galvanized-sheet',
+          material: hoodMaterial,
           width: hoodDiam,
           height: hoodDiam,
           diameter: hoodDiam,

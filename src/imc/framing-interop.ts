@@ -8,6 +8,11 @@
  */
 
 import {
+  type SceneNodeLike as KernelSceneNodeLike,
+  belongsToLevel as kernelBelongsToLevel,
+  resolveNodeLevelId as kernelResolveNodeLevelId,
+} from '@kruschdev/pascal-mep-kernel'
+import {
   type DuctShape,
   type HvacEquipmentKind,
   INCHES_TO_METERS,
@@ -295,33 +300,21 @@ export function belongsToLevel(
   node: SceneNodeLike,
   levelId: string | null,
 ): boolean {
-  if (!levelId) return true
-  if (node.id === levelId || node.parentId === levelId) return true
-  let cur: SceneNodeLike | undefined = node
-  let guard = 0
-  while (cur?.parentId && guard < 12) {
-    if (cur.parentId === levelId) return true
-    cur = nodes[cur.parentId]
-    guard += 1
-  }
-  return false
+  return kernelBelongsToLevel(
+    nodes as Readonly<Record<string, KernelSceneNodeLike>>,
+    node as KernelSceneNodeLike,
+    levelId,
+  )
 }
 
 export function resolveNodeLevelId(
   nodes: Readonly<Record<string, SceneNodeLike>>,
   node: SceneNodeLike,
 ): string | null {
-  if (node.type === 'level') return node.id
-  let cur: SceneNodeLike | undefined = node
-  let guard = 0
-  while (cur?.parentId && guard < 12) {
-    const parent: SceneNodeLike | undefined = nodes[cur.parentId]
-    if (!parent) return cur.parentId
-    if (parent.type === 'level') return parent.id
-    cur = parent
-    guard += 1
-  }
-  return null
+  return kernelResolveNodeLevelId(
+    nodes as Readonly<Record<string, KernelSceneNodeLike>>,
+    node as KernelSceneNodeLike,
+  )
 }
 
 export type HvacFramingContext = {

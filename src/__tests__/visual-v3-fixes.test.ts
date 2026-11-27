@@ -942,4 +942,37 @@ describe('Round 3 Visual & Geometric Regression Suite (VIS-V3-03, VIS-V3-04, VIS
     expect(audit.errorCount).toBe(0)
     expect(audit.warningCount).toBe(0)
   })
+
+  test('KERNEL-MEP-05: buildAtticRoofEnvelope resolves 2-hop nested roof container transforms and exposes isFlatRoof/ridgeY/eaveY', () => {
+    const nestedRoofScene: Record<string, SceneNodeLike> = {
+      level_0: { id: 'level_0', type: 'level', level: 0, height: 2.6 },
+      w1: { id: 'w1', type: 'wall', parentId: 'level_0', start: [0, 0], end: [12, 0], height: 2.6, thickness: 0.16 },
+      w2: { id: 'w2', type: 'wall', parentId: 'level_0', start: [12, 0], end: [12, 8], height: 2.6, thickness: 0.16 },
+      w3: { id: 'w3', type: 'wall', parentId: 'level_0', start: [12, 8], end: [0, 8], height: 2.6, thickness: 0.16 },
+      w4: { id: 'w4', type: 'wall', parentId: 'level_0', start: [0, 8], end: [0, 0], height: 2.6, thickness: 0.16 },
+      roof_outer: { id: 'roof_outer', type: 'roof', parentId: 'level_0', position: [4, 0, 2], rotation: 0 },
+      roof_inner: { id: 'roof_inner', type: 'roof', parentId: 'roof_outer', position: [2, 0, 2], rotation: 0 },
+      rseg_nested: {
+        id: 'rseg_nested',
+        type: 'roof-segment',
+        parentId: 'roof_inner',
+        roofType: 'gable',
+        position: [0, 0, 0],
+        width: 12,
+        depth: 8,
+        pitch: 26.57,
+        wallHeight: 0,
+      },
+    }
+    const roof = buildAtticRoofEnvelope(nestedRoofScene, 'level_0', { minX: 0, maxX: 12, minZ: 0, maxZ: 8 }, 2.6)
+    expect(roof.hasRoofAbove).toBe(true)
+    expect(roof.isFlatRoof).toBe(false)
+    expect(roof.wallH).toBe(2.6)
+    expect(roof.eaveY).toBeCloseTo(2.6, 2)
+    expect(roof.ridgeY).toBeCloseTo(4.6, 1)
+    // Segment center resolves to (4+2, 2+2) = (6, 4) across 2 roof container hops
+    expect(roof.roofYAt(6, 4)).toBeCloseTo(4.6, 1)
+    // At outer eave (6, 8), roof drops back to eaveY = 2.6
+    expect(roof.roofYAt(6, 8)).toBeCloseTo(2.6, 2)
+  })
 })

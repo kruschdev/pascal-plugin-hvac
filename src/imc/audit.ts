@@ -4,6 +4,7 @@
  * Framework-free: zero React, Three.js, or `@pascal-app/*` imports.
  */
 
+import { evaluatePlacementCandidate } from '@kruschdev/pascal-mep-kernel'
 import {
   type SceneNodeLike,
   resolveNodeLevelId,
@@ -20,6 +21,14 @@ import {
   polylineLengthM,
   resolveLevelHeightM,
 } from './routing'
+import {
+  IECC_ATTIC_DUCT_INSULATION_RULE,
+  IMC_CONDENSATE_SLOPE_RULE,
+  IMC_PROHIBITED_RETURN_CATEGORIES,
+  IMC_PROHIBITED_RETURN_ZONES_RULE,
+  IMC_RANGE_HOOD_MATERIAL_RULE,
+  IMC_RULE_THRESHOLDS,
+} from './rules'
 import { buildHvacElectricalCoordination } from './schedule'
 import { calculateDuctHydraulics } from './sizing'
 import {
@@ -326,20 +335,33 @@ export function auditSceneHvac(
     }
 
     // IMC 505.4 Domestic kitchen range hood exhaust must use smooth rigid metallic duct (never flex or ductboard)
-    if (system === 'exhaust-duct' && (material === 'flex-r8' || material === 'flex-r6' || material === 'ductboard')) {
+    if (system === 'exhaust-duct') {
       const srcNode = typeof run.sourceNodeId === 'string' ? nodes[run.sourceNodeId] : undefined
       const isRangeHood =
         srcNode?.equipmentKind === 'range-hood' ||
         (typeof run.name === 'string' && /range\s*hood|kitchen/i.test(run.name))
       if (isRangeHood) {
-        push({
-          severity: 'error',
-          codeRef: 'IMC 505.4',
-          title: 'Kitchen range hood exhaust uses non-metallic / flexible duct',
-          detail: `${run.name ?? run.id} specifies ${material}; domestic kitchen exhaust ducts must have smooth interior surfaces constructed of galvanized steel, stainless steel, or copper.`,
-          suggestedFix: 'Change kitchen exhaust duct material to galvanized-sheet (smooth rigid metal).',
-          nodeIds: [run.id],
-        })
+        const rangeHoodEval = evaluatePlacementCandidate(
+          [IMC_RANGE_HOOD_MATERIAL_RULE],
+          {
+            id: run.id,
+            kind: 'range-hood-exhaust',
+            system: 'range-hood-exhaust',
+            pos: path[0] ?? [0, 0, 0],
+            material,
+          },
+          'audit',
+        )
+        if (!rangeHoodEval.legal) {
+          push({
+            severity: IMC_RANGE_HOOD_MATERIAL_RULE.severity,
+            codeRef: IMC_RANGE_HOOD_MATERIAL_RULE.codeRef,
+            title: IMC_RANGE_HOOD_MATERIAL_RULE.title,
+            detail: `${run.name ?? run.id} specifies ${material}; domestic kitchen exhaust ducts must have smooth interior surfaces constructed of galvanized steel, stainless steel, or copper.`,
+            suggestedFix: IMC_RANGE_HOOD_MATERIAL_RULE.suggestedFix,
+            nodeIds: [run.id],
+          })
+        }
       }
     }
 
@@ -348,30 +370,44 @@ export function auditSceneHvac(
       const slope = measureCondensateSlope(path)
       if (slope.hasUphillSegment) {
         push({
-          severity: 'error',
-          codeRef: 'IMC 307.2.1',
+          severity: IMC_CONDENSATE_SLOPE_RULE.severity,
+          codeRef: IMC_CONDENSATE_SLOPE_RULE.codeRef,
           title: 'Condensate drain pitches uphill (back-pitched)',
           detail: `${run.name ?? run.id} contains an upward-sloping segment; gravity condensate drains must slope continuously downward (>= 1/8"/ft).`,
           suggestedFix: 'Re-route condensate line with continuous downward pitch or install a dedicated condensate pump.',
           nodeIds: [run.id],
         })
-      } else if (slope.horizontalDistFt >= 1.0 && slope.overallSlopeInPerFt < 0.12) {
-        push({
-          severity: 'error',
-          codeRef: 'IMC 307.2.1',
-          title: `Condensate drain slope (${slope.overallSlopeInPerFt}"/ft) below 1/8"/ft minimum`,
-          detail: `${run.name ?? run.id} slopes ${slope.overallSlopeInPerFt}"/ft across ${slope.horizontalDistFt} ft, below the 0.125"/ft (1%) IMC minimum.`,
-          suggestedFix: 'Increase downward pitch to at least 1/8" to 1/4" per foot along the horizontal run.',
-          nodeIds: [run.id],
-        })
+      } else if (slope.horizontalDistFt >= 1.0) {
+        const slopeEval = evaluatePlacementCandidate(
+          [IMC_CONDENSATE_SLOPE_RULE],
+          {
+            id: run.id,
+            kind: 'condensate-drain',
+            system: 'condensate-drain',
+            pos: path[0]!,
+            slopeInPerFt: slope.overallSlopeInPerFt,
+          },
+          'audit',
+        )
+        if (!slopeEval.legal) {
+          push({
+            severity: IMC_CONDENSATE_SLOPE_RULE.severity,
+            codeRef: IMC_CONDENSATE_SLOPE_RULE.codeRef,
+            title: `Condensate drain slope (${slope.overallSlopeInPerFt}"/ft) below 1/8"/ft minimum`,
+            detail: `${run.name ?? run.id} slopes ${slope.overallSlopeInPerFt}"/ft across ${slope.horizontalDistFt} ft, below the ${IMC_RULE_THRESHOLDS.condensateMinSlopePlacementInPerFt}"/ft (1%) IMC minimum.`,
+            suggestedFix: IMC_CONDENSATE_SLOPE_RULE.suggestedFix,
+            nodeIds: [run.id],
+          })
+        }
       }
     }
 
     // IECC R403.3.1 Unconditioned Attic Supply & Return Duct Insulation (must be >= R-8)
-    // Segment-level check: a duct is in the unconditioned attic if any horizontal segment
-    // or >= 30% of total path length runs at midpoint y >= levelH + 0.05.
+    // Segment-level check using unified single-source threshold from `IECC_ATTIC_DUCT_INSULATION_RULE`:
+    // a duct is in the unconditioned attic if any horizontal segment or >= 30% of total path length
+    // runs at midpoint y >= levelH + atticThresholdOffsetM (0.05m).
     const levelH = getLevelH(runLevelId)
-    const atticThresholdY = levelH + 0.05
+    const atticThresholdY = levelH + IMC_RULE_THRESHOLDS.atticThresholdOffsetM
     let totalPathLenM = 0
     let atticLenM = 0
     let hasHorizontalAtticSeg = false
@@ -417,11 +453,11 @@ export function auditSceneHvac(
       const insR = typeof run.insulationR === 'number' ? run.insulationR : 0
       if (insR < zoneSpec.ieccAtticDuctR) {
         push({
-          severity: 'error',
-          codeRef: 'IECC R403.3.1',
+          severity: IECC_ATTIC_DUCT_INSULATION_RULE.severity,
+          codeRef: IECC_ATTIC_DUCT_INSULATION_RULE.codeRef,
           title: `Attic duct insulation (R-${insR}) below IECC R-${zoneSpec.ieccAtticDuctR} minimum`,
           detail: `${run.name ?? run.id} runs in unconditioned attic space (${(maxAtticMidY * METERS_TO_FEET).toFixed(1)} ft) with R-${insR} insulation.`,
-          suggestedFix: `Upgrade attic duct wrap or flex duct to >= R-${zoneSpec.ieccAtticDuctR} per IECC R403.3.1.`,
+          suggestedFix: `Upgrade attic duct wrap or flex duct to >= R-${zoneSpec.ieccAtticDuctR} per ${IECC_ATTIC_DUCT_INSULATION_RULE.codeRef}.`,
           nodeIds: [run.id],
         })
       }
@@ -472,8 +508,9 @@ export function auditSceneHvac(
     }
   }
 
-  // Prohibited return-air intake zones (IMC 601.5 / IRC M1602.2)
-  const prohibitedReturnCategories = new Set(['bathroom', 'garage', 'kitchen', 'utility', 'closet', 'exterior', 'attic'])
+  // Prohibited return-air intake zones (IMC 601.5 / IRC M1602.2 — single-source declarative rule)
+  const requireBelowCeilingForAttic =
+    IMC_PROHIBITED_RETURN_ZONES_RULE.params.requireBelowCeilingForAttic === true
   for (const t of terminals) {
     if (t.terminalKind !== 'return-grille') continue
     const tLvlId = resolveNodeLevelId(nodes, t)
@@ -483,20 +520,31 @@ export function auditSceneHvac(
     const termY = pos ? Number(pos[1]) : 0
     const matchingRooms = pos
       ? lvlRooms
-          .filter((r) => !(r.category === 'attic' && termY < lvlH))
+          .filter((r) => !(requireBelowCeilingForAttic && r.category === 'attic' && termY < lvlH))
           .filter((r) => pointInPolygon2D(Number(pos[0]), Number(pos[2]), r.polygon))
           .sort((a, b) => a.areaSqm - b.areaSqm)
       : []
     const containingRoom = matchingRooms[0]
     const roomLabel = containingRoom?.name ?? (typeof t.roomName === 'string' ? t.roomName : '')
     const roomCat = containingRoom?.category ?? (roomLabel ? classifyHvacRoomName(roomLabel) : 'other')
-    if (prohibitedReturnCategories.has(roomCat)) {
+    const returnEval = evaluatePlacementCandidate(
+      [IMC_PROHIBITED_RETURN_ZONES_RULE],
+      {
+        id: t.id,
+        kind: 'return-grille',
+        pos: pos ? [Number(pos[0]), termY, Number(pos[2])] : [0, termY, 0],
+        roomCategory: roomCat,
+        ceilingHeightM: lvlH,
+      },
+      'audit',
+    )
+    if (!returnEval.legal || IMC_PROHIBITED_RETURN_CATEGORIES.has(roomCat)) {
       push({
-        severity: 'error',
-        codeRef: 'IMC 601.5 / IRC M1602.2',
+        severity: IMC_PROHIBITED_RETURN_ZONES_RULE.severity,
+        codeRef: IMC_PROHIBITED_RETURN_ZONES_RULE.codeRef,
         title: `Return air grille placed in prohibited ${roomCat} zone`,
         detail: `${t.name ?? t.id} draws return air from ${roomLabel || roomCat}; IMC 601.5 and IRC M1602.2 prohibit return air from bathrooms, kitchens, garages, closets, utility rooms, attics, or exterior spaces.`,
-        suggestedFix: 'Relocate the return air grille into a conditioned hallway, living room, or other habitable space.',
+        suggestedFix: IMC_PROHIBITED_RETURN_ZONES_RULE.suggestedFix,
         nodeIds: [t.id],
       })
     }
