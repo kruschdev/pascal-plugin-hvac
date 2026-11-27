@@ -2,15 +2,22 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-sky.svg)](./LICENSE)
 [![Pascal Plugin API v1](https://img.shields.io/badge/Pascal_Plugin_API-v1-38bdf8.svg)](https://github.com/pascalorg/editor)
+[![Kernel](https://img.shields.io/badge/Kernel-%40kruschdev%2Fpascal--mep--kernel-a78bfa.svg)](https://github.com/kruschdev/pascal-mep-kernel)
 [![3D CAD Models](https://img.shields.io/badge/MIT_3D_CAD_Models-42_.glb-10b981.svg)](./docs/CAD-CATALOG.md)
-[![IMC Tests](https://img.shields.io/badge/Tests-46%2F46_Passing-22c55e.svg)](./src/__tests__)
+[![IMC Tests](https://img.shields.io/badge/Tests-95%2F95_Passing-22c55e.svg)](./src/__tests__)
 
 An open-source, MIT-licensed **Residential and Light-Commercial IMC / UMC / ACCA Manual J-D-S / ASHRAE 62.2 / IECC HVAC** plugin for [Pascal Editor](https://github.com/pascalorg/editor).
 
-I built `@kruschdev/pascal-plugin-hvac` to complete the 4-trade MEP stack inside Pascal Editor alongside Structural (Priority #1), Plumbing (Priority #2), and Electrical (Priority #4). Every calculation runs deterministically in TypeScript with zero cloud dependencies, zero global CSS, and strict runtime boundary isolation across all 6 subpath exports.
+I built `@kruschdev/pascal-plugin-hvac` on top of [`@kruschdev/pascal-mep-kernel`](https://github.com/kruschdev/pascal-mep-kernel) to complete the 4-trade MEP stack inside Pascal Editor alongside Structural (Priority #1), Plumbing (Priority #2), and Electrical (Priority #4). Every calculation runs deterministically in TypeScript with zero cloud dependencies, zero global CSS, and strict runtime boundary isolation across all 6 subpath exports.
 
 > [!NOTE]
-> **Early Development Status:** This plugin is still in the beginning stages of being refined and is not yet at the same level of polish, depth, or completeness as my [Pascal Electrical Plugin (`@kruschdev/pascal-plugin-electrical`)](https://github.com/kruschdev/pascal-plugin-electrical). Expect active iteration on layout rules, 3D routing, and edge cases as I continue building it out.
+> **Verification Status:** Verified with `95 / 95` deterministic unit tests (`1,669` assertions), `5 / 5` entry boundary gates, and audited across `246` real public Pascal buildings (`222 / 246` zero-error, `0` crashes, `0/0/0/0` errors on two-story Aymeric House with automatic West 4-Ton + East 2-Ton dual-wing zoning and zero courtyard ducts).
+
+## 4-Trade Coordinated Cutaway (Shared `@kruschdev/pascal-mep-kernel`)
+
+![Aymeric House Finished Architecture vs 4-Trade Coordinated MEP Cutaway powered by @kruschdev/pascal-mep-kernel](https://raw.githubusercontent.com/kruschdev/pascal-mep-kernel/main/assets/social-preview.png)
+
+Watch the full two-story Aymeric House finished-to-cutaway walkthrough (Structural -> Plumbing -> Dual-Wing HVAC -> Electrical, `1,412` coordinated nodes, `0/0/0/0` errors) in [`@kruschdev/pascal-mep-kernel`](https://github.com/kruschdev/pascal-mep-kernel).
 
 ## Walkthrough Video (Recorded Live in Pascal Editor)
 
@@ -19,7 +26,7 @@ I built `@kruschdev/pascal-plugin-hvac` to complete the 4-trade MEP stack inside
 **[Watch Full 720p HD Narrated Walkthrough Video Recorded in Pascal Editor (`assets/demo-walkthrough.mp4`)](./assets/demo-walkthrough.mp4)**
 
 1. **One-Click IMC / Manual J-D-S Auto-Populate & Catalog Placement**: Scans every room and exterior wall across all 14 ASHRAE Climate Zones (`1A` through `7`) to compute room-by-room heating and sensible/latent cooling BTU/h, select equipment tonnage (`SEER2` / `HSPF2`), A2L refrigerant linesets (`R-454B`, `R-32`, `R-410A`), continuous ASHRAE 62.2 ERV ventilation, bath exhaust fans, and vented kitchen range hoods, and drop in 26 live equipment, plenum, and terminal kinds directly from the HVAC rail.
-2. **4-Trade Priority #3 3D Duct Routing, Layer Filtering & 2D Floorplan**: Routes color-coded 3D rectangular trunks, R-8 flex/rigid branches, return drops, ERV fresh-air ducts, exhaust runs, insulated copper refrigerant linesets, and gravity-sloped 3/4" PVC condensate drains while yielding around Structural beams/columns and Priority #2 Plumbing DWV pipes. Toggle any of the 8 mechanical layers live or switch to the color-matched 2D HVAC floorplan schematic.
+2. **4-Trade Priority #3 Legal-Cavity Routing, Automatic Dual-Wing Zoning & 2D Floorplan**: Routes color-coded 3D rectangular trunks, R-8 flex/rigid branches, return drops, ERV fresh-air ducts, header-safe bath and kitchen range-hood exhaust runs, grounded exterior-wall copper refrigerant linesets, and gravity-sloped 3/4" PVC condensate drains via [`@kruschdev/pascal-mep-kernel`](https://github.com/kruschdev/pascal-mep-kernel) while yielding around Structural beams/columns, 3D door/window headers, and Priority #2 Plumbing DWV pipes. Concave U-shaped courtyard houses and >5-Ton residences automatically split into independent dual-wing systems (`<= 5 Ton` each) with zero ducts bridging open courtyards. Toggle any of the 8 mechanical layers live or switch to the color-matched 2D HVAC floorplan schematic.
 3. **Interactive 3D Air Handler, Supply/Return Plenum & Joist-Bay Cutaway**: Opens inside Pascal's split-pane `HVAC Schedule` view with live drag-to-orbit and 3 view modes (`Joist-Bay & Open Air Handler`, `Cabinet Cover Off`, `Cabinet Door Closed`) showing the overhead 16" OC joists, evaporator A-coil, copper lineset stubs, ECM blower housing, MERV-13 filter rack, secondary galvanized overflow pan with SS2 float switch (`IMC 307.2`), manual balancing dampers, and live room branch tags.
 4. **Live Manual J Schedule, Manual S Sizing & Cross-Trade Power/Gas Handoff**: Inspects room-by-room heating/cooling loads and airflows, installed ductwork velocities (`FPM`), Manual S capacity and lineset sizing, structural framing/soffit clearances (`IRC R502.8 / R602.6 / R302.11`), furnace `gasBtuh` sync for `@kruschdev/pascal-plugin-plumbing`, and automatic `NEC Art. 440 / 424` breaker handoff to `@kruschdev/pascal-plugin-electrical`.
 5. **Live Priced BOM + IECC Envelope Insulation & IMC/IECC Audit**: Adjust Labor (`$/hr`), Material Markup (`%`), Sales Tax (`%`), and optional IECC building envelope insulation (wall batts, attic cellulose, rim-joist spray foam, air sealing) with one-click CSV export alongside the live IMC / Manual D / IECC / `NEC 110.26(E)` compliance audit.
@@ -102,7 +109,7 @@ registerPluginChatExtension(hvacChatExtension)
 
 ```bash
 bun install
-bun run check              # tsc + 46/46 tests + 5/5 entry boundary gates + ESM build
+bun run check              # tsc + 95/95 tests + 5/5 entry boundary gates + ESM build
 bun run export:cad         # Export all 42 .glb CAD assets into assets/cad/
 bun run render:cad-thumbs  # Re-render all 42 thumbnails + 6x7 contact sheet
 bun run render:cutaway     # Re-render 4-panel 3D Air Handler Cutaway showcase
